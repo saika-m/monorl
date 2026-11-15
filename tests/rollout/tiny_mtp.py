@@ -157,7 +157,9 @@ def fit_to_greedy(
     examples = []
     with torch.no_grad():
         for prompt in prompts:
-            ids = model.generate(input_ids=torch.tensor([prompt]), generation_config=config)
+            ids = model.generate(
+                input_ids=torch.tensor([prompt], device=layers.device), generation_config=config
+            )
             hidden = model(input_ids=ids, output_hidden_states=last_layer).hidden_states[-1]
             mask = torch.zeros_like(ids)
             mask[:, len(prompt) :] = 1

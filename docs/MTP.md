@@ -65,6 +65,13 @@ Per engine:
   takes one sequence per call, so the engine decodes its rows one after another: this engine is
   for checking behaviour, not for throughput. It drafts one token per MTP layer
   (`num_speculative_tokens` must be unset or that number) and text prompts only.
+  When only one output token remains, it bypasses the drafter and generates that token directly
+  from the policy. For multiple MTP layers, only the preceding `D` hidden states are retained for
+  rejection correction (`D` = MTP depth), rather than copying the full history at each pass.
+  The suffix owns a compact allocation; this bounds the extra correction buffer, not the
+  policy or drafter KV caches. These optimizations use device-neutral PyTorch operations.
+  Omitting a terminal draft can change the final seeded sample's RNG draws, but not its target
+  distribution or recorded policy logprob.
 - **vLLM.** `speculative_config = {"method": "mtp", "num_speculative_tokens": N or 1}`; keys in
   `rollout.extra.engine_kwargs.speculative_config` are laid over it. A `rejection_sample_method`
   other than `standard` is rejected (the lossy ones sample from another distribution than the
