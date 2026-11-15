@@ -76,7 +76,7 @@ def _mtp_model_class() -> Any:
         import transformers
 
         raise ConfigError(
-            f"model.mtp needs a transformers release with MTP support (5.22 or later); "
+            f"model.mtp needs transformers 5.22.x with MTP support; "
             f"{transformers.__version__} is installed"
         ) from e
     return MtpModel

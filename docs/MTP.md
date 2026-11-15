@@ -188,8 +188,9 @@ untouched layer: over 8 steps `mtp/accept_rate` stayed 0 in every step and in th
 
 - Models: what `transformers.modeling_layers.MtpModel.from_pretrained` loads for the model's
   class. A model whose class registers no MTP key patterns, or a checkpoint without MTP weights,
-  is a `ConfigError`. The native path needs transformers 5.22 or later (tested with 5.22.1 and
-  5.22.2); it reaches into loader internals that a later release may move.
+  is a `ConfigError`. The native path needs transformers 5.22.x (tested with 5.22.1 and
+  5.22.2). Installation excludes 5.23 and later: that release changed the hidden-state selection
+  contract used by the MTP trainer and candidate generator. Both must migrate before lifting the cap.
 - `hf` engine: one sequence at a time, text prompts only, one drafted token per MTP layer.
 - vLLM and SGLang decide themselves which architectures they can draft for; an unsupported one
   fails when the engine starts.
