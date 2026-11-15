@@ -19,6 +19,8 @@ Endpoints used (vLLM v0.33.0 unless noted):
   token *strings*, so token ids come from ``choices[i].token_ids`` and the prompt ids the server
   conditioned on (chat template + image placeholders rendered server-side) from the
   response-level ``prompt_token_ids``. One request per prompt (a chat request is one conversation).
+  A batch's chat requests run concurrently with its text-completion request; responses are
+  regrouped into the original prompt order. Server scheduling and sampling settings are unchanged.
 * ``POST /sleep?level=N``, ``POST /wake_up``, ``GET /is_sleeping``
   (``vllm/entrypoints/serve/dev/sleep/api_router.py``, enabled by ``VLLM_SERVER_DEV_MODE=1``).
 * ``POST /reset_prefix_cache`` (``vllm/entrypoints/serve/dev/cache/api_router.py``).
@@ -32,15 +34,14 @@ Endpoints used (vLLM v0.33.0 unless noted):
 routes are wrapped in ``with_cancellation`` (``vllm/entrypoints/serve/utils/api_utils.py``), which
 cancels the handler on ``http.disconnect``, and ``AsyncLLM.generate``
 (``vllm/v1/engine/async_llm.py``) aborts its request in the engine when it is cancelled. The
-requests therefore run as tasks of an ``httpx.AsyncClient`` on a private event-loop thread:
-cancelling a task closes its connection, which a thread blocked in a synchronous ``httpx.Client``
-call could not be made to do.
+requests therefore run as tasks of an ``httpx.AsyncClient`` on a private event-loop thread.
+Cancellation or a failed request closes the batch's other connections before returning. The
+generation lock still excludes weight updates and sleep transitions until the batch finishes.
 """
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import os
 import threading
@@ -99,8 +100,8 @@ class _GenerateCall:
 
     def __init__(self) -> None:
         self.cancelled = False
-        self.request: concurrent.futures.Future[httpx.Response] | None = None
-        """The HTTP request the call is blocked on, if any."""
+        self.task: asyncio.Task[list[httpx.Response]] | None = None
+        """The batch task, cancelled on its event loop so its HTTP children are drained first."""
 
 
 class VllmServerClient:
@@ -187,6 +188,7 @@ class VllmServerClient:
         try:
             with self._lock:
                 self._wake(_ALL_TAGS)
+                requests: list[tuple[str, dict[str, Any]]] = []
                 if text_idx:
                     ids = [prompt_token_ids(self._tokenizer, prompts[i]) for i in text_idx]
                     body: dict[str, Any] = {
@@ -197,9 +199,23 @@ class VllmServerClient:
                     }
                     if params.top_logprobs > 0:
                         body["return_tokens_as_token_ids"] = True
-                    resp = self._post("/v1/completions", call=call, json=body)
+                    requests.append(("/v1/completions", body))
+                for i in media_idx:
+                    body = {
+                        "model": self._model_name,
+                        "messages": chat_completion_messages(prompts[i]),  # type: ignore[arg-type]
+                        **chat_completion_kwargs(params),
+                    }
+                    requests.append(("/v1/chat/completions", body))
+                pending = asyncio.run_coroutine_threadsafe(self._generate_batch(requests, call), self._loop)
+                try:
+                    responses = iter(pending.result())
+                except BaseException:
+                    pending.cancel()
+                    raise
+                if text_idx:
                     grouped = completions_from_choices(
-                        resp.json()["choices"],
+                        next(responses).json()["choices"],
                         ids,
                         params.n,
                         want_logprobs=params.logprobs,
@@ -207,15 +223,12 @@ class VllmServerClient:
                     )
                     for i, comps in zip(text_idx, grouped, strict=True):
                         result[i] = comps
-                for i in media_idx:
-                    body = {
-                        "model": self._model_name,
-                        "messages": chat_completion_messages(prompts[i]),  # type: ignore[arg-type]
-                        **chat_completion_kwargs(params),
-                    }
-                    resp = self._post("/v1/chat/completions", call=call, json=body)
+                for i, response in zip(media_idx, responses, strict=True):
                     result[i] = completions_from_chat_response(
-                        resp.json(), params.n, want_logprobs=params.logprobs, top_logprobs=params.top_logprobs
+                        response.json(),
+                        params.n,
+                        want_logprobs=params.logprobs,
+                        top_logprobs=params.top_logprobs,
                     )
         finally:
             with self._calls_lock:
@@ -227,9 +240,11 @@ class VllmServerClient:
         no-op when idle. The client stays usable: later calls run normally."""
         with self._calls_lock:
             for call in self._calls:
+                if call.cancelled:
+                    continue
                 call.cancelled = True
-                if call.request is not None:
-                    call.request.cancel()
+                if call.task is not None:
+                    self._loop.call_soon_threadsafe(call.task.cancel)
 
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         with self._lock:
@@ -341,29 +356,44 @@ class VllmServerClient:
         self._post("/wake_up", params=[("tags", t) for t in pending])
         self._sleeping_tags.difference_update(pending)
 
-    def _post(self, path: str, *, call: _GenerateCall | None = None, **kwargs: Any) -> httpx.Response:
-        return self._request("POST", path, call=call, **kwargs)
-
-    def _request(
-        self, method: str, path: str, *, call: _GenerateCall | None = None, **kwargs: Any
-    ) -> httpx.Response:
-        """Send a request on the client's event loop and wait for the response. With ``call`` the
-        request belongs to that ``generate`` call and :meth:`cancel` can abandon it."""
+    async def _generate_batch(
+        self, requests: Sequence[tuple[str, dict[str, Any]]], call: _GenerateCall
+    ) -> list[httpx.Response]:
+        """Submit the whole batch; on failure/cancel close every sibling before releasing the run."""
         with self._calls_lock:
-            if call is not None and call.cancelled:
+            if call.cancelled:
                 raise GenerationCancelled("generation cancelled")
-            request = asyncio.run_coroutine_threadsafe(
-                self._client.request(method, path, **kwargs), self._loop
-            )
-            if call is not None:
-                call.request = request
+            call.task = asyncio.current_task()
+        tasks: list[asyncio.Task[httpx.Response]] = []
         try:
-            resp = request.result()
-        except concurrent.futures.CancelledError:  # only cancel() cancels a request
+            try:
+                for path, body in requests:
+                    tasks.append(asyncio.create_task(self._request_async("POST", path, json=body)))
+                return await asyncio.gather(*tasks)
+            finally:
+                with self._calls_lock:
+                    call.task = None  # repeated cancel() must not interrupt child cleanup
+                for task in tasks:
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
             raise GenerationCancelled("generation cancelled") from None
+
+    def _post(self, path: str, **kwargs: Any) -> httpx.Response:
+        return self._request("POST", path, **kwargs)
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Run a control-plane request on the client's event loop."""
+        request = asyncio.run_coroutine_threadsafe(self._request_async(method, path, **kwargs), self._loop)
+        try:
+            return request.result()
         except BaseException:
-            request.cancel()  # interrupted while waiting (KeyboardInterrupt): drop the request too
+            request.cancel()  # interrupted while waiting: drop the request too
             raise
+
+    async def _request_async(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        resp = await self._client.request(method, path, **kwargs)
         if resp.status_code >= 400:
             raise RuntimeError(f"vLLM server {self._url}{path} -> {resp.status_code}: {resp.text[:500]}")
         return resp

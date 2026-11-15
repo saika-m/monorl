@@ -96,6 +96,15 @@ Chat prompts with `{"type": "image", ...}` parts (`data.image_field`, see `docs/
 | `sglang` | colocate | `Engine.async_generate(input_ids=<processor ids>, image_data=[[PIL…] or None per request])` run on the engine's loop; sglang's multimodal processor decodes the ids, re-expands the image placeholders and returns the final ids | processor chat template |
 | `sglang` | server | `POST /generate` with `image_data` = per-request lists of `data:image/png;base64,…` URLs (sglang `load_image`) | processor chat template |
 
+In vLLM server mode, the image requests of a batch run concurrently with its batched text request,
+not one image after another. This lets a ROCm vLLM server schedule the requested batch together
+instead of being starved by serial client dispatch. Output groups retain the original prompt order;
+sampling parameters, token IDs and logprobs use the same API contract. A failure or cancellation
+closes the sibling requests before the call returns, and weight updates/sleep remain serialized
+against the batch. Concurrent payload memory grows with batch size; HTTP connection limits and the
+server's own scheduling capacity still apply. This does not select AITER kernels, change graph
+settings, or relax speculative acceptance thresholds.
+
 Text-only models never load a processor (`load_processor` decides from the HF config); a VLM
 prompt against a text-only model is a `ConfigError`. Audio/video parts are not forwarded by the
 vLLM/SGLang adapters yet.
