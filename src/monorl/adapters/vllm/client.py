@@ -367,6 +367,9 @@ class VllmServerClient:
         tasks: list[asyncio.Task[httpx.Response]] = []
         try:
             try:
+                if len(requests) == 1:
+                    path, body = requests[0]
+                    return [await self._request_async("POST", path, json=body)]
                 for path, body in requests:
                     tasks.append(asyncio.create_task(self._request_async("POST", path, json=body)))
                 return await asyncio.gather(*tasks)
@@ -376,7 +379,8 @@ class VllmServerClient:
                 for task in tasks:
                     if not task.done() and not task.cancelling():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             raise GenerationCancelled("generation cancelled") from None
 
