@@ -83,6 +83,17 @@ makes sglang send an abort per dispatched request. Both server clients close the
 flight, and the server aborts on the disconnect (vLLM at once via `with_cancellation`; SGLang's
 `/generate` waiter polls every `SGLANG_REQUEST_STATE_WAIT_TIMEOUT` seconds, 4 by default).
 
+#### Shared prompt prefill on HF
+
+For text batches at least 128 padded tokens wide, the HF engine prefills identical prompts once
+per call and copies their KV-cache rows before sampling independent completions. This covers both
+`SamplingParams.n > 1` and duplicate prompts coalesced from parallel RL episodes. The final prompt
+token is left for normal generation; sampling, stop handling and logprob extraction are unchanged.
+The cache is never retained across calls or weight updates. Short batches, batches without repeated
+prompts, multimodal models, MTP drafting, remote-code models, non-default positional scaling and
+nonstandard cache configurations keep the ordinary path. The optimization targets full-attention
+text models with dynamic caches; its benefit depends on prompt length, group size and hardware.
+
 #### Multimodal (image) prompts
 
 Chat prompts with `{"type": "image", ...}` parts (`data.image_field`, see `docs/ARCHITECTURE.md`

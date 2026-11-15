@@ -269,3 +269,74 @@ def test_cancel_interrupts_generation_and_engine_stays_usable(
     for c in after[0]:
         assert c.logprobs is not None and len(c.logprobs) == len(c.token_ids) >= 1
     assert [(c.token_ids, c.logprobs) for c in after[0]] == [(c.token_ids, c.logprobs) for c in before[0]]
+
+
+@pytest.mark.parametrize("n", [1, 3])
+@pytest.mark.parametrize("short_row", [False, True])
+def test_shared_prefill_preserves_samples_and_policy_logprobs(
+    engine: HFRolloutEngine, monkeypatch: pytest.MonkeyPatch, n: int, short_row: bool
+) -> None:
+    # Duplicates need not be adjacent; unequal lengths exercise left-padding and cache row order.
+    first, second = [11, 12, 13, 14] * 40, [17, 18, 19] * 45
+    prompts = [first, [21] if short_row else second, first]
+    params = SamplingParams(
+        n=n,
+        max_new_tokens=6,
+        temperature=0.8,
+        top_p=0.9,
+        top_k=31,
+        repetition_penalty=1.1,
+        seed=41,
+        top_logprobs=5,
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(engine, "_shared_prompt_cache", lambda *args: None)
+        expected = engine.generate(prompts, params)
+    actual = engine.generate(prompts, params)
+    repeated = engine.generate(prompts, params)
+    for ids, expected_group, actual_group, repeated_group in zip(
+        prompts, expected, actual, repeated, strict=True
+    ):
+        for before, after, again in zip(expected_group, actual_group, repeated_group, strict=True):
+            assert after.prompt_token_ids == ids
+            assert after.token_ids == before.token_ids == again.token_ids
+            assert after.finish_reason == before.finish_reason
+            torch.testing.assert_close(
+                torch.tensor(after.logprobs), torch.tensor(before.logprobs), atol=1e-4, rtol=0.0
+            )
+            assert list(after.top_logprobs.token_ids) == list(before.top_logprobs.token_ids)
+            torch.testing.assert_close(
+                torch.tensor(after.top_logprobs.logprobs),
+                torch.tensor(before.top_logprobs.logprobs),
+                atol=1e-4,
+                rtol=0.0,
+            )
+
+
+def test_shared_prefill_does_not_reuse_cache_after_weight_updates(
+    engine: HFRolloutEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts = [[11, 12, 13, 14] * 40] * 2
+    params = SamplingParams(n=2, max_new_tokens=4, temperature=0.8, seed=7)
+    before = engine.generate(prompts, params)
+    name = "model.layers.0.mlp.down_proj.weight"
+    original = engine.model.state_dict()[name].clone()
+    try:
+        engine.update_weights([(name, original + 0.5)])
+        actual = engine.generate(prompts, params)
+        with monkeypatch.context() as patch:
+            patch.setattr(engine, "_shared_prompt_cache", lambda *args: None)
+            expected = engine.generate(prompts, params)
+        for actual_group, expected_group in zip(actual, expected, strict=True):
+            for after, reference in zip(actual_group, expected_group, strict=True):
+                assert after.token_ids == reference.token_ids
+                torch.testing.assert_close(
+                    torch.tensor(after.logprobs), torch.tensor(reference.logprobs), atol=1e-4, rtol=0.0
+                )
+        assert any(
+            old.logprobs != new.logprobs
+            for old_group, new_group in zip(before, actual, strict=True)
+            for old, new in zip(old_group, new_group, strict=True)
+        )
+    finally:
+        engine.update_weights([(name, original)])
