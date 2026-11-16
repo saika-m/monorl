@@ -33,7 +33,8 @@ This module must stay importable without vLLM: the engine only hands its dotted 
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import itertools
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import torch
@@ -69,27 +70,37 @@ class MonorlWorkerExtension:
         them). Returns the number of parameters vLLM reports as loaded (``load_weights`` returns
         a set of names).
 
+        Same-device loaders reuse the policy's staged stream. Inputs are borrowed read-only, as
+        when the caller already supplies on-device tensors. The replay buffer lasts for this RPC
+        payload only; it is not a cross-update cache.
+
         After the last call of an update the caller runs :meth:`monorl_refresh_drafter`."""
         model = self.model_runner.model  # type: ignore[attr-defined]
         device = next(model.parameters()).device
         draft_model = self.get_draft_model()  # type: ignore[attr-defined]
 
-        def on_device() -> Any:
-            for name, tensor in named_tensors:
-                yield name, tensor.to(device, non_blocking=True)
+        def on_device(
+            weights: Sequence[tuple[str, torch.Tensor]], destination: torch.device
+        ) -> Iterator[tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
+                yield name, tensor.to(destination, non_blocking=True)
+
+        policy_weights = on_device(named_tensors, device)
+        if draft_model is not None:
+            draft_device = next(draft_model.parameters()).device
+            if draft_device == device:
+                policy_weights, draft_policy_weights = itertools.tee(policy_weights)
+            else:
+                draft_policy_weights = on_device(named_tensors, draft_device)
 
         count = 0
         if named_tensors:
-            loaded = model.load_weights(on_device())
+            loaded = model.load_weights(policy_weights)
             count += len(loaded) if loaded is not None else len(named_tensors)
         if draft_model is not None:
-            draft_device = next(draft_model.parameters()).device
             # The drafter sees the whole stream, like at start-up: it picks its own layers and,
             # where it could not share them (pipeline parallelism), the embedding and the head.
-            moved = [
-                (name, tensor.to(draft_device, non_blocking=True))
-                for name, tensor in (*named_tensors, *mtp_tensors)
-            ]
+            moved = itertools.chain(draft_policy_weights, on_device(mtp_tensors, draft_device))
             loaded = _load_drafter(draft_model, lambda: draft_model.load_weights(moved))
             count += len(loaded) if loaded is not None else len(mtp_tensors)
         if device.type == "cuda":

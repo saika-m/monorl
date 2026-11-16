@@ -153,6 +153,19 @@ transformers, vLLM and SGLang all load MTP layers from those keys:
   into the embedding module the layers share with the policy; monorl puts the policy's values
   back.
 
+For vLLM tensor updates, a target and drafter on the same worker device share the policy's staged
+weight stream. A host/peer-origin policy tensor is transferred once and borrowed by both loaders,
+while MTP-only tensors go only to the drafter. Different-device destinations keep separate streams;
+already-resident inputs still need no device copy. This applies to ROCm through PyTorch's device
+API without changing the quantized-head refresh or sampling behavior.
+
+The staged policy buffers remain live until both loaders consume them, within the current RPC
+payload, and are not cached across updates. Native payloads are controlled by
+`rollout.extra.chunk_bytes` (except an individual oversized tensor); the HTTP endpoint sends one
+tensor per call. Reuse can increase transient memory during target loading compared with streaming
+and re-copying, so this is not a promise of lower peak device memory. Loaders must treat borrowed
+weight inputs as read-only, as the existing on-device input path already requires.
+
 transformers 5.22 can load MTP layers but not write them: `MtpModel` is not saved with the
 model, and reverting its key renamings produces invalid keys. monorl records, when it loads the
 layers, which checkpoint key each parameter came from, lets transformers undo the tensor
