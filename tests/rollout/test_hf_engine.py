@@ -183,6 +183,31 @@ def test_sampling_knobs_accepted(engine: HFRolloutEngine) -> None:
     assert all(len(c.logprobs) == len(c.token_ids) for g in out for c in g)
 
 
+def test_logprobs_of_a_peft_wrapped_policy(tiny_config: RunConfig) -> None:
+    """The TRL adapter samples from the trainer's LoRA-wrapped model. ``generate`` of the wrapper
+    runs the transformers model inside it, never the wrapper's own forward pass."""
+    from peft import LoraConfig, get_peft_model
+
+    eng = HFRolloutEngine(tiny_config)
+    try:
+        # init_lora_weights=False: the adapter changes the logits, as it does after a training step
+        lora = LoraConfig(r=4, target_modules=["q_proj", "v_proj"], init_lora_weights=False)
+        eng.model = get_peft_model(eng.model, lora).eval()
+        params = SamplingParams(n=2, max_new_tokens=5, temperature=1.0, seed=3, top_logprobs=2)
+        for group in eng.generate(CHATS, params):
+            for c in group:
+                start = len(c.prompt_token_ids)
+                reference = torch.log_softmax(_logits(eng, c.prompt_token_ids + c.token_ids)[0], dim=-1)
+                sampled = reference[start - 1 : -1].gather(1, torch.tensor(c.token_ids)[:, None]).squeeze(1)
+                torch.testing.assert_close(torch.tensor(c.logprobs), sampled, rtol=1e-4, atol=1e-5)
+                top = torch.tensor(list(c.top_logprobs.logprobs)).reshape(len(c.token_ids), 2)
+                torch.testing.assert_close(
+                    top, reference[start - 1 : -1].topk(2).values, rtol=1e-4, atol=1e-5
+                )
+    finally:
+        eng.shutdown()
+
+
 def _logits(engine: HFRolloutEngine, ids: list[int]) -> torch.Tensor:
     with torch.no_grad():
         return engine.model(input_ids=torch.tensor([ids])).logits.float().clone()

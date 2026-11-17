@@ -36,6 +36,7 @@ from typing import Any
 import torch
 from transformers import AutoTokenizer, GenerationConfig
 from transformers.generation import (
+    GenerationMixin,
     LogitsProcessor,
     LogitsProcessorList,
     StoppingCriteria,
@@ -596,6 +597,13 @@ class HFRolloutEngine:
             results.append(group)
         return results
 
+    def _generating_model(self) -> torch.nn.Module:
+        """The module whose forward pass ``generate`` runs, which is where a forward hook sees the
+        logits of a decoding step: ``self.model``, or the transformers model inside a wrapper that
+        hands ``generate`` on to it (a PEFT model, whose own ``forward`` a ``generate`` call never
+        goes through)."""
+        return next(m for m in self.model.modules() if isinstance(m, GenerationMixin))
+
     def _decode_batch(
         self, encoded: list[_EncodedPrompt], params: SamplingParams, n: int, switch: _CancelSwitch
     ) -> list[Completion]:
@@ -618,7 +626,7 @@ class HFRolloutEngine:
             top=params.top_logprobs,
         )
         recording = params.logprobs or params.top_logprobs > 0
-        hook = self.model.register_forward_hook(logprobs.observe) if recording else None
+        hook = self._generating_model().register_forward_hook(logprobs.observe) if recording else None
         try:
             out = self.model.generate(
                 input_ids=input_ids,
