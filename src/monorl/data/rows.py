@@ -242,7 +242,7 @@ class HubRows(RowSource):
             self.dataset = load_dataset(
                 parsed.repo_id, name=config_name, split=split, streaming=streaming, **kwargs
             )
-        except (ValueError, FileNotFoundError) as e:
+        except (ValueError, OSError) as e:  # no such repo, split or config; the Hub cannot be reached
             raise DataError(
                 f"cannot load {parsed.raw!r} (split={split!r}, config={config_name!r}): {e}"
             ) from e
