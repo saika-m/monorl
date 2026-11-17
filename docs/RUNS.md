@@ -266,6 +266,50 @@ here). Without a checkpoint the run logs
 The full validated `RunConfig` with every default filled in (`run_name` included), written before
 anything else. Field reference: [CONFIG.md](CONFIG.md).
 
+**Secrets.** A value that the config read from the environment (`${NAME}` or `${NAME:-default}`)
+is written as `${NAME}` again when `NAME` contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`
+or `CREDENTIAL` (in any case) and the value has at least 8 characters. The components of the run
+are built with the value; the file names the variable, wherever the value occurs inside a string.
+With `api_key: ${DEMO_JUDGE_API_KEY}` added to the reward's `params` of
+`grpo_gsm8k_smollm_cpu.yaml` and the variable set to `sk-demo-0123456789abcdef`, one step leaves
+the value in no file of the run directory, and lines 115 to 118 of `config.yaml` are:
+
+```yaml
+  weight: 1.0
+  params:
+    extract: last_number
+    api_key: ${DEMO_JUDGE_API_KEY}
+```
+
+The file loads to the same config where the variable is set, which is how `--resume` with this
+file and the jobs of the web server use it. Where it is not set, loading fails with
+`environment variable DEMO_JUDGE_API_KEY is not set (referenced as ${DEMO_JUDGE_API_KEY})`. A
+value that came from a default is written as `${NAME}` too, so that file needs the variable.
+
+The same replacement applies to `pipeline.yaml`, `pipeline.json` and the `config.yaml` of every
+stage, to `status.json` and the lines monorl writes to `run.log` (an error that quotes the value
+names the variable), to the config the W&B sink sends, to the job records and the recipes the
+web server returns, to `monorl recipes show --json` and to the `monorl_reward.py` the `verl`
+backend writes (it reads the variable in verl's process).
+
+Not replaced:
+
+- A variable with another name, a value shorter than 8 characters, and a secret typed into the
+  config file itself. Read secrets from variables that are named as above.
+- What other programs write: the output of a framework or of an environment's process in
+  `run.log`, and the text of `metrics.jsonl` and `trajectories.jsonl`.
+- The files a pipeline backend compiles for its framework, which reads them without monorl and
+  needs the values:
+
+  | File | Holds |
+  |---|---|
+  | `verl_config.yaml`, `verl_overrides.txt` | the verl config compiled from the run config, with `trainer.extra` merged in |
+  | `verl_tools.yaml` | `env.params` of a `tool_calling` environment, once per tool |
+  | `nemo_rl/nemo_rl.yaml` | the NeMo-RL config with `trainer.extra.nemo_rl` merged in; under `env.monorl` the whole run config and its `rewards` |
+
+  Keep these files as private as the variables themselves. What the framework does with its
+  config (logging it, sending it to its own W&B run) is the framework's.
+
 ### `status.json`
 
 Written atomically (temporary file, then rename). `message` is the latest progress line, `step`
