@@ -17,6 +17,8 @@ hands it the whole episode instead of stepping it.
 * ``timeout`` — seconds the agent may run (default 600). Then it is killed; the episode still
   counts when the agent called the policy at least once.
 * ``env`` — extra environment variables for the agent and the verifier.
+* ``host_env`` — names of variables of monorl's own environment that a task (below) may read
+  with ``${VAR}``. Default: none. A task that reads any other variable is refused.
 * ``verifier`` — optional command run in the working directory after the agent ended; its
   result is the episode's reward: the last line of its stdout when that is a number, otherwise
   1.0 for exit status 0 and 0.0 for any other. Additional placeholders: ``{reference_file}``
@@ -55,12 +57,20 @@ Tasks. A sample may bring its own environment, verifier and limits: a mapping un
 task format) fills in. They replace the ``env.params`` values for that sample::
 
     {"name": str,
-     "sandbox": {...},          # env.params.sandbox options laid over the configured ones
+     "dir": directory,          # the task directory, when the task was read from one
+     "sandbox": {...},          # the options of sandbox.TASK_OPTIONS, laid over the configured ones
      "env": {name: value},      # the container's environment; "${VAR}" / "${VAR:-default}" are read from this host
      "timeout": seconds,        # the agent's; absent: env.params.timeout
      "user": str,               # the agent's user
      "healthcheck": {command, interval_sec, timeout_sec, start_period_sec, start_interval_sec, retries},
      "verifier": {"tests": directory, "timeout": seconds, "user": str, "env": {name: value}}}
+
+A task is data: whoever wrote the dataset wrote it, not whoever runs monorl. It describes its own
+container and nothing of this host (:func:`checked_task`): ``sandbox`` holds
+:data:`~monorl.envs.sandbox.TASK_OPTIONS` only, ``${VAR}`` reads only what ``env.params.host_env``
+lists, and directories of this host (``sandbox.build``, ``verifier.tests``) are accepted only from
+a task that is, entry for entry, what its task directory ``dir`` says on disk. Anything else is a
+``ConfigError`` naming the sample and what it tried.
 
 A task verifier is the Harbor one: after the agent has ended, ``tests`` is copied to ``/tests``
 and ``/tests/test.sh`` runs in the working directory; the reward is what it wrote to
@@ -93,7 +103,13 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from monorl.core.errors import ConfigError, EnvironmentError_, EpisodeAborted, GenerationFailed
+from monorl.core.errors import (
+    ConfigError,
+    DataError,
+    EnvironmentError_,
+    EpisodeAborted,
+    GenerationFailed,
+)
 from monorl.core.types import Sample, SamplingParams, Trajectory
 from monorl.envs.protocol import encode_sample
 from monorl.envs.sandbox import (
@@ -125,6 +141,7 @@ _PARAMS = (
     "command",
     "timeout",
     "env",
+    "host_env",
     "verifier",
     "verifier_timeout",
     "workdir",
@@ -168,6 +185,66 @@ def task_payload(sample: Sample) -> dict[str, Any]:
     return {"id": sample.id, "messages": list(sample.messages), "metadata": metadata}
 
 
+def checked_task(sample: Sample, task: Mapping[str, Any], *, paths: bool = True) -> None:
+    """Refuse a task that reaches for this host (module docstring): the shapes of its entries
+    and, with ``paths``, the directories it names. Raises ``ConfigError`` naming the sample and
+    the entry.
+
+    A task names directories of this host in ``sandbox.build`` (sent to the Docker daemon) and
+    ``verifier.tests`` (copied into the container). Only a task directory may: the task has to
+    name it in ``dir`` and be exactly what :func:`monorl.data.tasks.load_task` reads from it now,
+    so the directories are that task's own ``environment/`` and ``tests/`` and they go into the
+    container that task describes, not into one a dataset row made up around them."""
+    where = f"sample {sample.id!r}"
+    verifier = task.get("verifier")
+    for name, entry in (
+        ("sandbox", task.get("sandbox")),
+        ("env", task.get("env")),
+        ("verifier", verifier),
+        ("verifier.env", verifier.get("env") if isinstance(verifier, Mapping) else None),
+        ("healthcheck", task.get("healthcheck")),
+    ):
+        if entry is not None and not isinstance(entry, Mapping):
+            raise ConfigError(f"{where}: its task's `{name}` must be a mapping, got {type(entry).__name__}")
+    if task.get("healthcheck") and not task["healthcheck"].get("command"):
+        raise ConfigError(f"{where}: its task's `healthcheck` has no command")
+    named = []
+    if (task.get("sandbox") or {}).get("build") is not None:
+        named.append("sandbox.build")
+    if (verifier or {}).get("tests"):
+        named.append("verifier.tests")
+    if not paths or not named:
+        return
+    directory = task.get("dir")
+    if not isinstance(directory, str) or not directory:
+        raise ConfigError(
+            f"{where}: its task names a directory of this host in {' and '.join(named)}, which only a "
+            "task directory may do. Make it a task directory and name that in data.uri "
+            "(docs/SANDBOX.md, section 3), or have the row name an image (sandbox.image) and "
+            "score with env.params.verifier"
+        )
+    from monorl.data.tasks import load_task  # lazily: the data layer imports the config schema
+
+    try:
+        on_disk = load_task(Path(directory))["task"]
+    except (DataError, OSError) as e:
+        raise ConfigError(
+            f"{where}: its task names a directory of this host in {' and '.join(named)}, but its "
+            f"`dir` {directory!r} cannot be read as a task directory: {e}"
+        ) from e
+    differing = sorted(
+        str(key)
+        for key in {*task, *on_disk} - {"metadata"}  # the author's notes; nothing runs on them
+        if task.get(key) != on_disk.get(key)
+    )
+    if differing:
+        raise ConfigError(
+            f"{where}: its task names the task directory {directory!r} but is not what that "
+            f"directory says (differing: {differing}), so the directories of this host it names "
+            "are refused. Read the task from its directory: name the directory in data.uri"
+        )
+
+
 class HarnessEnv:
     """One agent process per episode, served by the capture gateway (module docstring)."""
 
@@ -177,6 +254,7 @@ class HarnessEnv:
         command: str | list[str],
         timeout: float = DEFAULT_TIMEOUT_S,
         env: Mapping[str, Any] | None = None,
+        host_env: list[str] | None = None,
         verifier: str | list[str] | None = None,
         verifier_timeout: float = DEFAULT_VERIFIER_TIMEOUT_S,
         workdir: Mapping[str, Any] | None = None,
@@ -196,6 +274,14 @@ class HarnessEnv:
         if not isinstance(env or {}, Mapping) or not isinstance(workdir or {}, Mapping):
             raise ConfigError("env.params.env and env.params.workdir must be mappings")
         self.env = {str(key): str(value) for key, value in (env or {}).items()}
+        if not isinstance(host_env or [], (list, tuple)) or not all(
+            isinstance(name, str) and name for name in host_env or []
+        ):
+            raise ConfigError(
+                "env.params.host_env must be a list of names of environment variables that tasks "
+                f"may read with ${{VAR}}, got {host_env!r}"
+            )
+        self.host_env = frozenset(host_env or [])
         workdir = dict(workdir or {})
         if set(workdir) - {"root", "template"}:
             raise ConfigError(f"env.params.workdir accepts 'root' and 'template', got {sorted(workdir)}")
@@ -247,15 +333,16 @@ class HarnessEnv:
         from monorl.gateway import build_trajectory, get_gateway
 
         task = task_spec(sample)
-        config = self.sandbox if task is None else self.sandbox.override(task.get("sandbox") or {})
-        if task is not None and config.backend != "docker":
-            raise ConfigError(
-                f"sample {sample.id!r} is a task with an environment of its own: it runs in a "
-                "container, set env.params.sandbox.backend to 'docker'"
-            )
-        task_verifier = task.get("verifier") if task is not None else None
-        if not isinstance(task_verifier, Mapping) or not task_verifier.get("tests"):
-            task_verifier = None
+        config = self.sandbox
+        task_env: tuple[dict[str, str], set[str]] = ({}, set())
+        verifier_env: tuple[dict[str, str], set[str]] = ({}, set())
+        task_verifier = None
+        if task is not None:
+            # The task is the dataset's, not the run config's: everything it says is checked
+            # before anything is started for it.
+            config, task_env, verifier_env = self._task_settings(sample, task)
+            verifier = task.get("verifier")
+            task_verifier = verifier if verifier and verifier.get("tests") else None
         agent_user = _optional(task.get("user")) if task is not None else None
         timeout = self.timeout
         if task is not None and task.get("timeout") is not None:
@@ -299,9 +386,7 @@ class HarnessEnv:
         task_file.write_text(
             json.dumps(task_payload(sample), ensure_ascii=False, indent=2, default=str), encoding="utf-8"
         )
-        sandbox.start(
-            episode_dir, logs=logs, env=_host_env(task.get("env") if task is not None else None), abort=abort
-        )
+        sandbox.start(episode_dir, logs=logs, env=task_env[0], env_by_name=task_env[1], abort=abort)
         if isinstance(sandbox, DockerSandbox) and not mounted_work and self.workdir_template is not None:
             sandbox.copy_in(self.workdir_template, sandbox.workdir)
         stdout, stderr = episode_dir / "agent.stdout", episode_dir / "agent.stderr"
@@ -367,7 +452,9 @@ class HarnessEnv:
         verdict = None
         if task_verifier is not None:
             assert isinstance(sandbox, DockerSandbox) and logs is not None
-            verdict = self._verify_task(task_verifier, sandbox, logs, group_id=group_id, abort=abort)
+            verdict = self._verify_task(
+                task_verifier, verifier_env, sandbox, logs, group_id=group_id, abort=abort
+            )
         elif self.verifier is not None:
             reference_file = episode_dir / "reference.json"
             reference_file.write_text(
@@ -404,6 +491,36 @@ class HarnessEnv:
             shutil.rmtree(episode_dir, ignore_errors=True)
 
     # -- internals --------------------------------------------------------------------------
+    def _task_settings(
+        self, sample: Sample, task: Mapping[str, Any]
+    ) -> tuple[SandboxConfig, tuple[dict[str, str], set[str]], tuple[dict[str, str], set[str]]]:
+        """The sandbox config for a sample's task and its two environments (the container's and
+        the verifier's, :func:`_host_env`). ``ConfigError`` naming the sample and everything its
+        task may not do (module docstring)."""
+        if self.sandbox.backend != "docker":
+            raise ConfigError(
+                f"sample {sample.id!r} is a task with an environment of its own: it runs in a "
+                "container, set env.params.sandbox.backend to 'docker'"
+            )
+        where = f"sample {sample.id!r}: "
+        checked_task(sample, task, paths=False)
+        verifier = task.get("verifier") or {}
+        settings: list[Any] = []
+        refused: list[str] = []
+        for check in (
+            lambda: self.sandbox.for_task(task.get("sandbox") or {}, sample_id=sample.id),
+            lambda: _host_env(task.get("env"), self.host_env, sample.id, "env"),
+            lambda: _host_env(verifier.get("env"), self.host_env, sample.id, "verifier.env"),
+            lambda: checked_task(sample, task),
+        ):
+            try:
+                settings.append(check())
+            except ConfigError as e:
+                refused.append(str(e).removeprefix(where))
+        if refused:
+            raise ConfigError(where + "; ".join(refused))
+        return settings[0], settings[1], settings[2]
+
     def _make_dir(self, *, shared: bool) -> Path:
         """A fresh directory for the episode: ``task.json``, captured output and ``work/``.
         ``shared``: users other than the owner get in."""
@@ -520,6 +637,7 @@ class HarnessEnv:
     def _verify_task(
         self,
         verifier: Mapping[str, Any],
+        env: tuple[dict[str, str], set[str]],
         sandbox: DockerSandbox,
         logs: Path,
         *,
@@ -528,7 +646,8 @@ class HarnessEnv:
     ) -> dict[str, Any]:
         """Run a task's verifier the way Harbor does: whatever the agent left under ``/tests``
         and any reward file it wrote are removed, the task's ``tests`` directory is copied to
-        ``/tests``, ``/tests/test.sh`` runs in the working directory and the reward is read from
+        ``/tests``, ``/tests/test.sh`` runs in the working directory with ``env`` (the task's
+        variables and which of them go by name, :func:`_host_env`) and the reward is read from
         ``/logs/verifier``. ``{reward, exit_code, timed_out, stdout_tail, stderr_tail}`` plus
         ``rewards`` (every metric of ``reward.json``) and ``error`` (no usable reward file)."""
         assert self._dir is not None
@@ -542,7 +661,8 @@ class HarnessEnv:
         exit_code, timed_out = self._run(
             [script],
             {},
-            env=_host_env(verifier.get("env")),
+            env=env[0],
+            env_by_name=env[1],
             stdout=stdout,
             stderr=stderr,
             timeout=TASK_VERIFIER_TIMEOUT_S if timeout is None else _seconds(timeout, "verifier timeout"),
@@ -585,6 +705,7 @@ class HarnessEnv:
         abort: threading.Event | None,
         session: Session | None = None,
         user: str | None = None,
+        env_by_name: set[str] | None = None,
     ) -> tuple[int, bool]:
         """Run ``command`` in the sandbox's working directory until it exits or ``timeout``
         passes; ``(exit code, timed out)``. Its process group on this host is always killed and
@@ -596,7 +717,9 @@ class HarnessEnv:
         argv = [_fill(arg, values) for arg in command]
         try:
             with open(stdout, "wb") as out, open(stderr, "wb") as err:
-                proc = self._sandbox.popen(argv, env=env, stdout=out, stderr=err, user=user)
+                proc = self._sandbox.popen(
+                    argv, env=env, stdout=out, stderr=err, user=user, env_by_name=env_by_name
+                )
         except OSError as e:
             raise EnvironmentError_(
                 f"episode {group_id}: cannot start the harness {what} {argv!r}: {e}"
@@ -711,24 +834,49 @@ def _fill(text: str, values: Mapping[str, str]) -> str:
     return _PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), text)
 
 
-def _host_env(env: Mapping[str, Any] | None) -> dict[str, str]:
-    """A task's environment variables with Harbor's templates resolved: a value that is exactly
-    ``${VAR}`` or ``${VAR:-default}`` is read from this process's environment."""
+def _host_env(
+    env: Mapping[str, Any] | None, allowed: frozenset[str], sample_id: str, entry: str
+) -> tuple[dict[str, str], set[str]]:
+    """A task's environment variables (its ``entry``: ``env`` or ``verifier.env``) with Harbor's
+    templates resolved: a value that is exactly ``${VAR}`` or ``${VAR:-default}`` is read from
+    this process's environment, when ``VAR`` is in ``allowed`` (``env.params.host_env``);
+    ``ConfigError`` naming the variable when it is not.
+
+    Returns the variables and the names among them that are handed to the container by name
+    (``-e NAME``): the ones that read the host variable of the same name. Their values stay out of
+    the process list, and the Docker CLI's environment is what it was. Every other variable goes
+    by value (:func:`monorl.envs.sandbox._env_args`)."""
     resolved: dict[str, str] = {}
+    by_name: set[str] = set()
+    refused: dict[str, str] = {}
     for key, value in (env or {}).items():
+        key = str(key)
         template = _HOST_VARIABLE_RE.fullmatch(str(value))
         if template is None:
-            resolved[str(key)] = str(value)
-        elif template.group(1) in os.environ:
-            resolved[str(key)] = os.environ[template.group(1)]
-        elif template.group(2) is not None:
-            resolved[str(key)] = template.group(2)
+            resolved[key] = str(value)
+            continue
+        variable, default = template.groups()
+        if variable not in allowed:
+            refused[variable] = f"{entry}.{key}"
+        elif variable in os.environ:
+            resolved[key] = os.environ[variable]
+            if key == variable:
+                by_name.add(key)
+        elif default is not None:
+            resolved[key] = default
         else:
             raise ConfigError(
-                f"the task's environment variable {key} is read from {template.group(1)}, "
+                f"sample {sample_id!r}: its task's variable {entry}.{key} is read from {variable}, "
                 "which is not set in monorl's environment"
             )
-    return resolved
+    if refused:
+        raise ConfigError(
+            f"sample {sample_id!r}: its task reads {sorted(refused)} from monorl's environment "
+            f"({', '.join(sorted(refused.values()))}), which the run config does not allow. A task "
+            "may read the variables listed in env.params.host_env: add the names there if this "
+            "dataset is to have them"
+        )
+    return resolved, by_name
 
 
 def _verifier_reward(output: str, exit_code: int) -> float:
@@ -778,4 +926,4 @@ def _tail(path: Path) -> str:
         return f.read().decode("utf-8", errors="replace")[-TAIL_CHARS:]
 
 
-__all__ = ["HarnessEnv", "make_harness_env", "policy_processor", "task_payload", "task_spec"]
+__all__ = ["HarnessEnv", "checked_task", "make_harness_env", "policy_processor", "task_payload", "task_spec"]

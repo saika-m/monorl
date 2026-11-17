@@ -10,7 +10,8 @@
 Options of the docker backend (``docs/SANDBOX.md``): ``image`` or ``build`` (a context, built
 once and cached under a content-addressed tag), ``build_timeout``, ``workdir``, ``mounts``,
 ``network``, ``cpus``, ``memory``, ``pids_limit``, ``gpus``, ``user``, ``platform``, ``python``,
-``keep_entrypoint``, ``keep_processes``, ``args``, ``start_timeout``.
+``keep_entrypoint``, ``keep_processes``, ``args``, ``start_timeout``. A task that a sample brings
+may set the ones in :data:`TASK_OPTIONS` only (:meth:`SandboxConfig.for_task`).
 
 A container never outlives its episode: :meth:`DockerSandbox.close` removes it, and a watchdog
 process per monorl process removes every container of that process once the process is gone,
@@ -35,7 +36,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
 from typing import IO, Any
@@ -61,6 +62,11 @@ CLI_TIMEOUT_S = 60.0
 DAEMON_TIMEOUT_S = 20.0
 """Seconds ``docker info`` may take before the daemon counts as not answering."""
 PLATFORM = sys.platform
+
+TASK_OPTIONS = ("image", "build", "build_timeout", "workdir", "cpus", "memory", "gpus", "keep_entrypoint")
+"""The options a task may set: what describes its own container (what a task directory says,
+:mod:`monorl.data.tasks`). Everything that reaches beyond the container (``mounts``, ``network``,
+``args``, ``user``, the backend, ...) is the run config's."""
 
 _KEEP_ALIVE = ["sh", "-c", "sleep infinity"]
 _CGROUP_FILES = ["/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/memory.events", "/sys/fs/cgroup/memory.peak"]
@@ -136,6 +142,31 @@ class SandboxConfig:
         if config.image is not None and config.build is not None:
             raise ConfigError("env.params.sandbox takes `image` or `build`, not both")
         return config
+
+    def for_task(self, options: Mapping[str, Any], *, sample_id: str) -> SandboxConfig:
+        """This config with the ``sandbox`` options of the task that sample ``sample_id`` brings
+        laid over it. The task is data, not the run's config: it may set :data:`TASK_OPTIONS`
+        and nothing else, and a build is a context directory without further settings. Raises
+        ``ConfigError`` naming the sample and the options it may not set."""
+        if not isinstance(options, Mapping):
+            raise ConfigError(f"sample {sample_id!r}: its task's `sandbox` must be a mapping of options")
+        refused = sorted(str(key) for key in set(options) - set(TASK_OPTIONS))
+        if refused:
+            raise ConfigError(
+                f"sample {sample_id!r}: its task sets sandbox option(s) {refused}, which only the run "
+                f"config may set (env.params.sandbox); a task may set {list(TASK_OPTIONS)}"
+            )
+        build = options.get("build")
+        if isinstance(build, Mapping) and set(build) - {"context"}:
+            raise ConfigError(
+                f"sample {sample_id!r}: its task sets sandbox.build option(s) "
+                f"{sorted(str(key) for key in set(build) - {'context'})}; a task's build is its "
+                "context directory only, the other build options are the run config's"
+            )
+        try:
+            return self.override(options)
+        except ConfigError as e:
+            raise ConfigError(f"sample {sample_id!r}: its task's sandbox options: {e}") from e
 
 
 def _text(name: str) -> Any:
@@ -328,6 +359,7 @@ class LocalSandbox:
         *,
         logs: Path | None = None,
         env: Mapping[str, str] | None = None,
+        env_by_name: Collection[str] | None = None,
         abort: threading.Event | None = None,
     ) -> None:
         self.workdir = str(episode_dir / "work")
@@ -352,6 +384,7 @@ class LocalSandbox:
         stdout: IO[bytes],
         stderr: IO[bytes],
         user: str | None = None,
+        env_by_name: Collection[str] | None = None,
     ) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
             argv,
@@ -628,15 +661,22 @@ def ensure_image(
         return image, workdir
 
 
-def _env_args(env: Mapping[str, str]) -> tuple[list[str], dict[str, str]]:
+def _env_args(
+    env: Mapping[str, str], by_name: Collection[str] | None = None
+) -> tuple[list[str], dict[str, str]]:
     """``-e`` arguments that hand ``env`` to a container, and the environment the CLI needs for
     them. Variables go by name (``-e NAME``, value taken from the CLI's environment), which keeps
     their values — the session id — out of the host's process list; the few names the CLI reads
-    itself go by value."""
+    itself go by value.
+
+    ``by_name`` is for an ``env`` whose names were not chosen by the run config (a task's): only
+    the names in it go by name, every other one by value, so that such a name never becomes a
+    variable of the CLI process on this host (``LD_PRELOAD``, say)."""
     args: list[str] = []
     cli_env = dict(os.environ)
     for key, value in env.items():
         by_value = key in _CLI_VARIABLES or key.startswith("DOCKER_") or key.upper().endswith("_PROXY")
+        by_value = by_value or (by_name is not None and key not in by_name)
         args += ["-e", f"{key}={value}" if by_value else key]
         if not by_value:
             cli_env[key] = value
@@ -671,11 +711,12 @@ class DockerSandbox:
         *,
         logs: Path | None = None,
         env: Mapping[str, str] | None = None,
+        env_by_name: Collection[str] | None = None,
         abort: threading.Event | None = None,
     ) -> None:
         """Pull or build the image if needed and start the idle container: ``episode_dir`` at
         :data:`CONTAINER_DIR`, ``logs`` (if any) at ``/logs``, ``env`` as the container's
-        environment."""
+        environment (``env_by_name``: :func:`_env_args`)."""
         config = self.config
         in_vm = self._in_vm()
         self.image, image_workdir = ensure_image(self.docker, config, abort=abort)
@@ -708,7 +749,7 @@ class DockerSandbox:
         ):
             if value is not None:
                 command += [flag, f"{value:g}" if isinstance(value, float) else str(value)]
-        env_args, cli_env = _env_args(env or {})
+        env_args, cli_env = _env_args(env or {}, env_by_name)
         command += [*env_args, *config.args, self.image, *_KEEP_ALIVE]
         self._created = True  # from here on a container of this name may exist
         result = _docker(self.docker, command, timeout=config.start_timeout, env=cli_env)
@@ -735,10 +776,11 @@ class DockerSandbox:
         stdout: IO[bytes],
         stderr: IO[bytes],
         user: str | None = None,
+        env_by_name: Collection[str] | None = None,
     ) -> subprocess.Popen[bytes]:
         """``docker exec`` of ``argv`` in the working directory. Killing the returned CLI process
         does not stop ``argv`` inside the container: :meth:`settle` and :meth:`close` do."""
-        env_args, cli_env = _env_args(env)
+        env_args, cli_env = _env_args(env, env_by_name)
         command = [self.docker, "exec", "-w", self.workdir, *env_args]
         user = user or self.config.user
         if user is not None:
@@ -832,6 +874,7 @@ __all__ = [
     "CONTAINER_DIR",
     "CONTAINER_HOST",
     "IMAGE_WORKDIR",
+    "TASK_OPTIONS",
     "Build",
     "DockerSandbox",
     "LocalSandbox",
