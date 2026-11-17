@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from conftest import gpu_cluster
 from monorl.core.errors import ConfigError
 from monorl.distributed import ClusterInfo, plan_placement
 from monorl.distributed.placement import estimate_model
+from tests.distributed.conftest import gpu_cluster
 
 LLAMA_7B = {
     "architectures": ["LlamaForCausalLM"],
