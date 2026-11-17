@@ -225,7 +225,7 @@ func TestHTTPRoutesAndStatuses(t *testing.T) {
 	if code, m := getJSON(t, base+"/health"); code != 200 || m["ok"] != true {
 		t.Errorf("GET /health: %d %v", code, m)
 	}
-	if code, m := postJSON(t, base+"/spec", ""); code != 200 || m["name"] != "counter" {
+	if code, m := postJSON(t, base+"/spec", "{}"); code != 200 || m["name"] != "counter" {
 		t.Errorf("POST /spec: %d %v", code, m)
 	}
 	if code, _ := getJSON(t, base+"/reset"); code != 405 {
@@ -257,6 +257,121 @@ func TestHTTPRoutesAndStatuses(t *testing.T) {
 	}
 	if env.store.Len() != 0 {
 		t.Errorf("episode leaked")
+	}
+}
+
+// send issues method url with the given headers and returns the status and the decoded body.
+func send(t *testing.T, method, url, body string, headers map[string]string) (int, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("%s %s: non-JSON response %q", method, url, raw)
+	}
+	return resp.StatusCode, m
+}
+
+// A web page can send a POST with a text/plain or form body to any address, and its requests
+// carry Origin: none of them may reach the environment.
+func TestHTTPRefusesRequestsOfWebPages(t *testing.T) {
+	env := newCounterEnv()
+	srv, base := startHTTP(t, env, -1)
+	reset := `{"episode_id":"e1","sample":` + sampleJSON("s1") + `}`
+	step := `{"episode_id":"e1","action":{"text":"a","finish_reason":"stop"}}`
+	asJSON := map[string]string{"Content-Type": "application/json"}
+
+	refused := []struct {
+		name, method, path, body string
+		headers                  map[string]string
+		status                   int
+		errType                  string
+	}{
+		{"text/plain reset", "POST", "/reset", reset, map[string]string{"Content-Type": "text/plain"}, 415, ErrTypeUnsupportedMediaType},
+		{"form reset", "POST", "/reset", reset, map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, 415, ErrTypeUnsupportedMediaType},
+		{"multipart reset", "POST", "/reset", reset, map[string]string{"Content-Type": "multipart/form-data; boundary=x"}, 415, ErrTypeUnsupportedMediaType},
+		{"reset without content type", "POST", "/reset", reset, nil, 415, ErrTypeUnsupportedMediaType},
+		{"json look-alike", "POST", "/reset", reset, map[string]string{"Content-Type": "text/plain; application/json"}, 415, ErrTypeUnsupportedMediaType},
+		{"text/plain spec", "POST", "/spec", "", map[string]string{"Content-Type": "text/plain"}, 415, ErrTypeUnsupportedMediaType},
+		{"json reset with origin", "POST", "/reset", reset, map[string]string{"Content-Type": "application/json", "Origin": "http://evil.example"}, 403, ErrTypeForbidden},
+		{"text/plain reset with origin", "POST", "/reset", reset, map[string]string{"Content-Type": "text/plain", "Origin": "http://evil.example"}, 403, ErrTypeForbidden},
+		{"null origin", "POST", "/reset", reset, map[string]string{"Content-Type": "application/json", "Origin": "null"}, 403, ErrTypeForbidden},
+		{"own origin", "POST", "/reset", reset, map[string]string{"Content-Type": "application/json", "Origin": base}, 403, ErrTypeForbidden},
+		{"get with origin", "GET", "/spec", "", map[string]string{"Origin": "http://evil.example"}, 403, ErrTypeForbidden},
+		{"unknown route with origin", "GET", "/nope", "", map[string]string{"Origin": "http://evil.example"}, 403, ErrTypeForbidden},
+	}
+	for _, c := range refused {
+		code, m := send(t, c.method, base+c.path, c.body, c.headers)
+		e, _ := m["error"].(map[string]any)
+		if code != c.status || e["type"] != c.errType || e["message"] == "" {
+			t.Errorf("%s: want %d %s, got %d %v", c.name, c.status, c.errType, code, m)
+		}
+	}
+	if srv.h.Live() != 0 || env.store.Len() != 0 {
+		t.Fatalf("a refused reset opened an episode (%d sessions)", srv.h.Live())
+	}
+
+	// A refused step leaves a live episode where it was.
+	if code, m := send(t, "POST", base+"/reset", reset, asJSON); code != 200 {
+		t.Fatalf("reset: %d %v", code, m)
+	}
+	for _, headers := range []map[string]string{
+		{"Content-Type": "text/plain"},
+		{"Content-Type": "application/json", "Origin": "http://evil.example"},
+	} {
+		if code, m := send(t, "POST", base+"/step", step, headers); code == 200 {
+			t.Errorf("step with %v was answered: %v", headers, m)
+		}
+		if code, m := send(t, "POST", base+"/close", `{"episode_id":"e1"}`, headers); code == 200 {
+			t.Errorf("close with %v was answered: %v", headers, m)
+		}
+	}
+	if code, m := send(t, "POST", base+"/step", step, asJSON); code != 200 || m["reward"] != 1.0 {
+		t.Errorf("the first step that is answered should be turn 1: %d %v", code, m)
+	}
+}
+
+// What environment clients send is answered: application/json in any case and with parameters.
+func TestHTTPAnswersEnvironmentClients(t *testing.T) {
+	_, base := startHTTP(t, newCounterEnv(), -1)
+	for i, contentType := range []string{
+		"application/json", "application/json; charset=utf-8", "Application/JSON", "application/json;charset=utf-8",
+	} {
+		id := fmt.Sprintf("e%d", i)
+		headers := map[string]string{"Content-Type": contentType}
+		reset := fmt.Sprintf(`{"episode_id":%q,"sample":%s}`, id, sampleJSON("s1"))
+		if code, m := send(t, "POST", base+"/reset", reset, headers); code != 200 {
+			t.Errorf("reset as %q: %d %v", contentType, code, m)
+		}
+		step := fmt.Sprintf(`{"episode_id":%q,"action":{"text":"a","finish_reason":"stop"}}`, id)
+		if code, m := send(t, "POST", base+"/step", step, headers); code != 200 || m["reward"] != 1.0 {
+			t.Errorf("step as %q: %d %v", contentType, code, m)
+		}
+	}
+	// GET has no body to declare, and a name in Host is answered (http://env-wordle:8080).
+	req, err := http.NewRequest("GET", base+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "env-wordle:8080"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("GET /health with Host env-wordle:8080: %d", resp.StatusCode)
 	}
 }
 

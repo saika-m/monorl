@@ -235,7 +235,7 @@ def test_http_spec_health_and_statuses(http_server, example: Example) -> None:
     assert spec.protocol == protocol.PROTOCOL_VERSION and spec.name == example.name
     assert client.health()["ok"] is True
     h = client.http
-    assert h.post("/spec").status_code == 200
+    assert h.post("/spec", json={}).status_code == 200
     r = h.get("/reset")
     assert r.status_code == 405 and r.json()["error"]["type"] == "method_not_allowed"
     r = h.get("/nope")
