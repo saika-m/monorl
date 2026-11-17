@@ -17,10 +17,10 @@ import torch
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, GenerationCancelled
 from monorl.core.types import Completion, PromptInput, SamplingParams
-from monorl.mtp import write_checkpoint_weights
+from monorl.mtp import MtpLayers, write_checkpoint_weights
 from monorl.rollout.hf_engine import HFRolloutEngine, chat_prompt_ids
 from monorl.rollout.media import load_processor
-from tests.rollout.tiny_mtp import build_tiny_mtp, fit_to_greedy
+from tests.rollout.tiny_mtp import build_tiny_mtp, fit_to_greedy, mtp_layers_on
 from tests.rollout.tiny_vlm import image_chat
 
 CHAT = [{"role": "user", "content": "Say hello."}]
@@ -314,6 +314,51 @@ def test_weights_loaded_from_a_directory_reach_policy_and_drafter(
     for engine in (cold, plain):
         with pytest.raises(KeyError, match="nope"):
             engine.load_weights_from_path(export)
+
+
+class _TwoLayerEngine(HFRolloutEngine):
+    """Mellum checkpoints hold one MTP layer; the depth logic runs on two layers built in memory."""
+
+    def _load_mtp_layers(self, config: RunConfig) -> MtpLayers:
+        with torch.random.fork_rng():
+            torch.manual_seed(0)
+            layers = MtpLayers.of(self.model, mtp_layers_on(self.model, 2).requires_grad_(False))
+        layers.install_drafting()
+        return layers
+
+
+def test_prompts_shorter_than_the_mtp_depth_are_decoded(plain: HFRolloutEngine, model_dir: Path) -> None:
+    """Two MTP layers and prompts of one token, next to one that is long enough: the first draft
+    of a short prompt is rejected before the sequence is as long as the layers are deep."""
+    engine = _TwoLayerEngine(_config(model_dir, enabled=True, rollout=True))
+    try:
+        prompts: list[PromptInput] = [[7], [1, 5, 9, 17], [40]]
+        greedy = SamplingParams(n=1, max_new_tokens=12, temperature=0.0, top_logprobs=2)
+        got = engine.generate(prompts, greedy)
+        _assert_same(got, plain.generate(prompts, greedy))
+        stats = engine.speculation_stats()
+        # random layers: every draft was made (two tokens each) and rejected
+        assert stats.emitted == stats.steps == _num_tokens(got) == 3 * 12
+        assert stats.accepted == 0 and stats.drafted == 2 * 3 * (12 - 2)
+
+        sampled = SamplingParams(n=3, max_new_tokens=12, temperature=1.0, seed=5)
+        out = engine.generate(prompts, sampled)
+        stats = engine.speculation_stats()
+        assert stats.emitted == stats.steps + stats.accepted == _num_tokens(out)
+        assert 0 < stats.accepted < stats.drafted
+        for prompt, group in zip(prompts, out, strict=True):
+            assert len(group) == 3
+            for c in group:
+                assert c.prompt_token_ids == prompt
+                tokens = torch.tensor(c.token_ids)[:, None]
+                reference = _policy_logprobs(engine, c).gather(1, tokens).squeeze(1)
+                torch.testing.assert_close(torch.tensor(c.logprobs), reference, rtol=1e-4, atol=1e-5)
+        again = engine.generate(prompts, sampled)
+        assert [[c.token_ids for c in g] for g in again] == [[c.token_ids for c in g] for g in out]
+        assert [[c.logprobs for c in g] for g in again] == [[c.logprobs for c in g] for g in out]
+        assert engine.speculation_stats() == stats
+    finally:
+        engine.shutdown()
 
 
 def test_cancel_stops_a_drafting_call_within_a_step(
