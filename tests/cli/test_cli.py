@@ -211,6 +211,18 @@ def test_recipes_dir_env_override(runner: CliRunner, tmp_path: Path, monkeypatch
 RECIPE_BODY = "model: {name_or_path: x}\ndata: {uri: y}\nrewards: [{type: exact_match}]\n"
 
 
+def test_recipes_list_shows_a_description_with_brackets_as_written(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "tags.yaml").write_text(
+        "# Prompts in the [INST] ... [/INST] format, [bold] kept.\n" + RECIPE_BODY
+    )
+    monkeypatch.setenv("MONORL_RECIPES_DIR", str(tmp_path))
+    result = runner.invoke(app, ["recipes", "list"], env={"COLUMNS": "1000"})
+    assert result.exit_code == 0, result.output
+    assert "Prompts in the [INST] ... [/INST] format, [bold] kept." in result.output
+
+
 def test_yml_recipe_is_listed_and_shown(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -674,6 +686,23 @@ def test_data_inspect_reports_a_missing_path_without_a_traceback(runner: CliRunn
     flat = " ".join(result.output.split())
     assert "dataset path not found: openai/gsm8k" in flat and "hf://openai/gsm8k" in flat
     assert "Traceback" not in result.output
+
+
+def test_data_inspect_shows_bracketed_text_as_it_is(runner: CliRunner, tmp_path: Path) -> None:
+    """Rows and messages are text, not console markup: ``[/INST]`` is no closing tag (it used to
+    end the command with a MarkupError) and ``[bold]`` no style (it used to vanish)."""
+    f = tmp_path / "d[v1].jsonl"
+    f.write_text(json.dumps({"prompt": "[INST] What is [bold]2+2[/bold]? [/INST]", "answer": "[4]"}) + "\n")
+    result = runner.invoke(app, ["data", "inspect", str(f)], env={"COLUMNS": "1000"})
+    assert result.exit_code == 0, result.output
+    lines = [" ".join(line.split()) for line in result.output.splitlines()]
+    assert lines[0] == str(f)
+    assert "│ [INST] What is [bold]2+2[/bold]? [/INST] │ [4] │" in lines
+    assert f"sample {f}#0 reference='[4]'" in lines
+
+    result = runner.invoke(app, ["data", "inspect", str(tmp_path / "[x-z]*.jsonl")], env={"COLUMNS": "1000"})
+    assert result.exit_code == 1
+    assert result.output.strip() == f"error: glob '{tmp_path}/[x-z]*.jsonl' matched no supported data files"
 
 
 def test_data_inspect_reads_the_data_source_of_a_provider(

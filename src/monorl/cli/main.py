@@ -51,7 +51,7 @@ EXIT_BY_STATE: dict[str, int] = {"succeeded": 0, "failed": 1, "cancelled": 130}
 
 
 def _fail(message: str, code: int = 1) -> None:
-    err_console.print(f"[bold red]error:[/bold red] {message}")
+    err_console.print(f"[bold red]error:[/bold red] {escape(message)}")
     raise typer.Exit(code)
 
 
@@ -109,10 +109,10 @@ def train(
     except MonorlError as e:
         _fail(str(e))
         return
-    console.print(f"run dir: {result.run_dir}")
+    console.print(f"run dir: {escape(result.run_dir)}")
     console.print(f"state: {result.state}  final step: {result.final_step}")
     if result.error:
-        err_console.print(f"[red]{result.error}[/red]")
+        err_console.print(f"[red]{escape(result.error)}[/red]")
     if result.metrics:
         table = Table(title="final metrics", show_lines=False)
         table.add_column("metric")
@@ -121,7 +121,7 @@ def train(
             table.add_row(key, f"{result.metrics[key]:.6g}")
         console.print(table)
     if result.final_model_path:
-        console.print(f"final model: {result.final_model_path}")
+        console.print(f"final model: {escape(result.final_model_path)}")
     raise typer.Exit(EXIT_BY_STATE.get(result.state, 1))
 
 
@@ -164,7 +164,7 @@ def _run_pipeline(config: Path, data: dict[str, Any], run_dir: Path | None, resu
     except MonorlError as e:
         _fail(str(e))
         return
-    console.print(f"pipeline dir: {result.run_dir}")
+    console.print(f"pipeline dir: {escape(result.run_dir)}")
     table = Table(title="stages", show_lines=False)
     table.add_column("#", justify="right")
     table.add_column("name")
@@ -173,14 +173,18 @@ def _run_pipeline(config: Path, data: dict[str, Any], run_dir: Path | None, resu
     table.add_column("step", justify="right")
     for stage in result.stages:
         table.add_row(
-            str(stage["index"] + 1), stage["name"], stage["type"], stage["state"], str(stage.get("step", 0))
+            str(stage["index"] + 1),
+            escape(stage["name"]),
+            stage["type"],
+            stage["state"],
+            str(stage.get("step", 0)),
         )
     console.print(table)
     console.print(f"state: {result.state}")
     if result.error:
-        err_console.print(f"[red]{result.error}[/red]")
+        err_console.print(f"[red]{escape(result.error)}[/red]")
     if result.final_model_path:
-        console.print(f"final model: {result.final_model_path}")
+        console.print(f"final model: {escape(result.final_model_path)}")
     raise typer.Exit(EXIT_BY_STATE.get(result.state, 1))
 
 
@@ -286,7 +290,7 @@ def doctor(as_json: bool = typer.Option(False, "--json", help="Emit the report a
     if report.errors:
         err_console.print("[yellow]warnings:[/yellow]")
         for line in report.errors:
-            err_console.print(f"  - {line}")
+            err_console.print(f"  - {escape(line)}")
 
 
 # -- patches ---------------------------------------------------------------------------------
@@ -326,7 +330,7 @@ def _status_table(framework: str, statuses: list[Any]) -> Table:
             _yes_no(s.applicable),
             _yes_no(s.applied),
             _yes_no(s.verified),
-            s.reason or "",
+            escape(s.reason or ""),
         )
     return table
 
@@ -388,9 +392,9 @@ def patches_apply(
     for pid in report.applied:
         console.print(f"  [green]applied[/green]  {pid}")
     for pid, reason in report.skipped:
-        console.print(f"  [yellow]skipped[/yellow]  {pid}: {reason}")
+        console.print(f"  [yellow]skipped[/yellow]  {pid}: {escape(reason)}")
     for pid, error in report.failed:
-        console.print(f"  [red]failed[/red]   {pid}: {error}")
+        console.print(f"  [red]failed[/red]   {pid}: {escape(error)}")
     if report.failed:
         raise typer.Exit(1)
 
@@ -441,11 +445,14 @@ def data_inspect(
     if as_json:
         typer.echo(json.dumps({**preview, "samples": samples}, indent=2, default=str))
         return
-    console.print(f"[bold]{uri}[/bold]")
+    console.print(f"[bold]{escape(uri)}[/bold]")
     inferred = preview.get("inferred") or {}
     console.print(
-        "format: {format}  prompt: {prompt_field}  answer: {answer_field}  messages: {messages_field}".format(
-            **{k: inferred.get(k) for k in ("format", "prompt_field", "answer_field", "messages_field")}
+        escape(
+            "format: {format}  prompt: {prompt_field}  answer: {answer_field}  "
+            "messages: {messages_field}".format(
+                **{k: inferred.get(k) for k in ("format", "prompt_field", "answer_field", "messages_field")}
+            )
         )
     )
     if preview.get("num_rows") is not None:
@@ -453,12 +460,12 @@ def data_inspect(
     columns = preview.get("columns") or {}
     table = Table(title="rows")
     for name in columns:
-        table.add_column(f"{name} ({columns[name]})", overflow="fold", max_width=60)
+        table.add_column(escape(f"{name} ({columns[name]})"), overflow="fold", max_width=60)
     for row in preview.get("rows") or []:
-        table.add_row(*(str(row.get(name, ""))[:200] for name in columns))
+        table.add_row(*(escape(str(row.get(name, ""))[:200]) for name in columns))
     console.print(table)
     for s in samples:
-        console.print(f"[bold]sample {s['id']}[/bold] reference={s['reference']!r}")
+        console.print(f"[bold]sample {escape(str(s['id']))}[/bold] reference={escape(repr(s['reference']))}")
         for m in s["messages"]:
             console.print(escape(_message_line(m, 300)))
 
@@ -518,16 +525,18 @@ def env_check(
     if as_json:
         typer.echo(json.dumps(report.to_dict(), indent=2, default=str))
     else:
-        console.print(f"[bold]{report.transport}[/bold] {report.target}")
+        console.print(f"[bold]{report.transport}[/bold] {escape(report.target)}")
         if report.spec:
             spec = report.spec
             console.print(
-                f"spec: name={spec['name']} version={spec['version']} protocol={spec['protocol']} "
-                f"max_turns={spec['max_turns']} parallel_episodes={spec['parallel_episodes']} "
-                f"tools={len(spec.get('tools') or [])}"
+                escape(
+                    f"spec: name={spec['name']} version={spec['version']} protocol={spec['protocol']} "
+                    f"max_turns={spec['max_turns']} parallel_episodes={spec['parallel_episodes']} "
+                    f"tools={len(spec.get('tools') or [])}"
+                )
             )
             if spec.get("description"):
-                console.print(f"  {spec['description']}")
+                console.print(escape(f"  {spec['description']}"))
         if report.health is not None:
             console.print("health: ok")
         if report.reset_messages:
@@ -536,12 +545,14 @@ def env_check(
                 console.print(escape(_message_line(m, 200)))
         for s in report.steps:
             console.print(
-                f"step {s.turn}: reward={s.reward} done={s.done} messages={len(s.messages)} info={s.info}"
+                escape(
+                    f"step {s.turn}: reward={s.reward} done={s.done} messages={len(s.messages)} info={s.info}"
+                )
             )
         if report.closed:
             console.print("close: ok")
         if report.error:
-            err_console.print(f"[bold red]protocol error:[/bold red] {report.error}")
+            err_console.print(f"[bold red]protocol error:[/bold red] {escape(report.error)}")
         else:
             console.print("[green]MEP/1 conformance: OK[/green]")
     if not report.ok:
@@ -642,7 +653,7 @@ def recipes_list(as_json: bool = typer.Option(False, "--json")) -> None:
     table.add_column("kind")
     table.add_column("description", overflow="fold")
     for r in recipes:
-        table.add_row(r.name, r.kind, r.description)
+        table.add_row(escape(r.name), r.kind, escape(r.description))
     console.print(table)
 
 
