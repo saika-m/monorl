@@ -138,6 +138,35 @@ def test_finish_recorder_eos_and_length() -> None:
     assert rec.num_tokens == [2, 2, 1]
 
 
+def test_logprobs_stay_those_of_the_raw_distribution_under_every_sampling_knob(
+    engine: HFRolloutEngine,
+) -> None:
+    """Repetition penalty and the truncations change what is sampled from, not what is reported:
+    the trainer's log-softmax of the same logits has to give an importance ratio of 1."""
+    params = SamplingParams(
+        n=2,
+        max_new_tokens=6,
+        temperature=0.8,
+        top_p=0.9,
+        top_k=50,
+        min_p=0.05,
+        repetition_penalty=1.3,
+        seed=11,
+        top_logprobs=3,
+    )
+    for group in engine.generate(CHATS, params):
+        for c in group:
+            ids = torch.tensor([c.prompt_token_ids + c.token_ids])
+            with torch.no_grad():
+                logits = engine.model(input_ids=ids).logits[0].float()
+            start = len(c.prompt_token_ids)
+            reference = torch.log_softmax(logits[start - 1 : -1] / 0.8, dim=-1)
+            sampled = reference.gather(1, ids[0, start:, None]).squeeze(1)
+            torch.testing.assert_close(torch.tensor(c.logprobs), sampled, atol=1e-4, rtol=0.0)
+            top = torch.tensor(list(c.top_logprobs.logprobs)).reshape(len(c.token_ids), 3)
+            torch.testing.assert_close(top, reference.topk(3).values, atol=1e-4, rtol=0.0)
+
+
 def test_sampling_knobs_accepted(engine: HFRolloutEngine) -> None:
     params = SamplingParams(
         n=2,
@@ -213,12 +242,14 @@ def test_top_k_minus_one_disables_truncation(engine: HFRolloutEngine) -> None:
     """transformers backfills ``top_k=None`` with 50; the engine must pass 0 so sampling is
     full-vocabulary and matches the full-softmax logprobs it returns."""
     gc = engine._generation_config(
-        SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=-1, min_p=0.0), 1
+        SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=-1, min_p=0.0), 1, output_logits=False
     )
     effective, _ = engine.model._prepare_generation_config(gc)
     assert effective.top_k == 0
     assert effective.min_p == 0.0
-    gc = engine._generation_config(SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=7), 1)
+    gc = engine._generation_config(
+        SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=7), 1, output_logits=False
+    )
     effective, _ = engine.model._prepare_generation_config(gc)
     assert effective.top_k == 7
 

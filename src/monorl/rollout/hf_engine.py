@@ -35,7 +35,13 @@ from typing import Any
 
 import torch
 from transformers import AutoTokenizer, GenerationConfig
-from transformers.generation import StoppingCriteria, StoppingCriteriaList, StopStringCriteria
+from transformers.generation import (
+    LogitsProcessor,
+    LogitsProcessorList,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    StopStringCriteria,
+)
 
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, GenerationCancelled
@@ -137,6 +143,69 @@ def encode_prompt(prompt: PromptInput, tokenizer: Any, processor: Any | None) ->
             ids=[int(t) for t in enc["input_ids"][0].tolist()], token_aligned=aligned, media=media
         )
     return _EncodedPrompt(ids=chat_prompt_ids(tokenizer, prompt))
+
+
+class _LogprobRecorder(LogitsProcessor):
+    """The log-probability of every token a ``generate`` call samples, and of the ``top`` most
+    likely tokens at its position, under ``log_softmax(raw logits / temperature)``.
+
+    ``generate`` can hand back the raw logits of every step (``output_logits``), but then it holds
+    ``steps x rows x vocab`` floats until it returns. This keeps one step. :meth:`observe`, a
+    forward hook on the model, sees a step's logits before any logits processor has touched them;
+    the token that was chosen from them is the last one of ``input_ids`` when ``generate`` calls
+    its logits processors for the following step, which is all this processor is there for.
+    """
+
+    def __init__(self, temperature: float, *, logprobs: bool, top: int) -> None:
+        self.temperature = temperature
+        self.top = top
+        self._ahead: torch.Tensor | None = None  # log-softmax of the step whose token is not drawn yet
+        self._drawn: torch.Tensor | None = None  # ... of the step whose token is drawn but not read
+        self._logprobs: list[torch.Tensor] | None = [] if logprobs else None
+        self._top_ids: list[torch.Tensor] = []
+        self._top_logprobs: list[torch.Tensor] = []
+
+    def observe(self, module: torch.nn.Module, args: Any, output: Any) -> None:
+        # a new tensor, not a view: the logits of the first pass span the whole prompt
+        self._ahead = torch.log_softmax(output.logits[:, -1].float() / self.temperature, dim=-1)
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        self._read(input_ids[:, -1])
+        step, self._ahead = self._ahead, None
+        if step is None:
+            raise RuntimeError("generate asked for a token without a forward pass of the model")
+        if self.top > 0:
+            values, indices = step.topk(min(self.top, step.shape[-1]))
+            self._top_ids.append(indices.to("cpu", torch.int32))
+            self._top_logprobs.append(values.cpu())
+        if self._logprobs is not None:
+            self._drawn = step
+        return scores
+
+    def _read(self, tokens: torch.Tensor) -> None:
+        if self._drawn is not None and self._logprobs is not None:
+            self._logprobs.append(self._drawn.gather(1, tokens[:, None]).squeeze(1).cpu())
+            self._drawn = None
+
+    def result(
+        self, generated: torch.Tensor
+    ) -> tuple[torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
+        """``[rows, steps]`` log-probabilities of ``generated`` (``None`` unless asked for) and the
+        ``([rows, steps, k] token ids, log-probabilities)`` of the top tokens (``None`` unless
+        ``top > 0``)."""
+        rows, steps = generated.shape
+        if steps:
+            self._read(generated[:, -1])
+        logprobs = None
+        if self._logprobs is not None:
+            logprobs = torch.stack(self._logprobs, dim=1) if steps else torch.empty((rows, 0))
+        top = None
+        if self.top > 0:
+            if steps:
+                top = (torch.stack(self._top_ids, dim=1), torch.stack(self._top_logprobs, dim=1))
+            else:  # nothing was generated
+                top = (torch.empty((rows, 0, 0), dtype=torch.int32), torch.empty((rows, 0, 0)))
+        return logprobs, top
 
 
 class _FinishRecorder(StoppingCriteria):
@@ -444,7 +513,7 @@ class HFRolloutEngine:
             torch.manual_seed(seed)
             yield
 
-    def _generation_config(self, params: SamplingParams, n: int) -> GenerationConfig:
+    def _generation_config(self, params: SamplingParams, n: int, *, output_logits: bool) -> GenerationConfig:
         do_sample = params.temperature > 0.0
         gc = GenerationConfig(
             max_new_tokens=params.max_new_tokens,
@@ -454,7 +523,7 @@ class HFRolloutEngine:
             eos_token_id=self._eos_ids,
             repetition_penalty=params.repetition_penalty,
             return_dict_in_generate=True,
-            output_logits=params.logprobs or params.top_logprobs > 0,
+            output_logits=output_logits,
             use_cache=True,
             use_mtp=self.mtp_layers is not None,
         )
@@ -543,13 +612,25 @@ class HFRolloutEngine:
             input_ids = input_ids.repeat_interleave(n, dim=0)
             attention_mask = attention_mask.repeat_interleave(n, dim=0)
             expand = n
-        out = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            generation_config=self._generation_config(params, n // expand),
-            stopping_criteria=StoppingCriteriaList([recorder, switch]),
-            **model_kwargs,
+        logprobs = _LogprobRecorder(
+            params.temperature if params.temperature > 0.0 else 1.0,
+            logprobs=params.logprobs,
+            top=params.top_logprobs,
         )
+        recording = params.logprobs or params.top_logprobs > 0
+        hook = self.model.register_forward_hook(logprobs.observe) if recording else None
+        try:
+            out = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=self._generation_config(params, n // expand, output_logits=False),
+                stopping_criteria=StoppingCriteriaList([recorder, switch]),
+                logits_processor=LogitsProcessorList([logprobs] if recording else []),
+                **model_kwargs,
+            )
+        finally:
+            if hook is not None:
+                hook.remove()
         switch.check()  # the sequences were cut short, not finished
         generated = out.sequences[:, input_ids.shape[1] :]
         recorder.finalize(generated.shape[1])
@@ -558,8 +639,7 @@ class HFRolloutEngine:
             generated,
             recorder.num_tokens,
             recorder.reason,
-            out.logits,
-            params,
+            *logprobs.result(generated),
         )
 
     def _decode_drafting(
@@ -571,7 +651,10 @@ class HFRolloutEngine:
         layers = self.mtp_layers
         if layers is None:
             raise RuntimeError("the engine holds no MTP layers to draft with")
-        generation_config = self._generation_config(params, 1)
+        # One row per call: the logits of its steps are small enough to be taken from ``generate``.
+        generation_config = self._generation_config(
+            params, 1, output_logits=params.logprobs or params.top_logprobs > 0
+        )
         stop = StopStringCriteria(self._tokenizer, list(params.stop)) if params.stop else None
         completions: list[Completion] = []
         for e in encoded:
@@ -596,9 +679,42 @@ class HFRolloutEngine:
                     generated = generated[:, : recorder.num_tokens]
                     reason = "stop"
                 completions += self._completions(
-                    [e.ids], generated, [generated.shape[1]], [reason], out.logits, params
+                    [e.ids],
+                    generated,
+                    [generated.shape[1]],
+                    [reason],
+                    *self._logprobs_from_logits(out.logits, generated, params),
                 )
         return completions
+
+    @staticmethod
+    def _logprobs_from_logits(
+        logits: Sequence[torch.Tensor], generated: torch.Tensor, params: SamplingParams
+    ) -> tuple[torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
+        """What :meth:`_LogprobRecorder.result` returns, from the raw logits ``generate`` returned:
+        ``logits[t]`` ``[rows, vocab]`` are those the token at position ``t`` was chosen from."""
+        rows, steps = generated.shape
+        temperature = params.temperature if params.temperature > 0.0 else 1.0
+        logprobs = torch.empty((rows, steps), dtype=torch.float32) if params.logprobs else None
+        top: tuple[torch.Tensor, torch.Tensor] | None = None
+        for t, step_logits in enumerate(
+            logits[:steps] if logprobs is not None or params.top_logprobs else ()
+        ):
+            step_logprobs = torch.log_softmax(step_logits.float() / temperature, dim=-1)
+            if logprobs is not None:
+                logprobs[:, t] = step_logprobs.gather(1, generated[:, t : t + 1]).squeeze(1).cpu()
+            if params.top_logprobs > 0:
+                values, indices = step_logprobs.topk(min(params.top_logprobs, step_logprobs.shape[-1]))
+                if top is None:
+                    top = (
+                        torch.empty((rows, steps, indices.shape[-1]), dtype=torch.int32),
+                        torch.empty((rows, steps, indices.shape[-1]), dtype=torch.float32),
+                    )
+                top[0][:, t] = indices.cpu()
+                top[1][:, t] = values.cpu()
+        if params.top_logprobs > 0 and top is None:  # nothing was generated
+            top = (torch.empty((rows, 0, 0), dtype=torch.int32), torch.empty((rows, 0, 0)))
+        return logprobs, top
 
     def _completions(
         self,
@@ -606,35 +722,13 @@ class HFRolloutEngine:
         generated: torch.Tensor,
         num_tokens: Sequence[int],
         reasons: Sequence[FinishReason | None],
-        logits: Sequence[torch.Tensor],
-        params: SamplingParams,
+        logprobs: torch.Tensor | None,
+        top: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> list[Completion]:
         """One :class:`Completion` per row of ``generated`` ``[rows, steps]``: the row's first
-        ``num_tokens[row]`` tokens as the continuation of ``prompt_ids[row]``. ``logits[t]``
-        ``[rows, vocab]`` are the policy's raw logits the token at position ``t`` was chosen from
-        (read only when ``params`` ask for logprobs)."""
-        rows, total_steps = generated.shape
-        logprobs: torch.Tensor | None = None
-        top: tuple[torch.Tensor, torch.Tensor] | None = None  # ([rows, steps, k] ids, logprobs)
-        if params.logprobs or params.top_logprobs > 0:
-            temperature = params.temperature if params.temperature > 0.0 else 1.0
-            if params.logprobs:
-                logprobs = torch.empty((rows, total_steps), dtype=torch.float32)
-            for t, step_logits in enumerate(logits[:total_steps]):
-                step_logprobs = torch.log_softmax(step_logits.float() / temperature, dim=-1)
-                if logprobs is not None:
-                    logprobs[:, t] = step_logprobs.gather(1, generated[:, t : t + 1]).squeeze(1).cpu()
-                if params.top_logprobs > 0:
-                    values, indices = step_logprobs.topk(min(params.top_logprobs, step_logprobs.shape[-1]))
-                    if top is None:
-                        top = (
-                            torch.empty((rows, total_steps, indices.shape[-1]), dtype=torch.int32),
-                            torch.empty((rows, total_steps, indices.shape[-1]), dtype=torch.float32),
-                        )
-                    top[0][:, t] = indices.cpu()
-                    top[1][:, t] = values.cpu()
-            if params.top_logprobs > 0 and top is None:  # nothing was generated
-                top = (torch.empty((rows, 0, 0), dtype=torch.int32), torch.empty((rows, 0, 0)))
+        ``num_tokens[row]`` tokens as the continuation of ``prompt_ids[row]``, with their
+        ``logprobs`` ``[rows, steps]`` and the ``top`` tokens of every position
+        (``([rows, steps, k] ids, logprobs)``) where the caller asked for them."""
         generated = generated.cpu()
 
         completions: list[Completion] = []
