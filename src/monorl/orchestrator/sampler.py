@@ -4,7 +4,8 @@ Resume only needs the step counter: step ``s`` (1-based) draws the window
 ``[(s-1)*P, s*P)`` of an infinite stream that walks the dataset epoch by epoch. Epoch 0 keeps the
 source order (``open_source`` already shuffled with ``seed``); later epochs are permutations seeded
 by ``seed`` and the epoch index. Resample rounds (DAPO dynamic sampling) draw random indices seeded
-by ``(seed, step, round)`` so they never shift the main stream.
+by ``(seed, step, round)`` so they never shift the main stream; the loop rolls out a prefix of such
+a draw, as long as it needs to replace the groups it dropped.
 """
 
 from __future__ import annotations
