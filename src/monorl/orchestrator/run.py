@@ -14,6 +14,7 @@ import traceback
 from pathlib import Path
 
 from monorl.config.schema import RunConfig
+from monorl.core.errors import BackendUnavailable, ConfigError, DataError, RegistryError
 from monorl.core.registry import ensure_providers, registry
 from monorl.core.reporting import (
     CONFIG_FILE,
@@ -27,6 +28,10 @@ from monorl.core.signals import signal_guard
 from monorl.core.types import RunResult
 from monorl.orchestrator.loop import ComponentLoop
 from monorl.orchestrator.sft import SFTLoop
+
+USER_ERRORS = (ConfigError, DataError, RegistryError, BackendUnavailable)
+"""What a run fails with when its config, its data or its installation has to change. The message
+says what; the traceback, which only shows where monorl noticed, is left out of the log."""
 
 
 def default_run_name(config: RunConfig) -> str:
@@ -88,14 +93,17 @@ def run(
                 error="interrupted",
             )
         except Exception as e:  # noqa: BLE001 - every failure must land in status.json
-            tb = traceback.format_exc()
-            reporter.log(tb)
+            error = f"{type(e).__name__}: {e}"
+            if not isinstance(e, USER_ERRORS):
+                tb = traceback.format_exc()
+                reporter.log(tb)
+                error = f"{error}\n{tb}"
             result = RunResult(
                 state="failed",
                 final_step=int(reporter.status.get("step", 0)),
                 run_dir=str(reporter.run_dir),
                 checkpoints=list_checkpoints(reporter.run_dir),
-                error=f"{type(e).__name__}: {e}\n{tb}",
+                error=error,
             )
             reporter.set_status("failed", f"{type(e).__name__}: {e}", step=result.final_step)
             return result
