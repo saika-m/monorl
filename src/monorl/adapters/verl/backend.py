@@ -218,15 +218,27 @@ class VerlBackend:
         resume: bool = False,
         cancel: threading.Event | None = None,
     ) -> RunResult:
-        """``cancel`` is the event that the first SIGINT or SIGTERM sets. While the driver runs
-        the backend handles the two signals with it (on the main thread; with an event of its
-        own when it is given none): the first asks the driver to stop, a second one kills it
+        """``cancel`` is the event that the first SIGINT or SIGTERM sets. Set while the run is
+        being prepared, it ends the run before the driver is started. While the driver runs the
+        backend handles the two signals with it (on the main thread; with an event of its own
+        when it is given none): the first asks the driver to stop, a second one kills it
         (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
         run_dir = Path(run_dir).expanduser().resolve()
         if not self._custom_python and not is_available():
             raise BackendUnavailable("pipeline_backend 'verl' needs `pip install monorl[verl]` (verl>=0.9.1)")
         reporter.set_status("pending", "compiling verl config")
         overrides = self.prepare(config, run_dir, resume=resume)
+        stop = cancel if cancel is not None else threading.Event()
+        if stop.is_set() or self._cancel.is_set():
+            # Asked to stop while the run was being prepared: there is no driver to stop yet.
+            step = latest_step(run_dir) or 0
+            reporter.set_status("cancelled", "cancelled before verl was started", step=step)
+            return RunResult(
+                state="cancelled",
+                final_step=step,
+                run_dir=str(run_dir),
+                checkpoints=link_checkpoints(run_dir),
+            )
         if resume and (step := resume_step(run_dir)) is not None:
             reporter.log(
                 f"trainer.resume_mode=auto: verl continues after step {step}"
@@ -239,7 +251,6 @@ class VerlBackend:
             "launching: " + " ".join(cmd[:3]) + f" (+{len(overrides)} overrides, see {OVERRIDES_FILE})"
         )
 
-        stop = cancel if cancel is not None else threading.Event()
         interrupted = False
         tail: deque[str] = deque(maxlen=20)
         with (

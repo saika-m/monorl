@@ -319,6 +319,33 @@ def test_a_second_signal_kills_the_child_and_its_process_group(
                 os.kill(pid, signal.SIGKILL)
 
 
+def test_a_signal_while_the_run_is_prepared_ends_it_before_the_child_is_started(
+    python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first signal sets the event of the run while the data are exported: the run ends
+    cancelled, and NeMo-RL, which would train to the end, is never started."""
+    from monorl.adapters.nemo_rl import backend as backend_module
+
+    cancel = threading.Event()
+    export = backend_module.export_dataset
+
+    def export_and_signal(*args, **kwargs):
+        try:
+            return export(*args, **kwargs)
+        finally:
+            cancel.set()
+
+    monkeypatch.setattr(backend_module, "export_dataset", export_and_signal)
+    run_dir = tmp_path / "run"
+    reporter = RunReporter(run_dir, echo=False)
+    result = NemoRLBackend().run(python_launch, run_dir, reporter=reporter, cancel=cancel)
+    assert result.state == "cancelled" and result.error is None and result.final_step == 0
+    status = read_status(run_dir)
+    assert status["state"] == "cancelled" and status["message"] == "cancelled before NeMo-RL was started"
+    assert "child_pid" not in status and not (run_dir / "child_env.json").exists()
+    assert "launching" not in (run_dir / "run.log").read_text()
+
+
 def test_cancel_propagates_to_child(
     python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

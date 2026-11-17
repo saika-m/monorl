@@ -363,6 +363,32 @@ def test_a_second_signal_kills_the_driver_and_what_it_started(
                 os.kill(pid, signal.SIGKILL)
 
 
+def test_a_signal_while_the_run_is_prepared_ends_it_before_the_driver_is_started(
+    make_config, tmp_path: Path, fake_entry: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The first signal sets the event of the run while the data are exported: the run ends
+    cancelled, and the driver, which would train to the end, is never started."""
+    cancel = threading.Event()
+    export = backend_module.export_datasets
+
+    def export_and_signal(*args, **kwargs):
+        try:
+            return export(*args, **kwargs)
+        finally:
+            cancel.set()
+
+    monkeypatch.setattr(backend_module, "export_datasets", export_and_signal)
+    cfg = make_config()
+    run_dir = tmp_path / "run"
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False), cancel=cancel)
+    assert result.state == "cancelled" and result.error is None and result.final_step == 0
+    status = read_status(run_dir)
+    assert status["state"] == "cancelled" and status["message"] == "cancelled before verl was started"
+    assert "child_pid" not in status and not (run_dir / "metrics.jsonl").exists()
+    log = (run_dir / "run.log").read_text()
+    assert "launching" not in log and "fake verl entry" not in log
+
+
 def test_checkpoint_helpers(tmp_path: Path):
     root = tmp_path / "checkpoints"
     for n in (10, 2):

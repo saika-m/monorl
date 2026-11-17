@@ -199,11 +199,11 @@ class NemoRLBackend:
         resume: bool = False,
         cancel: threading.Event | None = None,
     ) -> RunResult:
-        """``cancel`` is the event that the first SIGINT or SIGTERM sets. While the child runs
-        the backend handles the two signals with it (on the main thread; with an event of its
-        own when it is given none): the first makes it :meth:`cancel` the child, a second one
-        kills the child's process group (``docs/BACKENDS.md``, "Signals with a pipeline
-        backend")."""
+        """``cancel`` is the event that the first SIGINT or SIGTERM sets. Set while the run is
+        being prepared, it ends the run before the child is started. While the child runs the
+        backend handles the two signals with it (on the main thread; with an event of its own
+        when it is given none): the first makes it :meth:`cancel` the child, a second one kills
+        the child's process group (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
         run_dir = Path(run_dir).expanduser().resolve()
         home = nemo_rl_home(config)
         self._cancelled.clear()
@@ -233,6 +233,17 @@ class NemoRLBackend:
         )
         cmd = build_command(config, home, yaml_path, run_dir)
         env = build_env(config, home, run_dir)
+        stop = cancel if cancel is not None else threading.Event()
+        if stop.is_set():
+            # Asked to stop while the run was being prepared: there is no child to stop yet.
+            step = latest_step(run_dir)
+            reporter.set_status("cancelled", "cancelled before NeMo-RL was started", step=step)
+            return RunResult(
+                state="cancelled",
+                final_step=step,
+                run_dir=str(run_dir),
+                checkpoints=list_checkpoints(run_dir),
+            )
         reporter.log(f"launching (cwd={home}): {shlex.join(cmd)}")
 
         proc = subprocess.Popen(
@@ -252,7 +263,6 @@ class NemoRLBackend:
         # The first signal only sets an event. Its handler runs on the main thread, which copies
         # the child's output: stopping the child (SIGTERM, a wait, SIGKILL) is left to a thread,
         # so that the output is still copied while the child shuts down.
-        stop = cancel if cancel is not None else threading.Event()
         interrupted, finished = False, threading.Event()
         canceller = threading.Thread(
             target=self._cancel_when, args=(stop, finished), name="monorl-nemo-rl-cancel", daemon=True

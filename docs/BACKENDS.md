@@ -378,13 +378,15 @@ gives the backend the event that the first signal sets (`PipelineBackend.run(...
 * **verl** and **NeMo-RL** run the framework in a child process and do not finish the step. What
   the backends do is tested against stand-ins for the two frameworks (a stand-in entry, a fake
   checkout); what the frameworks do is read from the pinned sources. Neither was run with a
-  signal here. Common to both: while monorl prepares the run (compiling the config, exporting the
-  data) the event is set and logged like in any run, and the backend does not read it, so the
-  child is started all the same. From the start of the child to its end the backend handles the
-  two signals for the same event. The first one asks the child to stop and gives it 30 seconds;
-  `run.log` has `received SIGINT: stopping the verl driver` or `stopping NeMo-RL`. A second one
-  kills the child at once, with the line `received SIGINT again: stopping now`. The training
-  loops of the two frameworks handle neither signal at the pin (`verl/trainer/`;
+  signal here. Common to both: a signal that arrives while monorl prepares the run (compiling
+  the config, exporting the data) is logged with the line of any run, the preparation is
+  finished, and the run ends `cancelled` without starting the child
+  (`cancelled before verl was started`, `cancelled before NeMo-RL was started`); a second signal
+  in that time ends the run at once. From the start of the child to its end the backend handles
+  the two signals for the same event. The first one asks the child to stop and gives it 30
+  seconds; `run.log` has `received SIGINT: stopping the verl driver` or `stopping NeMo-RL`. A
+  second one kills the child at once, with the line `received SIGINT again: stopping now`. The
+  training loops of the two frameworks handle neither signal at the pin (`verl/trainer/`;
   `nemo_rl/algorithms/grpo.py` and `sft.py`, `examples/run_grpo.py` and `run_sft.py`): the step
   in flight is lost, no checkpoint is written for the signal, and `--resume` continues from the
   checkpoint the framework saved last on its own schedule. The run ends `cancelled` with exit
