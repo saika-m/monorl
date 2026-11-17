@@ -116,7 +116,14 @@ items cannot be addressed (`rewards.0.weight=2` fails validation): replace the w
 `SmolLM2-135M-Instruct-grpo-20261112-224338`, and the default run directory is
 `<logging.run_root>/<run_name>`. The shipped recipes set a fixed `run_name`, so without
 `--run-dir` every run of a recipe uses the same directory. A run started in an existing directory
-without `--resume` starts at step 0 and appends to `metrics.jsonl`, `trajectories.jsonl`, `run.log`.
+without `--resume` starts at step 0 and appends to `metrics.jsonl`, `trajectories.jsonl`, `run.log`
+(a last line that a killed run left unfinished is removed first, so that the first row of the new
+run is not glued to it). It replaces `config.yaml`, `status.json`, `final/` and the checkpoints of
+the steps it saves. Everything else of the earlier run stays: its rows, and its checkpoints of
+other steps, which a later `--resume` takes for this run's when they are newer. Run here with the
+test fakes: 4 steps, then 2 steps without `--resume`, left the rows of steps 1, 2, 3, 4, 1, 2 and
+`step-4` of the first run, from which `--resume` then continued. Give a new run a directory of its
+own.
 
 ### Resume
 
@@ -160,7 +167,60 @@ does not either under `trainer.scheduler: constant` (the default); with `linear`
 learning rate of every step depends on `trainer.max_steps`, so the short run is another run (from
 the code, not run here). A run that ends at `trainer.max_steps` has a checkpoint of its last step
 only when `trainer.save_every` divides it. A resume always starts at the last checkpoint: steps
-that ran after it are run again, and their rows are appended a second time.
+that ran after it are run again.
+
+#### The record files after a resume
+
+A run that was killed (SIGKILL, out of memory, power) has written rows of steps after its last
+checkpoint, and may have stopped in the middle of a line. Before a resume continues at step
+`N + 1` it takes `metrics.jsonl` and `trajectories.jsonl` back to the end of step `N`:
+
+- Rows of steps after `N` are removed, of every phase. The run writes those steps again.
+- A last line that is not a complete row is removed. The next row would otherwise share its line
+  and be unreadable.
+- `checkpoints/step-M.tmp` directories, checkpoints that were never finished, are removed.
+- The evaluation of step `N` comes after its checkpoint. When `metrics.jsonl` has no `eval` row
+  of step `N` although one is due, the resume evaluates step `N` again, from the weights and the
+  generators of the checkpoint, after removing the `eval` rows of step `N` that
+  `trajectories.jsonl` may hold (an evaluation writes its metrics row last).
+
+Without a checkpoint the resume starts at step 0 and both files start over. The files are read
+line by line and not held in memory; the result is written to `<file>.tmp` and renamed over the
+file, and a file that loses nothing is not rewritten. Measured here on a 257 MB
+`trajectories.jsonl` (6400 rows of 40 kB): 0.9 s of CPU time and 1.1 MB of Python memory at the
+peak to remove 100 of 400 steps, 0.6 s when there was nothing to remove. `run.log` says what was
+done:
+
+```text
+... removed the lines after step 2: 1 of metrics.jsonl, 4 of trajectories.jsonl
+... resumed from .../B_lora/checkpoints/step-2 at step 2
+```
+
+and, for the run that was killed while it evaluated step 2:
+
+```text
+... resumed from .../C_lora/checkpoints/step-2 at step 2
+... the run being resumed did not finish the evaluation of step 2; evaluating it again
+```
+
+The loop writes the rows of step `N` before it renames `step-N.tmp`, so a checkpoint that exists
+has the rows of its step, and a run that is killed in between resumes from the checkpoint before.
+
+With that, the two files of a run that was killed and resumed are those of the run that was not
+killed, timing fields apart (`time`, `time/*`, `eval/time`, `weight_sync/seconds`), under the
+conditions above for a resumed run to continue exactly. Run here, with `OMP_NUM_THREADS=1`:
+`grpo_gsm8k_smollm_cpu.yaml` with `trainer.max_steps=4`, `trainer.save_every=2`, `data.limit=8`,
+`rollout.max_new_tokens=48`, `data.eval_uri=hf://openai/gsm8k`, `data.eval_split=test`,
+`trainer.eval_every=1`, `trainer.learning_rate=1e-4` and the `length` reward of the runs above,
+once to the end, once killed with `kill -9` as soon as `metrics.jsonl` had the `train` row of step
+3, and once killed during the evaluation of step 2, each followed by `--resume`. All three
+directories held the same 8 metrics rows and 32 trajectory rows, and so did the three of the same
+runs with `model.lora.enabled=true` (the log lines above are theirs). Before this was done the
+second run had the `train` row of step 3 twice and its 4 episodes twice, and the third never got
+the `eval` row of step 2 or its 4 episodes.
+
+The tests kill the loop at three points (after later steps, in the rows of the checkpoint step,
+in its evaluation) with fake components, for the RL and the SFT loop.
 
 What does not continue exactly, and is logged as `the run will not continue exactly as the one it
 resumes: <reasons>` where the loop can tell:
@@ -183,10 +243,12 @@ resumes: <reasons>` where the loop can tell:
   environments that are not functions of their inputs (an `llm_judge`, a remote environment with a
   random state of its own).
 
-Not restored: the config (the one given on this command line is used and overwrites `config.yaml`),
-`status.json` (rewritten with a new `started_at` and `pid`) and earlier rows of `metrics.jsonl`
-and `trajectories.jsonl` (new rows are appended; nothing is truncated). Without a checkpoint the
-run logs `resume requested but no complete checkpoint exists; starting from step 0`.
+Not restored: the config (the one given on this command line is used and overwrites `config.yaml`)
+and `status.json` (rewritten with a new `started_at` and `pid`). `run.log` is appended to. What
+the optional sinks hold of the steps that are run again is not taken back (from the code: a
+resumed run opens a new TensorBoard event file next to the old one and a new W&B run; not run
+here). Without a checkpoint the run logs
+`resume requested but no complete checkpoint exists; starting from step 0`.
 
 ## The run directory
 
@@ -274,8 +336,9 @@ Lines are also echoed to stderr unless `MONORL_REPORTER_ECHO=0`.
 
 ### `checkpoints/step-N/`
 
-Written by the reference trainer into `step-N.tmp` and renamed, so a `step-N` directory is always
-complete. Old checkpoints are not deleted. Contents: `model/` (`config.json`,
+Written by the reference trainer into `step-N.tmp` and renamed once the rows of step `N` are in
+`metrics.jsonl` and `trajectories.jsonl`, so a `step-N` directory is always complete and never
+ahead of the record files. Old checkpoints are not deleted. Contents: `model/` (`config.json`,
 `generation_config.json`, `model.safetensors`), or `adapter/` (the PEFT adapter) with
 `model.lora.enabled` (not run here), and `trainer_state.pt`, a `torch.save` dict with `step`,
 `optimizer`, `scheduler`, `scaler`, `value_head`, `mtp` and `rng`. The loop adds `loop_state.pt`

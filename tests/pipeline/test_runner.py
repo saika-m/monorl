@@ -275,6 +275,29 @@ def test_resume_skips_succeeded_stages(make_pipeline: Any, tmp_path: Path) -> No
     assert "already succeeded; reusing" in (run_dir / "run.log").read_text()
 
 
+def test_resumed_stage_without_a_checkpoint_has_every_row_once(make_pipeline: Any) -> None:
+    """A stage that failed after it had logged a step and before its first checkpoint starts over
+    on resume, and so do its record files."""
+
+    def stages(extra: dict[str, Any]) -> list[dict[str, Any]]:
+        trainer = {"max_steps": 3, "save_every": 100, "extra": extra}
+        return [{"type": "train", "name": "only", "overrides": {"trainer": trainer}}]
+
+    first = run_pipeline(make_pipeline(stages({"fake_fail_at": 2})))
+    assert first.state == "failed"
+    stage_dir = Path(first.stages[0]["run_dir"])
+    assert [row["step"] for _, row in iter_metrics(stage_dir)] == [1]
+    assert not (stage_dir / "checkpoints").exists()
+
+    resumed = run_pipeline(make_pipeline(stages({})), Path(first.run_dir), resume=True)
+    assert resumed.state == "succeeded", resumed.error
+    assert [row["step"] for _, row in iter_metrics(stage_dir)] == [1, 2, 3]
+    assert {row["step"] for _, row in iter_trajectories(stage_dir)} == {1, 2, 3}
+    assert len(list(iter_trajectories(stage_dir))) == 3 * len(
+        [row for _, row in iter_trajectories(stage_dir) if row["step"] == 3]
+    )
+
+
 def test_resume_rejects_mismatched_stages(make_pipeline: Any) -> None:
     stages = [{"type": "train", "name": "a", "overrides": {"trainer": {"max_steps": 1}}}]
     first = run_pipeline(make_pipeline(stages))

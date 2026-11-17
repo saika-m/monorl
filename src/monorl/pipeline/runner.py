@@ -267,7 +267,8 @@ class _StageRunner:
             previous_dataset=self.previous_dataset,
         )
         stage_dir = Path(record.run_dir)
-        resume_stage = self.resume and (stage_dir / "checkpoints").is_dir()
+        # Also without a checkpoint: the stage starts over then, and so must its record files.
+        resume_stage = self.resume and stage_dir.is_dir()
         result = run_training(run_config, stage_dir, resume=resume_stage)
         record.step = int(result.final_step)
         record.summary = {k: float(v) for k, v in result.metrics.items() if isinstance(v, (int, float))}

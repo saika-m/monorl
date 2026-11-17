@@ -15,7 +15,14 @@ from pathlib import Path
 
 from monorl.config.schema import RunConfig
 from monorl.core.registry import ensure_providers, registry
-from monorl.core.reporting import CONFIG_FILE, RunReporter, list_checkpoints
+from monorl.core.reporting import (
+    CONFIG_FILE,
+    METRICS_FILE,
+    TRAJECTORIES_FILE,
+    RunReporter,
+    drop_rows,
+    list_checkpoints,
+)
 from monorl.core.signals import signal_guard
 from monorl.core.types import RunResult
 from monorl.orchestrator.loop import ComponentLoop
@@ -41,6 +48,13 @@ def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False)
     target = Path(run_dir).expanduser() if run_dir is not None else resolve_run_dir(config)
     reporter = RunReporter(target)
     config.to_yaml(reporter.run_dir / CONFIG_FILE)
+    if not resume:
+        # This run appends to the records of a run that was here before. A line that one did not
+        # finish goes first, or the first row of this run would share it and be unreadable. (A
+        # resume does the same when it takes the files back to its checkpoint.)
+        for name in (METRICS_FILE, TRAJECTORIES_FILE):
+            if drop_rows(reporter.run_dir / name, lambda row: False):
+                reporter.log(f"removed the unfinished last line an earlier run left in {name}")
     cancel = threading.Event()
     backend = config.trainer.backend
     kind = "pipeline" if config.is_pipeline_backend else "sft" if config.is_sft else "component"

@@ -168,6 +168,22 @@ def test_resume_continues_from_latest_checkpoint(make_config: Any, tmp_path: Pat
     assert _samples_by_step(run_dir, (3, 4)) == scratch_samples
 
 
+def test_run_in_the_directory_of_a_killed_run_keeps_its_first_rows(make_config: Any) -> None:
+    """Without ``--resume`` a run appends to the files that are there. A run that was killed in the
+    middle of a write left a line without its end: the first row of the next run must not join it."""
+    run_dir = Path(run(make_config(trainer={"max_steps": 2})).run_dir)
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write('{"step": 3, "time": 1.0, "pha')
+    with open(run_dir / "trajectories.jsonl", "a") as f:
+        f.write('{"step": 3, "phase": "train", "samp')
+    episodes = len(list(iter_trajectories(run_dir)))
+
+    again = run(make_config(trainer={"max_steps": 2}))
+    assert again.state == "succeeded" and Path(again.run_dir) == run_dir
+    assert [r["step"] for r in _rows(run_dir)] == [1, 2, 1, 2]
+    assert len(list(iter_trajectories(run_dir))) == 2 * episodes
+
+
 def test_resume_without_checkpoint_starts_fresh(make_config: Any) -> None:
     result = run(make_config(trainer={"max_steps": 1}), resume=True)
     assert result.state == "succeeded" and result.final_step == 1

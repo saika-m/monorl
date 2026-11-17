@@ -21,14 +21,12 @@ trained turn is a loss span in exactly one sequence, and the conversation counts
 from __future__ import annotations
 
 import math
-import os
 import random
 import shutil
 import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -38,7 +36,15 @@ from monorl.core.errors import ConfigError, DataError
 from monorl.core.registry import registry
 from monorl.core.reporting import list_checkpoints
 from monorl.core.types import Completion, Message, RunResult, Sample, Trajectory, Turn, message_text
-from monorl.orchestrator.loop import _checkpoint_complete, preserved_rng, restore_loop_state, save_loop_state
+from monorl.orchestrator.loop import (
+    commit_checkpoint,
+    evaluation_due,
+    evaluation_interrupted,
+    preserved_rng,
+    restore_loop_state,
+    resume_checkpoint,
+    save_loop_state,
+)
 from monorl.orchestrator.sampler import PromptSampler
 from monorl.orchestrator.sinks import MetricSinks
 from monorl.rollout.render import render_chat
@@ -360,7 +366,8 @@ class SFTLoop:
             final_path: str | None = None
             if cancelled:
                 if last_step > self._last_checkpoint_step and last_step > 0:
-                    self._save_checkpoint(last_step)
+                    self._write_checkpoint(last_step)
+                    self._commit_checkpoint(last_step)
                 state = "cancelled"
             else:
                 reporter.log(f"exporting final policy to {reporter.final_dir}")
@@ -435,11 +442,9 @@ class SFTLoop:
     def _maybe_resume(self) -> int:
         if not self.resume:
             return 0
-        checkpoints = [p for p in list_checkpoints(self.reporter.run_dir) if _checkpoint_complete(Path(p))]
-        if not checkpoints:
-            self.reporter.log("resume requested but no complete checkpoint exists; starting from step 0")
+        latest = resume_checkpoint(self.reporter)
+        if latest is None:
             return 0
-        latest = Path(checkpoints[-1])
         step = int(latest.name.removeprefix("step-"))
         self.trainer.load_checkpoint(latest)
         self._last_checkpoint_step = step
@@ -449,6 +454,8 @@ class SFTLoop:
             self.reporter.log(
                 f"the run will not continue exactly as the one it resumes: {'; '.join(inexact)}"
             )
+        if evaluation_due(self.config, step) and evaluation_interrupted(self.reporter, step):
+            self._evaluate(step)
         return step
 
     # -- main loop ------------------------------------------------------------------------
@@ -478,11 +485,14 @@ class SFTLoop:
             metrics.setdefault(
                 "lr", float(getattr(self.trainer, "learning_rate", config.trainer.learning_rate))
             )
-            if step % config.trainer.save_every == 0:
-                self._save_checkpoint(step)
+            save = step % config.trainer.save_every == 0
+            if save:
+                self._write_checkpoint(step)
             metrics["time/step"] = time.perf_counter() - t_step
             self._report(step, metrics, trajectories)
-            if config.trainer.eval_every and step % config.trainer.eval_every == 0 and config.data.eval_uri:
+            if save:  # after the rows of the step: a checkpoint never lacks them
+                self._commit_checkpoint(step)
+            if evaluation_due(config, step):
                 self._evaluate(step)
             last_step, last_metrics = step, metrics
             if self.cancel.is_set():
@@ -560,7 +570,8 @@ class SFTLoop:
             )
         return batch, stats, trajectories
 
-    def _save_checkpoint(self, step: int) -> None:
+    def _write_checkpoint(self, step: int) -> None:
+        """Write the checkpoint of ``step`` as ``step-N.tmp``; :meth:`_commit_checkpoint` renames it."""
         path = self.reporter.checkpoint_path(step)
         tmp = path.with_name(path.name + ".tmp")
         if tmp.exists():
@@ -568,11 +579,10 @@ class SFTLoop:
         tmp.mkdir(parents=True)
         self.trainer.save_checkpoint(tmp)
         save_loop_state(tmp, {})
-        if path.exists():
-            shutil.rmtree(path)
-        os.replace(tmp, path)  # a crash mid-save leaves only step-N.tmp, never a half-written step-N
+
+    def _commit_checkpoint(self, step: int) -> None:
+        commit_checkpoint(self.reporter, step)
         self._last_checkpoint_step = step
-        self.reporter.log(f"saved checkpoint {path}")
 
     def _report(self, step: int, metrics: dict[str, float], trajectories: Sequence[Trajectory]) -> None:
         config = self.config

@@ -1,5 +1,6 @@
 """A run that is stopped after step N and resumed continues the run it resumes: from step N + 1 on
-it logs the episodes and the metrics the uninterrupted run logs, timings apart."""
+it logs the episodes and the metrics the uninterrupted run logs, timings apart. And a run that is
+killed at any point and resumed leaves the record files of the run that was not killed."""
 
 from __future__ import annotations
 
@@ -15,7 +16,14 @@ import torch
 
 from monorl.config.schema import RunConfig
 from monorl.core.registry import registry
-from monorl.core.reporting import iter_metrics, iter_trajectories, list_checkpoints
+from monorl.core.reporting import (
+    METRICS_FILE,
+    TRAJECTORIES_FILE,
+    RunReporter,
+    iter_metrics,
+    iter_trajectories,
+    list_checkpoints,
+)
 from monorl.orchestrator import run
 from monorl.orchestrator.loop import LOOP_STATE_FILE
 
@@ -306,3 +314,113 @@ def test_resumed_run_on_the_hf_engine_and_the_reference_trainer(run_config_dict:
     rows = _metric_rows(Path(full.run_dir), later)
     assert all(row["grad_norm"] > 0 for row in rows)
     assert _metric_rows(Path(resumed.run_dir), later) == rows
+
+
+# -- killed runs --------------------------------------------------------------------------------
+
+
+class _Killed(BaseException):
+    """Stands in for SIGKILL: ``run()`` handles ``Exception`` and ``KeyboardInterrupt`` only, so
+    nothing is written after it is raised; ``status.json`` stays at ``running``."""
+
+
+def _run_until_killed(config: RunConfig, write: str, step: int, phase: str) -> Path:
+    """Run ``config`` and kill it when the reporter is about to write ``write`` (``log_metrics``
+    or ``log_trajectories``) of ``step`` and ``phase``. Returns the run directory."""
+    original = getattr(RunReporter, write)
+
+    def dying(self: RunReporter, at: int, *args: Any, **kwargs: Any) -> None:
+        if at == step and kwargs.get("phase", "train") == phase:
+            raise _Killed
+        original(self, at, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch, pytest.raises(_Killed):
+        patch.setattr(RunReporter, write, dying)
+        run(config)
+    return Path(config.logging.run_root) / str(config.run_name)
+
+
+def _unfinished_lines(run_dir: Path, step: int, phase: str) -> None:
+    """What a kill in the middle of a write leaves at the end of both files."""
+    with open(run_dir / METRICS_FILE, "a") as f:
+        f.write(f'{{"step": {step}, "time": 1.5, "phase": "{phase}", "reward/me')
+    with open(run_dir / TRAJECTORIES_FILE, "a") as f:
+        f.write(f'{{"step": {step}, "phase": "{phase}", "sample_id": "s1", "respo')
+
+
+def _records(run_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Every row of both files; the metrics without their timings."""
+    return _metric_rows(run_dir, (1, 2, 3, 4)), _episodes(run_dir, (1, 2, 3, 4))
+
+
+def _lines(run_dir: Path) -> int:
+    files = (run_dir / METRICS_FILE, run_dir / TRAJECTORIES_FILE)
+    return sum(len(f.read_text().splitlines()) for f in files)
+
+
+# (the write the run dies in, its step, its phase, the checkpoint the resume starts from)
+_KILLS = {
+    # steps 3 and 4 ran after the checkpoint of step 2; the checkpoint of step 4 is step-4.tmp
+    "after_later_steps": ("log_metrics", 4, "train", "step-2"),
+    # the metrics row of step 2 is written, its episodes and the name of its checkpoint are not
+    "in_the_rows_of_the_checkpoint_step": ("log_trajectories", 2, "train", None),
+    # the checkpoint of step 2 is complete, the episodes of its evaluation are written, its row is not
+    "in_the_evaluation_of_the_checkpoint_step": ("log_metrics", 2, "eval", "step-2"),
+}
+
+
+@pytest.mark.parametrize("kill", list(_KILLS))
+def test_killed_and_resumed_run_leaves_the_records_of_the_uninterrupted_run(
+    kill: str, make_config: Any, sampling_components: None, tmp_path: Path
+) -> None:
+    write, step, phase, checkpoint = _KILLS[kill]
+    overrides = {"data": {"eval_uri": _eval_file(tmp_path)}, "trainer": {"eval_every": 1}}
+    full = run(_rl_config(make_config, "full", 4, overrides))
+    assert full.state == "succeeded"
+    metrics, episodes = _records(Path(full.run_dir))
+    assert [(row["step"], row["phase"]) for row in metrics] == [
+        (s, p) for s in (1, 2, 3, 4) for p in ("train", "eval")
+    ]
+    assert {row["phase"] for row in episodes} == {"train", "eval"}
+
+    run_dir = _run_until_killed(_rl_config(make_config, "killed", 4, overrides), write, step, phase)
+    _unfinished_lines(run_dir, step, phase)
+    # what a cancel leaves that is killed while it saves step 3; no later save replaces it
+    (run_dir / "checkpoints" / "step-3.tmp").mkdir()
+    complete = [Path(p).name for p in list_checkpoints(run_dir)]
+    assert complete == ([checkpoint] if checkpoint else [])
+    assert _records(run_dir) != (metrics, episodes)
+
+    resumed = run(_rl_config(make_config, "killed", 4, overrides), resume=True)
+    assert resumed.state == "succeeded" and resumed.final_step == 4
+    assert fakes.TRAINERS[-1].loaded_from == (run_dir / "checkpoints" / checkpoint if checkpoint else None)
+    assert _records(run_dir) == (metrics, episodes)
+    assert _lines(run_dir) == _lines(Path(full.run_dir))  # nothing unreadable is left either
+    assert sorted(p.name for p in (run_dir / "checkpoints").iterdir()) == ["step-2", "step-4"]
+    assert "will not continue exactly" not in _log(run_dir)
+
+
+@pytest.mark.parametrize(
+    ("write", "step", "phase"),
+    [("log_metrics", 4, "train"), ("log_trajectories", 2, "sft"), ("log_metrics", 2, "eval")],
+)
+def test_killed_and_resumed_sft_run_leaves_the_records_of_the_uninterrupted_run(
+    write: str, step: int, phase: str, sampling_components: None, tmp_path: Path
+) -> None:
+    full = run(_sft_config(tmp_path, "sft-full", 4, {}))
+    assert full.state == "succeeded"
+    metrics, episodes = _records(Path(full.run_dir))
+    assert [(row["step"], row["phase"]) for row in metrics] == [
+        (s, p) for s in (1, 2, 3, 4) for p in ("train", "eval")
+    ]
+    assert {row["step"] for row in episodes} == {1, 2, 3, 4}
+
+    run_dir = _run_until_killed(_sft_config(tmp_path, "sft-killed", 4, {}), write, step, phase)
+    _unfinished_lines(run_dir, step, phase)
+    assert _records(run_dir) != (metrics, episodes)
+
+    resumed = run(_sft_config(tmp_path, "sft-killed", 4, {}), resume=True)
+    assert resumed.state == "succeeded" and resumed.final_step == 4
+    assert _records(run_dir) == (metrics, episodes)
+    assert _lines(run_dir) == _lines(Path(full.run_dir))
+    assert sorted(p.name for p in (run_dir / "checkpoints").iterdir()) == ["step-2", "step-4"]
