@@ -30,17 +30,29 @@ SFT_METRIC_KEYS: tuple[str, ...] = ("loss/sft", "sft/ppl", "sft/tokens")
 _PPL_MAX_NLL = 80.0  # exp(80) is the largest perplexity worth reporting; beyond that it overflows
 
 
-def _vocab_mean_logprobs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    scaled = logits[:, :-1].float() / temperature
-    mean = scaled.mean(dim=-1) - torch.logsumexp(scaled, dim=-1)
-    return torch.nn.functional.pad(mean, (1, 0))
+def _vocab_mean_logprobs(
+    logits: torch.Tensor, temperature: float, positions: torch.Tensor | None = None
+) -> torch.Tensor:
+    if positions is None:
+        scaled = logits[:, :-1].float() / temperature
+        mean = scaled.mean(dim=-1) - torch.logsumexp(scaled, dim=-1)
+        return torch.nn.functional.pad(mean, (1, 0))
+    keep = positions.bool().clone()
+    keep[:, 0] = False  # nothing predicts the first token
+    scaled = logits[:, :-1][keep[:, 1:]].float() / temperature  # [N, V]
+    out = scaled.new_zeros(keep.shape)
+    out[keep] = scaled.mean(dim=-1) - torch.logsumexp(scaled, dim=-1)
+    return out
 
 
-def mean_logprob_all_tokens(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+def mean_logprob_all_tokens(
+    logits: torch.Tensor, temperature: float = 1.0, *, positions: torch.Tensor | None = None
+) -> torch.Tensor:
     """``[B, T]`` vocabulary-mean log-probability of the predictive distribution at every position
     (position 0 is 0), aligned like the trainer's token logprobs (prediction for ``input_ids[:, t]``
-    comes from ``logits[:, t-1]``)."""
-    return _vocab_mean_logprobs(logits, temperature)
+    comes from ``logits[:, t-1]``). With ``positions`` (``[B, T]``, nonzero where wanted) it is
+    computed there only and 0 elsewhere."""
+    return _vocab_mean_logprobs(logits, temperature, positions)
 
 
 def sft_loss(

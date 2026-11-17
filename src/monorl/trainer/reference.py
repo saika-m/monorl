@@ -196,22 +196,32 @@ def sequence_logprobs_and_entropy(
     *,
     entropy: bool,
     top_ids: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """``[B,T]`` logprob of ``input_ids[:, t]`` given the prefix (position 0 is 0), optionally the
     entropy of the predictive distribution at every position (position 0 is 0) and, for
     ``top_ids`` (``[B,T,K]`` candidate tokens per position), their ``[B,T,K]`` logprobs under the
-    same distribution (position 0 is 0)."""
-    scaled = logits[:, :-1].float() / temperature
-    logp_all = torch.log_softmax(scaled, dim=-1)
-    lp = logp_all.gather(-1, input_ids[:, 1:, None]).squeeze(-1)
-    lp = torch.nn.functional.pad(lp, (1, 0))
+    same distribution (position 0 is 0).
+
+    With ``positions`` (``[B,T]``, nonzero where wanted) all three are computed at those positions
+    only and are 0 elsewhere. The log-softmax over the vocabulary, what autograd keeps of it and
+    the entropy are several ``[B,T,V]`` float tensors otherwise, and a loss reads them at the
+    response positions alone."""
+    if positions is None:
+        positions = torch.ones_like(input_ids, dtype=torch.bool)
+    keep = positions.bool().clone()
+    keep[:, 0] = False  # nothing predicts the first token
+    logp_all = torch.log_softmax(logits[:, :-1][keep[:, 1:]].float() / temperature, dim=-1)  # [N, V]
+    lp = logp_all.new_zeros(input_ids.shape)
+    lp[keep] = logp_all.gather(-1, input_ids[keep][:, None]).squeeze(-1)
     ent = None
     if entropy:
-        ent = -(logp_all.exp() * logp_all).sum(-1)
-        ent = torch.nn.functional.pad(ent, (1, 0))
+        ent = logp_all.new_zeros(input_ids.shape)
+        ent[keep] = -(logp_all.exp() * logp_all).sum(-1)
     top = None
     if top_ids is not None:
-        top = torch.nn.functional.pad(logp_all.gather(-1, top_ids[:, 1:]), (0, 0, 1, 0))
+        top = logp_all.new_zeros(top_ids.shape)
+        top[keep] = logp_all.gather(-1, top_ids[keep])
     return lp, ent, top
 
 
@@ -437,7 +447,7 @@ class ReferenceTrainer:
             num_layers = self.hf_model.config.get_text_config().num_hidden_layers
             mtp_inputs["output_hidden_states"] = [num_layers - 1]
         for start in range(0, local_seqs, mbs):
-            micro = batch.slice(start, start + mbs)
+            micro = batch.slice(start, start + mbs).trimmed()
             micro_tokens = int(micro.response_mask.sum().item())
             micro_scored = int((micro.response_mask.sum(dim=1) > 0).sum().item())
             micro_states = int(micro.value_mask.sum().item()) if critic else 0
@@ -455,7 +465,12 @@ class ReferenceTrainer:
             last_layer = outputs.hidden_states[-1] if mtp is not None else None
             del outputs
             logprobs, entropy, top_logprobs = sequence_logprobs_and_entropy(
-                logits, micro.input_ids, self.temperature, entropy=True, top_ids=micro.behavior_top_ids
+                logits,
+                micro.input_ids,
+                self.temperature,
+                entropy=True,
+                top_ids=micro.behavior_top_ids,
+                positions=micro.response_mask,
             )
             loss_kwargs: dict[str, Any] = {}
             if micro.loss_weights is not None:
@@ -468,7 +483,9 @@ class ReferenceTrainer:
             if self.config.algorithm.name == "sft" and self.config.algorithm.sft_label_smoothing > 0:
                 from monorl.algorithms import mean_logprob_all_tokens
 
-                loss_kwargs["mean_logprob_all_tokens"] = mean_logprob_all_tokens(logits, self.temperature)
+                loss_kwargs["mean_logprob_all_tokens"] = mean_logprob_all_tokens(
+                    logits, self.temperature, positions=micro.response_mask
+                )
             del logits
             mask = micro.response_mask.float()
             logprobs = logprobs * mask
@@ -596,13 +613,13 @@ class ReferenceTrainer:
             was_training = model.training
             model.eval()
             for start in range(0, len(prepared), mbs):
-                micro = prepared.slice(start, start + mbs)
+                micro = prepared.slice(start, start + mbs).trimmed()
                 with self._autocast():
                     logits = self._forward(model, micro)
                 lp, _, _ = sequence_logprobs_and_entropy(
-                    logits, micro.input_ids, self.temperature, entropy=False
+                    logits, micro.input_ids, self.temperature, entropy=False, positions=micro.response_mask
                 )
-                out[start : start + len(micro)] = lp * micro.response_mask.float()
+                out[start : start + len(micro), : lp.shape[1]] = lp
             model.train(was_training)
         return out.to(src_device)
 
@@ -622,10 +639,11 @@ class ReferenceTrainer:
         was_training = self.model.training
         self.model.eval()
         for start in range(0, len(prepared), mbs):
-            micro = prepared.slice(start, start + mbs)
+            micro = prepared.slice(start, start + mbs).trimmed()
             with self._autocast(), self._final_hidden() as hidden:
                 self._forward(self.model, micro)
-            out[start : start + len(micro)] = self._values(hidden, micro) * micro.attention_mask
+            values = self._values(hidden, micro) * micro.attention_mask
+            out[start : start + len(micro), : values.shape[1]] = values
         self.model.train(was_training)
         return out.to(src_device)
 
@@ -780,44 +798,7 @@ class ReferenceTrainer:
 
     # -- internals ------------------------------------------------------------------------
     def _prepare(self, batch: TrainBatch) -> TrainBatch:
-        if batch.input_ids.shape[1] > self.max_seq_len:
-            width = batch.input_ids.shape[1]
-
-            def cut(t: torch.Tensor | None) -> torch.Tensor | None:
-                return None if t is None else t[:, : self.max_seq_len]
-
-            batch = TrainBatch(
-                input_ids=batch.input_ids[:, : self.max_seq_len],
-                attention_mask=batch.attention_mask[:, : self.max_seq_len],
-                response_mask=batch.response_mask[:, : self.max_seq_len],
-                advantages=batch.advantages[:, : self.max_seq_len],
-                rewards=batch.rewards,
-                group_ids=batch.group_ids,
-                old_logprobs=None
-                if batch.old_logprobs is None
-                else batch.old_logprobs[:, : self.max_seq_len],
-                ref_logprobs=None
-                if batch.ref_logprobs is None
-                else batch.ref_logprobs[:, : self.max_seq_len],
-                position_ids=None
-                if batch.position_ids is None
-                else batch.position_ids[:, : self.max_seq_len],
-                loss_weights=cut(batch.loss_weights),
-                behavior_logprobs=cut(batch.behavior_logprobs),
-                behavior_top_ids=cut(batch.behavior_top_ids),
-                behavior_top_logprobs=cut(batch.behavior_top_logprobs),
-                values=cut(batch.values),
-                returns=cut(batch.returns),
-                value_mask=cut(batch.value_mask),
-                meta=batch.meta,
-                extra={
-                    k: v[:, : self.max_seq_len]
-                    if isinstance(v, torch.Tensor) and v.ndim >= 2 and v.shape[1] == width
-                    else v
-                    for k, v in batch.extra.items()
-                },
-            )
-        return batch.to(self.device)
+        return batch.narrow(self.max_seq_len).to(self.device)
 
     def _forward(self, model: nn.Module, micro: TrainBatch) -> torch.Tensor:
         """Logits for one micro-batch."""

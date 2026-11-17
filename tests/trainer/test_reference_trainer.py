@@ -97,6 +97,70 @@ def test_micro_batching_matches_single_pass(tiny_model_dir: Path, tokenizer) -> 
     torch.testing.assert_close(lp1, lp4, atol=1e-5, rtol=0)
 
 
+def test_logprobs_at_chosen_positions_are_those_of_the_full_computation() -> None:
+    """The trainer computes the log-softmax at the response positions only; values and gradients
+    there have to be what the computation over every position gives, and zero elsewhere."""
+    from monorl.trainer.reference import sequence_logprobs_and_entropy
+
+    generator = torch.Generator().manual_seed(0)
+    logits = torch.randn((3, 7, 11), generator=generator, requires_grad=True)
+    input_ids = torch.randint(0, 11, (3, 7), generator=generator)
+    top_ids = torch.randint(0, 11, (3, 7, 2), generator=generator)
+    positions = torch.zeros((3, 7), dtype=torch.long)
+    positions[0, 0:3] = 1  # position 0 has no prefix: it stays 0 even when asked for
+    positions[1, 4:7] = 1
+    wanted = positions.bool()
+    wanted[:, 0] = False
+
+    full = sequence_logprobs_and_entropy(logits, input_ids, 0.7, entropy=True, top_ids=top_ids)
+    part = sequence_logprobs_and_entropy(
+        logits, input_ids, 0.7, entropy=True, top_ids=top_ids, positions=positions
+    )
+    for whole, chosen in zip(full, part, strict=True):
+        torch.testing.assert_close(chosen[wanted], whole[wanted])
+        assert not chosen[~wanted].any()
+
+    def gradient(values: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        lp, entropy, top = values
+        scalar = (lp * wanted).sum() + 0.3 * (entropy * wanted).sum() + (top * wanted[..., None]).sum()
+        return torch.autograd.grad(scalar, logits, retain_graph=True)[0]
+
+    torch.testing.assert_close(gradient(part), gradient(full), atol=1e-6, rtol=1e-5)
+
+
+def test_a_step_does_not_depend_on_the_padding_of_the_batch(tiny_model_dir: Path, tokenizer) -> None:
+    """Micro-batches are cut to their longest sequence: a batch padded far beyond its sequences has
+    to give the same log-probs (in its own shape) and the same update."""
+    batch = make_batch(tokenizer, batch_size=6)
+    pad = 37
+
+    def widen(tensor: torch.Tensor, value: int = 0) -> torch.Tensor:
+        return torch.nn.functional.pad(tensor, (0, pad), value=value)
+
+    wide = type(batch)(
+        input_ids=widen(batch.input_ids, tokenizer.pad_token_id),
+        attention_mask=widen(batch.attention_mask),
+        response_mask=widen(batch.response_mask),
+        advantages=widen(batch.advantages),
+        rewards=batch.rewards,
+        group_ids=batch.group_ids,
+    )
+    results = []
+    for which in (batch, wide):
+        trainer = ReferenceTrainer(make_config(tiny_model_dir, max_seq_len=128))
+        before = trainer.compute_logprobs(which)
+        assert before.shape == which.input_ids.shape and not before[:, batch.input_ids.shape[1] :].any()
+        which.old_logprobs = before
+        metrics = trainer.train_step(which)
+        weights = torch.cat([w.detach().flatten() for _, w in trainer.export_weights()])
+        results.append((before[:, : batch.input_ids.shape[1]], metrics, weights))
+    (lp_a, metrics_a, weights_a), (lp_b, metrics_b, weights_b) = results
+    torch.testing.assert_close(lp_a, lp_b, atol=1e-5, rtol=0)
+    for key in ("loss/policy", "loss/entropy", "grad_norm"):
+        assert metrics_a[key] == pytest.approx(metrics_b[key], rel=1e-4, abs=1e-6), key
+    torch.testing.assert_close(weights_a, weights_b, atol=1e-6, rtol=0)
+
+
 def test_truncates_to_max_seq_len(tiny_model_dir: Path, tokenizer) -> None:
     trainer = ReferenceTrainer(make_config(tiny_model_dir, max_seq_len=16), loss_fn=reinforce_loss)
     batch = make_batch(tokenizer)
