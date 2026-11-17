@@ -493,8 +493,8 @@ class RunConfig(_Model):
     seed: int = Field(
         42,
         description=(
-            "Seed of the run: Python and torch are seeded with it at the start and with seed + step at every "
-            "step, and data sources and backends receive it."
+            "Seed of the run: Python and torch are seeded with it at the start (a resumed run takes the "
+            "state of the generators from its checkpoint), and data sources and backends receive it."
         ),
     )
     providers: list[str] = Field(

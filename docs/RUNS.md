@@ -278,7 +278,8 @@ Written by the reference trainer into `step-N.tmp` and renamed, so a `step-N` di
 complete. Old checkpoints are not deleted. Contents: `model/` (`config.json`,
 `generation_config.json`, `model.safetensors`), or `adapter/` (the PEFT adapter) with
 `model.lora.enabled` (not run here), and `trainer_state.pt`, a `torch.save` dict with `step`,
-`optimizer`, `scheduler`, `scaler`, `value_head`, `mtp` and `rng`.
+`optimizer`, `scheduler`, `scaler`, `value_head`, `mtp` and `rng`. The loop adds `loop_state.pt`
+(its policy version and the state of the process's random generators, see [Resume](#resume)).
 For SmolLM2-135M in fp32 with AdamW one checkpoint is 1.6 GB (514 MB weights, 1.1 GB state).
 
 ### `final/`

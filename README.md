@@ -51,7 +51,8 @@ engine. The orchestrator runs this loop itself, or hands the same config to a pi
   `providers`.
 - **Repeatable.** On the `hf` engine a run repeats for a fixed seed, multi-turn environments
   included: the turns of concurrent episodes reach the engine in batches that do not depend on
-  timing ([docs](docs/RUNS.md#what-a-run-does)).
+  timing, and a resumed run continues the run it resumes
+  ([docs](docs/RUNS.md#what-a-run-does)).
 - **Patches, not forks.** Each upstream modification is a `Patch` with a target, a version gate
   and a verification hook; pins live in [`third_party/pins.toml`](third_party/pins.toml)
   ([docs](docs/PATCHING.md)).
@@ -363,7 +364,7 @@ stated. `make test` and `make lint` pass there; CI runs the suite on Linux witho
 | Pipelines | The six-stage `r1_sft_grpo_loop_cpu.yaml` from the CLI, through a SIGTERM and `--resume`; the pipeline that samples episodes, runs SFT on every turn of them and evaluates, end to end |
 | Environments | The Go wordle environment through `grpo_remote_env_go_wordle.yaml`, over stdio and over http against the four replicas of the compose stack; `tool_calling` episodes with real tool calls, each trained as one token-contiguous sequence |
 | External agents | A tool-using agent through the capture gateway on the native loop and on the TRL backend, also with a side conversation (two threads, two training sequences per episode); agents written with the OpenAI SDK (Responses API, `previous_response_id`) and the Anthropic SDK (tool use, streamed final turn), with token-contiguous episodes; an image-sending agent training a tiny random Qwen2-VL |
-| Repeatability | Two runs with the same seed, on a busy machine: identical episodes and metrics for `grpo_gsm8k_smollm_cpu.yaml` (2 steps) and for the 6-turn `grpo_remote_env_go_wordle.yaml` (2 steps, 16 of 16 episodes) |
+| Repeatability | Two runs with the same seed, on a busy machine: identical episodes and metrics for `grpo_gsm8k_smollm_cpu.yaml` (2 steps) and for the 6-turn `grpo_remote_env_go_wordle.yaml` (2 steps, 16 of 16 episodes); a run of 4 steps against the same run stopped after step 2 and resumed: identical episodes and metrics in steps 3 and 4, also with a reward that gives a gradient |
 | Failures and context | A run whose agent crashes on some episodes finishes with those episodes left out or retried; a context budget ends episodes instead of truncating them in training |
 | Sandbox | Harness episodes in real Docker containers (agent and verifier inside, reward from the verifier, containers removed); `grpo_harness_tasks_docker_cpu.yaml` on its Harbor-format example tasks |
 | Async rollouts | `rollout.async_steps_ahead: 2` with decoupled PPO, importance weights and a ratio mask, and with score centering |
