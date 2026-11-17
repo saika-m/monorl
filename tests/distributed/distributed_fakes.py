@@ -36,6 +36,8 @@ class FakeEngine:
         self.slept = False
         self.shut_down = False
         self.updates = 0
+        self.received: list[str] = []
+        """Names of the tensors of the last update, in the order they came."""
         self.completions = 0
 
     def speculation_stats(self) -> SpeculationStats:
@@ -59,8 +61,10 @@ class FakeEngine:
         ]
 
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        self.received = []
         for name, tensor in weights:
             self.weights[name].copy_(tensor.to(self.weights[name].device, copy=True))
+            self.received.append(name)
         self.updates += 1
 
     def load_weights_from_path(self, path: str | Path) -> None:
@@ -122,6 +126,59 @@ class FakeTrainer:
         torch.save(self.weights, path / "weights.pt")
 
 
+class PatchingEngine(FakeEngine):
+    """An engine that says it takes pushes without the tensors it already holds."""
+
+    accepts_partial_weights = True
+
+
+class FlakyEngine(PatchingEngine):
+    """While ``failing``, an update takes its stream, fails, and leaves the engine with weights
+    of its own, like an engine that broke down and came back."""
+
+    failing = False
+
+    def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        if not self.failing:
+            return super().update_weights(weights)
+        self.received = [name for name, _ in weights]
+        for tensor in self.weights.values():
+            tensor.zero_()
+        raise RuntimeError("engine broke down during the update")
+
+
+class AdapterTrainer(FakeTrainer):
+    """Trains the tensors named in ``trained`` and leaves the others frozen. Like the reference
+    trainer it lists what its optimizer writes in ``trainable_params``, and like torch's fused
+    optimizers it writes without advancing the tensors' version counters."""
+
+    def __init__(self, seed: int = 1, *, trained: Sequence[str] = ("model.layers.0.proj.weight",)) -> None:
+        super().__init__(seed)
+        self.trained = tuple(trained)
+
+    @property
+    def trainable_params(self) -> list[torch.Tensor]:
+        return [self.weights[name] for name in self.trained]
+
+    def train_step(self, batch: TrainBatch) -> dict[str, float]:
+        self._step += 1
+        for name in self.trained:
+            self.weights[name].data.add_(0.5)
+        return {"loss/policy": float(batch.advantages.sum().item()), "batch/size": float(len(batch))}
+
+
+def make_batch() -> TrainBatch:
+    ids = torch.zeros(2, 3, dtype=torch.long)
+    return TrainBatch(
+        input_ids=ids,
+        attention_mask=torch.ones_like(ids),
+        response_mask=torch.ones_like(ids),
+        advantages=torch.ones(2, 3),
+        rewards=torch.ones(2),
+        group_ids=["g", "g"],
+    )
+
+
 def register(registry: Any) -> None:
     registry.register("rollout_engine", "fake", lambda config, **kw: FakeEngine(0, **kw))
     registry.register("trainer", "fake", lambda config, **kw: FakeTrainer(1, **kw))
@@ -173,3 +230,48 @@ def ipc_consumer(handles: list[Any], out_queue: Any) -> None:
     from monorl.distributed.weight_sync import open_ipc_handles
 
     out_queue.put({name: float(t.double().sum().item()) for name, t in open_ipc_handles(handles)})
+
+
+class RemoteBroadcastEngine:
+    """Rank-0 side of the engine that :func:`broadcast_engine_process` runs: starts a receive there
+    and, once it ended, has what that engine was given (``received``) and holds (``weights``)."""
+
+    accepts_partial_weights = True
+
+    def __init__(self, conn: Any) -> None:
+        self.conn = conn
+        self.failing = False
+        self.received: list[str] = []
+        self.weights: dict[str, torch.Tensor] = {}
+
+    def begin_receive_broadcast(self, spec: Any, rank: int) -> RemoteBroadcastEngine:
+        self.conn.send((spec, rank, self.failing))
+        return self
+
+    def result(self) -> dict[str, float]:
+        error, self.received, weights = self.conn.recv()
+        self.weights = {name: torch.tensor(values) for name, values in weights.items()}
+        if error:
+            raise RuntimeError(error)
+        return {}
+
+
+def broadcast_engine_process(conn: Any) -> None:
+    """Receive one broadcast into a :class:`FlakyEngine` per ``(spec, rank, failing)`` message and
+    answer ``(error, received, weights)``; ``None`` ends the process."""
+    from monorl.distributed.weight_sync import BroadcastWeightSync
+
+    engine = FlakyEngine(seed=0)
+    sync: BroadcastWeightSync | None = None
+    while (message := conn.recv()) is not None:
+        spec, rank, engine.failing = message
+        if sync is None:
+            sync = BroadcastWeightSync(spec, rank=rank)
+        error = ""
+        try:
+            sync.receive(engine)
+        except RuntimeError as e:
+            error = str(e)
+        conn.send((error, engine.received, {name: t.tolist() for name, t in engine.weights.items()}))
+    if sync is not None:
+        sync.close()
