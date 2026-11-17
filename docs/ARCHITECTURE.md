@@ -311,6 +311,8 @@ The files of a run directory, their row formats and the metrics glossary are in
 [`RUNS.md`](RUNS.md).
 
 ### Server API (FastAPI, `monorl.server.app:create_app`)
+Every route needs the server's access token, a local `Host` and, for a request that changes
+something, the server's own `Origin`: [`WEB_UI.md`](WEB_UI.md#access).
 ```
 GET  /api/system                      doctor report
 GET  /api/config/schema               RunConfig JSON schema

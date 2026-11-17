@@ -130,7 +130,7 @@ monorl train --config configs/recipes/grpo_gsm8k_smollm_cpu.yaml --set trainer.m
 
 # web UI
 make web                    # build web/dist once
-monorl serve                # http://127.0.0.1:8000, opens a browser tab
+monorl serve                # prints a sign-in URL for http://127.0.0.1:8000 and opens it
 
 # look at data before training
 monorl data inspect hf://openai/gsm8k --config-name main --limit 3
@@ -289,7 +289,7 @@ SDK is header-only (`envs/sdk/cpp/include/mep/mep.hpp`) and serves the same prot
 |---|---|
 | `monorl train` | Run a training job: `--config PATH` (a `RunConfig` YAML), `--set key.path=value` to override a field, `--run-dir DIR`, `--resume` from the latest checkpoint |
 | `monorl pipeline` | Run a multi-stage pipeline (SFT, RL, rejection sampling and eval stages). Same options; `--resume` skips the stages that already succeeded |
-| `monorl serve` | Web UI and API (`--host`, `--port`, `--no-open`, `--reload`) |
+| `monorl serve` | Web UI and API (`--host`, `--port`, `--no-open`, `--reload`, `--allowed-host`, `--token`); every request needs the access token ([docs](docs/WEB_UI.md#access)) |
 | `monorl doctor` | System, frameworks, patches and registered components (`--json`) |
 | `monorl bench` | `rollout`, `env`, `sync`, `plan`: size a run by tokens/s, episodes/s, sync time and a placement plan |
 | `monorl patches` | `list`, `status [FRAMEWORK]`, `apply FRAMEWORK`: inspect and apply the patchsets |
@@ -445,7 +445,8 @@ scripts/vendor.py --fetch vllm     # clone a pinned upstream source (or `all`)
 ```bash
 scripts/dev/bootstrap.sh     # .venv (uv, Python 3.12), example envs in envs/bin, web/dist
 scripts/dev/smoke.sh         # CPU end to end: 2-step GRPO run, then `monorl serve` probes
-docker compose up --build    # UI on :8000 and four `env-wordle` MEP/1 replicas
+docker compose up --build    # UI on 127.0.0.1:8000 and four `env-wordle` MEP/1 replicas
+docker compose logs ui       # the URL that signs a browser in to that UI
 docker compose --profile gpu up ray-head    # Ray head on the vLLM image (NVIDIA runtime)
 ```
 

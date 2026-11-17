@@ -257,6 +257,9 @@ signal interrupts immediately.
 
 ## API and UI
 
+The routes need the server's access token, like every route of the API
+([`WEB_UI.md`](WEB_UI.md#access)).
+
 - `POST /api/jobs {pipeline: PipelineConfig}` (or a bare `{base, stages}` dict) → job
   `kind: "pipeline"`, `config` = the PipelineConfig; the server spawns
   `python -m monorl.cli pipeline --config <run_dir>/pipeline.yaml --run-dir <run_dir>`

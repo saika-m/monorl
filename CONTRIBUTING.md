@@ -84,7 +84,9 @@ push cancels the run of an older one.
 - **Parallel runs.** CI runs the suite on four pytest-xdist workers, each a process of its own
   that gets the tests in no particular order. A test must pass alone and next to any other: it
   takes its ports from the system (the server binds port 0 and is asked which one it got), and
-  it removes what it registers. Tests that share one resource outside their process carry
+  it removes what it registers. A port that has to be named before the process that binds it
+  exists (`MASTER_PORT` of a `torch.distributed` group) comes from `tests/ports.py`, not from
+  a bind to port 0 that is closed again. Tests that share one resource outside their process carry
   `pytest.mark.xdist_group("<name>")` and stay together on one worker (`--dist loadgroup` in
   `pyproject.toml`): the local Ray of `tests/distributed/test_ray_runtime.py`, the Docker daemon
   of `tests/envs/test_sandbox_docker.py`. CI gives every worker one torch thread
