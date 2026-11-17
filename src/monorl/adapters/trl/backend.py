@@ -6,12 +6,15 @@ monorl data → HF dataset (:mod:`.data`; ``images`` column + ``AutoProcessor`` 
 rewards → TRL reward function (:mod:`.rewards`), monorl environments → TRL ``rollout_func``
 (:mod:`.rollout`, multi-turn only; single-turn runs on TRL's native generation path), monorl
 reporter ← ``TrainerCallback`` + the ``trl.grpo.monorl_hooks`` patch (:mod:`.callbacks`,
-:mod:`.patches`). Both trainers share checkpointing (``checkpoints/step-<n>``), resume and the
-merged ``final/`` export.
+:mod:`.patches`). Both trainers share checkpointing (``checkpoints/step-<n>``), resume
+(``Trainer.train(resume_from_checkpoint=...)`` with the newest complete ``checkpoint-<n>``, only
+when the run was started with ``--resume``), the merged ``final/`` export, and the end of a
+cancelled run: after the step the first signal arrived in, with the checkpoint of that step.
 """
 
 from __future__ import annotations
 
+import json
 import signal
 import sys
 import threading
@@ -94,6 +97,26 @@ def peft_config_for(config: RunConfig) -> Any | None:
     )
 
 
+def last_complete_checkpoint(output_dir: Path) -> tuple[int, Path | None]:
+    """``(step, path)`` of the newest ``checkpoint-<n>`` that a resume can load, ``(0, None)``
+    without one. ``Trainer._save_checkpoint`` writes ``trainer_state.json`` after the model, the
+    optimizer, the scheduler and the generator states, so a directory whose state file reads as
+    JSON was finished; one that a killed run left half-written is passed over, where
+    ``transformers.trainer_utils.get_last_checkpoint`` would pick it and the resume would fail."""
+    from transformers.trainer import TRAINER_STATE_NAME
+    from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+    found: list[tuple[int, Path]] = []
+    for path in output_dir.glob(f"{PREFIX_CHECKPOINT_DIR}-*"):
+        try:
+            step = int(path.name[len(PREFIX_CHECKPOINT_DIR) + 1 :])
+            json.loads((path / TRAINER_STATE_NAME).read_text())
+        except (ValueError, OSError):
+            continue
+        found.append((step, path))
+    return max(found) if found else (0, None)
+
+
 class TRLPipelineBackend:
     name = "trl"
 
@@ -102,7 +125,15 @@ class TRLPipelineBackend:
         self.trainer: Any = None
 
     # -- PipelineBackend ---------------------------------------------------------------------
-    def run(self, config: RunConfig, run_dir: Path, *, reporter: RunReporter) -> RunResult:
+    def run(
+        self,
+        config: RunConfig,
+        run_dir: Path,
+        *,
+        reporter: RunReporter,
+        resume: bool = False,
+        cancel: threading.Event | None = None,
+    ) -> RunResult:
         run_dir = Path(run_dir)
         trl = _import_trl()
         device = resolve_device(config)
@@ -117,7 +148,7 @@ class TRLPipelineBackend:
         )
         if config.is_sft:
             args = compile_sft_config(config, run_dir, device=device)
-            callback = ReporterCallback(reporter, sft=True, label="SFTTrainer")
+            callback = ReporterCallback(reporter, sft=True, label="SFTTrainer", cancel=cancel)
             trainer_cls, loss_kwargs = trl.SFTTrainer, {}
             smoothing = sft_label_smoothing(config)
             if smoothing > 0:
@@ -137,11 +168,11 @@ class TRLPipelineBackend:
             )
         else:
             args = compile_grpo_config(config, run_dir, device=device)
-            callback = ReporterCallback(reporter)
+            callback = ReporterCallback(reporter, cancel=cancel)
             trainer = self._build_grpo_trainer(
                 trl, config, args, model, tokenizer, processing_class, train_ds, eval_ds, callback, reporter
             )
-        return self._train(trainer, args, tokenizer, callback, run_dir, reporter)
+        return self._train(trainer, args, tokenizer, callback, run_dir, reporter, resume, cancel)
 
     # -- internals ---------------------------------------------------------------------------
     def _build_grpo_trainer(
@@ -220,16 +251,23 @@ class TRLPipelineBackend:
         callback: ReporterCallback,
         run_dir: Path,
         reporter: RunReporter,
+        resume: bool,
+        cancel: threading.Event | None,
     ) -> RunResult:
         from transformers import PrinterCallback
-        from transformers.trainer_utils import get_last_checkpoint
 
         trainer.remove_callback(PrinterCallback)  # metrics go to metrics.jsonl, not stdout
         self.trainer = trainer
 
-        resume_from = get_last_checkpoint(args.output_dir) if Path(args.output_dir).is_dir() else None
-        if resume_from:
-            reporter.log(f"resuming from {resume_from}")
+        resume_from: str | None = None
+        if resume:
+            step, checkpoint = last_complete_checkpoint(Path(args.output_dir))
+            if checkpoint is None:
+                reporter.log("resume requested but no complete checkpoint exists; starting from step 0")
+            else:
+                resume_from = str(checkpoint)
+                reporter.log(f"resuming from {resume_from}")
+            reporter.drop_rows_after(step)
 
         state = "succeeded"
         error: str | None = None
@@ -237,12 +275,25 @@ class TRLPipelineBackend:
         with _sigterm_as_interrupt():
             try:
                 trainer.train(resume_from_checkpoint=resume_from)
-                final_path = str(self._save_final(trainer, tokenizer, run_dir / FINAL_DIR))
+                # The callback ended the training after the step the first signal arrived in. A
+                # signal in the last step leaves nothing to cancel, as in the orchestrator's loops.
+                if (
+                    cancel is not None
+                    and cancel.is_set()
+                    and trainer.state.global_step < trainer.state.max_steps
+                ):
+                    state = "cancelled"
+                else:
+                    final_path = str(self._save_final(trainer, tokenizer, run_dir / FINAL_DIR))
+            # Trainer.train calls no callback when it raises: the sinks are closed here, inside
+            # the handlers, where they still see the exception and end the W&B run as failed.
             except KeyboardInterrupt:
                 state, error = "cancelled", "interrupted"
+                callback.close()
             except Exception as e:  # noqa: BLE001 - must land in status.json
                 state, error = "failed", f"{type(e).__name__}: {e}"
                 reporter.log(traceback.format_exc())
+                callback.close()
         step = int(trainer.state.global_step)
         link_checkpoint(Path(args.output_dir), step)
         message = {"succeeded": f"finished {step} steps", "cancelled": f"cancelled after step {step}"}.get(

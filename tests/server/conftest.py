@@ -17,6 +17,15 @@ from monorl.server.app import ServerSettings, create_app
 from monorl.server.jobs import JobManager
 
 FAKE_TRAINER = Path(__file__).with_name("fake_trainer.py")
+TOKEN = "test-token-0123456789abcdef"
+# The address a browser would use: the server refuses a Host that does not name this machine.
+BASE_URL = "http://127.0.0.1:8000"
+
+
+def signed_in(app: Any) -> TestClient:
+    """A client of ``app`` that sends the app's token, as an API client of the server does."""
+    token = app.state.settings.token
+    return TestClient(app, base_url=BASE_URL, headers={"Authorization": f"Bearer {token}"})
 
 
 @pytest.fixture
@@ -51,6 +60,8 @@ def settings(home: Path, recipes_dir: Path, envs_bin: Path, tmp_path: Path) -> S
         web_dist=tmp_path / "web-dist",
         envs_bin=envs_bin,
         envs_sdk=tmp_path / "envs-sdk",
+        token=TOKEN,
+        allowed_hosts=[],
     )
 
 
@@ -61,7 +72,7 @@ def jobs(settings: ServerSettings) -> JobManager:
 
 @pytest.fixture
 def client(settings: ServerSettings, jobs: JobManager) -> Iterator[TestClient]:
-    with TestClient(create_app(settings, jobs=jobs)) as c:
+    with signed_in(create_app(settings, jobs=jobs)) as c:
         yield c
 
 
@@ -124,9 +135,13 @@ class SseStream:
             "raw_path": path.encode(),
             "root_path": "",
             "query_string": urlencode(params).encode(),
-            "headers": [(b"host", b"testserver"), (b"accept", b"text/event-stream")],
+            "headers": [
+                (b"host", b"127.0.0.1:8000"),
+                (b"accept", b"text/event-stream"),
+                (b"authorization", f"Bearer {app.state.settings.token}".encode()),
+            ],
             "client": ("testclient", 50000),
-            "server": ("testserver", 80),
+            "server": ("127.0.0.1", 8000),
         }
         self._events: asyncio.Queue[tuple[str, Any] | None] = asyncio.Queue()
         self._disconnect = asyncio.Event()

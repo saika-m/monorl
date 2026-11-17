@@ -68,7 +68,7 @@ The SFT loop has no rollouts, rewards, environments or weight sync. Each step en
 | `running` | at start, then after every step with a progress message |
 | `succeeded` | all steps ran and `final/` was exported |
 | `cancelled` | a signal stopped the run before `trainer.max_steps` |
-| `failed` | any exception; the message is `<ExceptionType>: <text>`, the traceback is in `run.log` |
+| `failed` | any exception; the message is `<ExceptionType>: <text>`, and `run.log` has the traceback unless the error is a mistake in the config, the data or the installation ([`run.log`](#runlog)) |
 
 `status.json` holds one of these states. `monorl train` exits with 0 for `succeeded`, 130 for
 `cancelled` and 1 otherwise.
@@ -81,8 +81,23 @@ The SFT loop has no rollouts, rewards, environments or weight sync. Each step en
   sync, a due checkpoint, reporting, a due evaluation), then the loop stops. If that step was not
   checkpointed already, `checkpoints/step-N/` is saved. `final/` is not written and the state is
   `cancelled`. If the step that finished was the last one, the run completes as `succeeded`.
-- Second signal: `KeyboardInterrupt` is raised at once. The state is `cancelled`, no checkpoint is
-  saved for the interrupted step (from the code, not run here).
+- Second signal: the run stops at once and says so (`received SIGINT again: stopping now`).
+  `KeyboardInterrupt` is raised on the main thread, and what other threads were doing for the run
+  is aborted instead of waited for: a generation in flight ends through the engine's `cancel()`
+  (`hf`, `vllm` and `sglang` have one; `hf` stops within one decoding step), an episode at its
+  next turn. Two things are still waited for: an environment step in flight, and the batch of an
+  engine that has no `cancel()`. The state is `cancelled` and nothing more is written: no
+  checkpoint for the interrupted step, and a checkpoint that was being saved stays `step-N.tmp`
+  and never becomes `step-N`. `metrics.jsonl` and `trajectories.jsonl` keep the rows they have,
+  as after a kill; `--resume` continues from the newest checkpoint ([Resume](#resume)).
+
+`run(..., cancel=event)` takes the event the first signal sets. A pipeline passes its own to every
+train stage, so a signal that arrives in the last step of a stage, which ends `succeeded`, still
+stops the pipeline before the next stage ([PIPELINES.md](PIPELINES.md#resume-and-cancellation)).
+
+A pipeline backend gets the same event. `trainer.backend: trl` does what is described above, with
+TRL's checkpoint of the step; `verl` and `nemo_rl` stop their child process without finishing the
+step ([BACKENDS.md](BACKENDS.md#signals-with-a-pipeline-backend)).
 
 A real cancel of an SFT run (`kill -INT` after step 1 was logged, exit code 130):
 
@@ -91,6 +106,17 @@ A real cancel of an SFT run (`kill -INT` after step 1 was logged, exit code 130)
 2026-11-12 22:42:42 stopping after step 2 (cancel requested)
 2026-11-12 22:42:44 saved checkpoint .../cancel/checkpoints/step-2
 2026-11-12 22:42:44 [cancelled] cancelled after step 2
+```
+
+A real second signal, one second after the first, while step 1 of
+`configs/recipes/grpo_gsm8k_smollm_cpu.yaml` was generating (`hf` engine on CPU, LoRA,
+`rollout.max_new_tokens=128`). The process ended 0.6 s after it with exit code 130; a second
+signal during a train step and during an evaluation ended it in 0.9 s each:
+
+```text
+2026-11-17 02:45:17 received SIGINT: finishing the current step, then stopping
+2026-11-17 02:45:18 received SIGINT again: stopping now
+2026-11-17 02:45:18 [cancelled] cancelled after step 0
 ```
 
 ## Starting runs
@@ -109,14 +135,21 @@ missing mappings) and parses the value with `yaml.safe_load`, so `10` is an int,
 `null` is None, `[a, b]` a list, `{type: exact_match}` a mapping, and text that is not valid YAML
 stays a string. The merged config is then validated by the schema, which rejects unknown keys and
 converts compatible strings (YAML reads `2e-6` as a string; the `float` field accepts it). List
-items cannot be addressed (`rewards.0.weight=2` fails validation): replace the whole list.
+items cannot be addressed (`rewards.0.weight=2` is refused): replace the whole list.
 
-`logging.run_root` defaults to `~/.monorl/runs`. `run_name` defaults to
+`logging.run_root` defaults to `~/.monorl/runs`, which stands for `runs` under `$MONORL_HOME` when
+that variable is set (the server's jobs file and the caches are there too). `run_name` defaults to
 `<model basename>-<algorithm.name>-<YYYYmmdd-HHMMSS>`, for example
 `SmolLM2-135M-Instruct-grpo-20261112-224338`, and the default run directory is
-`<logging.run_root>/<run_name>`. The shipped recipes set a fixed `run_name`, so without
-`--run-dir` every run of a recipe uses the same directory. A run started in an existing directory
-without `--resume` starts at step 0 and appends to `metrics.jsonl`, `trajectories.jsonl`, `run.log`.
+`<logging.run_root>/<run_name>`. The shipped recipes set a fixed `run_name`, so without `--run-dir`
+every run of a recipe uses the same directory. A run started in an existing directory without
+`--resume` starts at step 0 and appends to `metrics.jsonl`, `trajectories.jsonl`, `run.log` (a last
+line that a killed run left unfinished is removed first, so that the first row of the new run is not
+glued to it). It replaces `config.yaml`, `status.json`, `final/` and the checkpoints of the steps it
+saves. Everything else of the earlier run stays: its rows, and its checkpoints of other steps, which
+a later `--resume` takes for this run's when they are newer. Run here with the test fakes: 4 steps,
+then 2 steps without `--resume`, left the rows of steps 1, 2, 3, 4, 1, 2 and `step-4` of the first
+run, from which `--resume` then continued. Give a new run a directory of its own.
 
 ### Resume
 
@@ -160,7 +193,60 @@ does not either under `trainer.scheduler: constant` (the default); with `linear`
 learning rate of every step depends on `trainer.max_steps`, so the short run is another run (from
 the code, not run here). A run that ends at `trainer.max_steps` has a checkpoint of its last step
 only when `trainer.save_every` divides it. A resume always starts at the last checkpoint: steps
-that ran after it are run again, and their rows are appended a second time.
+that ran after it are run again.
+
+#### The record files after a resume
+
+A run that was killed (SIGKILL, out of memory, power) has written rows of steps after its last
+checkpoint, and may have stopped in the middle of a line. Before a resume continues at step
+`N + 1` it takes `metrics.jsonl` and `trajectories.jsonl` back to the end of step `N`:
+
+- Rows of steps after `N` are removed, of every phase. The run writes those steps again.
+- A last line that is not a complete row is removed. The next row would otherwise share its line
+  and be unreadable.
+- `checkpoints/step-M.tmp` directories, checkpoints that were never finished, are removed.
+- The evaluation of step `N` comes after its checkpoint. When `metrics.jsonl` has no `eval` row
+  of step `N` although one is due, the resume evaluates step `N` again, from the weights and the
+  generators of the checkpoint, after removing the `eval` rows of step `N` that
+  `trajectories.jsonl` may hold (an evaluation writes its metrics row last).
+
+Without a checkpoint the resume starts at step 0 and both files start over. The files are read
+line by line and not held in memory; the result is written to `<file>.tmp` and renamed over the
+file, and a file that loses nothing is not rewritten. Measured here on a 257 MB
+`trajectories.jsonl` (6400 rows of 40 kB): 0.9 s of CPU time and 1.1 MB of Python memory at the
+peak to remove 100 of 400 steps, 0.6 s when there was nothing to remove. `run.log` says what was
+done:
+
+```text
+... removed the lines after step 2: 1 of metrics.jsonl, 4 of trajectories.jsonl
+... resumed from .../B_lora/checkpoints/step-2 at step 2
+```
+
+and, for the run that was killed while it evaluated step 2:
+
+```text
+... resumed from .../C_lora/checkpoints/step-2 at step 2
+... the run being resumed did not finish the evaluation of step 2; evaluating it again
+```
+
+The loop writes the rows of step `N` before it renames `step-N.tmp`, so a checkpoint that exists
+has the rows of its step, and a run that is killed in between resumes from the checkpoint before.
+
+With that, the two files of a run that was killed and resumed are those of the run that was not
+killed, timing fields apart (`time`, `time/*`, `eval/time`, `weight_sync/seconds`), under the
+conditions above for a resumed run to continue exactly. Run here, with `OMP_NUM_THREADS=1`:
+`grpo_gsm8k_smollm_cpu.yaml` with `trainer.max_steps=4`, `trainer.save_every=2`, `data.limit=8`,
+`rollout.max_new_tokens=48`, `data.eval_uri=hf://openai/gsm8k`, `data.eval_split=test`,
+`trainer.eval_every=1`, `trainer.learning_rate=1e-4` and the `length` reward of the runs above,
+once to the end, once killed with `kill -9` as soon as `metrics.jsonl` had the `train` row of step
+3, and once killed during the evaluation of step 2, each followed by `--resume`. All three
+directories held the same 8 metrics rows and 32 trajectory rows, and so did the three of the same
+runs with `model.lora.enabled=true` (the log lines above are theirs). Before this was done the
+second run had the `train` row of step 3 twice and its 4 episodes twice, and the third never got
+the `eval` row of step 2 or its 4 episodes.
+
+The tests kill the loop at three points (after later steps, in the rows of the checkpoint step,
+in its evaluation) with fake components, for the RL and the SFT loop.
 
 What does not continue exactly, and is logged as `the run will not continue exactly as the one it
 resumes: <reasons>` where the loop can tell:
@@ -183,21 +269,81 @@ resumes: <reasons>` where the loop can tell:
   environments that are not functions of their inputs (an `llm_judge`, a remote environment with a
   random state of its own).
 
-Not restored: the config (the one given on this command line is used and overwrites `config.yaml`),
-`status.json` (rewritten with a new `started_at` and `pid`) and earlier rows of `metrics.jsonl`
-and `trajectories.jsonl` (new rows are appended; nothing is truncated). Without a checkpoint the
-run logs `resume requested but no complete checkpoint exists; starting from step 0`.
+Not restored: the config (the one given on this command line is used and overwrites `config.yaml`)
+and `status.json` (rewritten with a new `started_at` and `pid`). `run.log` is appended to. What
+the optional sinks hold of the steps that are run again is not taken back (from the code: a
+resumed run opens a new TensorBoard event file next to the old one and a new W&B run; not run
+here). Without a checkpoint the run logs
+`resume requested but no complete checkpoint exists; starting from step 0`.
 
 ## The run directory
 
 `src/monorl/core/reporting.py` owns the layout and has the readers the server and CLI use:
 `read_status`, `iter_metrics`, `iter_trajectories` and `list_checkpoints`. Besides the files below,
-`<run_dir>/tensorboard/` exists when the TensorBoard sink is active.
+`<run_dir>/tensorboard/` and `<run_dir>/wandb/` exist when those sinks are active
+([Logging sinks](#logging-sinks)).
 
 ### `config.yaml`
 
 The full validated `RunConfig` with every default filled in (`run_name` included), written before
 anything else. Field reference: [CONFIG.md](CONFIG.md).
+
+**Secrets.** A value that the config read from an environment variable (`${NAME}`, or
+`${NAME:-default}` with the variable set) is written as `${NAME}` again when the variable is named
+like a secret and the value has at least 8 characters. A name is one when a part of it between
+underscores is `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PWD`, `CREDENTIAL` or
+`CREDENTIALS`, in any case: `OPENAI_API_KEY`, `HF_TOKEN` and `DB_PASSWORD` are, `TOKENIZER_PATH`
+and `MONKEY` are not. The components of the run are built with the value; the file names the
+variable, wherever the value occurs inside a string.
+Run here with a copy of `grpo_gsm8k_smollm_cpu.yaml` that has a second reward, an `llm_judge`
+whose `extra_body` (the mapping it adds to every request, where a key that an endpoint wants in
+the body goes) holds `api_key: ${DEMO_JUDGE_API_KEY}`, with `base_url: http://127.0.0.1:9/v1`
+(nothing listens there, so every judgment failed and scored 0) and `max_attempts: 1`. With the
+variable set to `sk-demo-0123456789abcdef`, one step leaves the value in no file of the run
+directory, and lines 118 to 125 of `config.yaml` are:
+
+```yaml
+- type: llm_judge
+  weight: 1.0
+  params:
+    base_url: http://127.0.0.1:9/v1
+    model: judge
+    max_attempts: 1
+    extra_body:
+      api_key: ${DEMO_JUDGE_API_KEY}
+```
+
+The file loads to the same config where the variable is set, which is how `--resume` with this
+file and the jobs of the web server use it. Where it is not set, loading fails with
+`environment variable DEMO_JUDGE_API_KEY is not set (referenced as ${DEMO_JUDGE_API_KEY})`. A
+default that was used because the variable is not set is written as it is: it stands in the
+config file, and the written file loads wherever the original did.
+
+The same replacement applies to `pipeline.yaml`, `pipeline.json` and the `config.yaml` of every
+stage, to `status.json` and the lines monorl writes to `run.log` (an error that quotes the value
+names the variable), to the config the W&B sink sends, to the job records and the recipes the
+web server returns, to `monorl recipes show --json` and to the `monorl_reward.py` the `verl`
+backend writes. verl's reward workers import that module and resolve `${NAME}` themselves, as
+they do for `config.yaml`, so the variable has to be set in their environment: on a Ray cluster,
+on every node. A worker without it fails with the error above.
+
+Not replaced:
+
+- A variable with another name, a value shorter than 8 characters, a default, and a secret typed
+  into the config file itself. Read secrets from variables that are named as above.
+- What other programs write: the output of a framework or of an environment's process in
+  `run.log`, and the text of `metrics.jsonl` and `trajectories.jsonl`.
+- The files a pipeline backend compiles for its framework, which reads them without monorl and
+  needs the values:
+
+  | File | Holds |
+  |---|---|
+  | `verl_config.yaml`, `verl_overrides.txt` | the verl config compiled from the run config, with `trainer.extra` merged in |
+  | `verl_tools.yaml` | `env.params` of a `tool_calling` environment, once per tool |
+  | `nemo_rl/nemo_rl.yaml` | the NeMo-RL config with `trainer.extra.nemo_rl` merged in; under `env.monorl` the whole run config and its `rewards` |
+
+  Keep these files as private as the variables themselves. What the framework does with its
+  config (logging it, sending it to its own W&B run) is the framework's.
 
 ### `status.json`
 
@@ -272,10 +418,57 @@ characters are cut with a marker and inline `data:` media over 64 KiB is replace
 One line per event, `YYYY-MM-DD HH:MM:SS <message>`; status changes appear as `[state] message`.
 Lines are also echoed to stderr unless `MONORL_REPORTER_ECHO=0`.
 
+**Failures.** A run that fails because its config, its data or its installation has to change
+ends with one line, the message `status.json` has:
+
+```text
+2026-11-17 02:41:13 [failed] DatasetNotFound: dataset path not found: /tmp/no-such.jsonl
+```
+
+These are the errors `ConfigError`, `DataError`, `RegistryError` and `BackendUnavailable`: an
+unknown trainer, engine, reward or environment, a provider that cannot be imported, a dataset
+path, split or column that does not exist, a dataset without usable samples, a framework that is
+not installed. A `model.name_or_path` or `model.tokenizer_name_or_path` that is written as a path
+(it starts with `/`, `./`, `../` or `~`) and is not a directory is one of them, found before
+anything is loaded. The path is taken as written, as transformers takes it: `~` is not expanded,
+and the message says so. Nothing is checked with `cluster.ray_address`, where the nodes of that
+cluster load the model. Every other exception has its traceback in `run.log` before the
+`[failed]` line, and `monorl train` says where: `(traceback in <run_dir>/run.log)`. That includes
+what a component raises as a plain `ValueError` for parameters it cannot use, such as
+`llm_judge` without `base_url`.
+
+**Warnings.** While a run is in progress, what its process logs through Python's `logging` under
+`monorl` at WARNING or above is a line of `run.log`, `<LEVEL> <logger>: <message>` after the time,
+followed by the traceback when the record has one. `monorl.rewards.llm_judge` (judgments that
+failed), `monorl.orchestrator.episodes` (an episode that failed and is tried again or left out),
+`monorl.envs.remote` (an environment process that is started again) and `monorl.envs.sandbox` (a
+container that was not removed) log this way. One step of the CPU recipe with an `llm_judge` reward
+whose `base_url` nobody listens on and `max_attempts: 1` wrote, between `[running] training steps
+1..1` and the line of step 1: `2026-11-17 02:45:38 WARNING monorl.rewards.llm_judge: reward
+llm_judge: 8 of 8 judgments failed and scored 0 (8x ConnectError: [Errno 61] Connection refused)`.
+The terminal had the same line once, as the echo of the log line. A program that configures
+`logging` itself gets the record in its handlers and no echo. Records below WARNING and records of
+other loggers (a library, a provider module that logs under its own name) are not collected. The
+`rejection_sample` and `eval` stages of a pipeline collect into the `run.log` of the stage, as a
+train stage does; the pipeline's own `run.log` holds the lines of the pipeline.
+
+Only the process of the run is covered. A warning logged in a Ray worker is not in `run.log`:
+Ray prints the worker's stderr on the driver's. Run here with a local Ray and an actor that logs
+under `monorl`, next to a warning of the driver: `run.log` had the driver's line only, and stderr
+had it and `(Worker pid=78825) warning logged in a Ray actor`. The engines and the trainer ranks
+of `cluster.mode: ray` are such actors (from `src/monorl/distributed/ray_runtime.py`; a run with
+`cluster.mode: ray` was not made for this). A job started by `monorl serve` has its stderr in
+`run.log` and the echo off, so it has the run's own warnings once, with the time, and those of
+Ray workers as Ray prints them (the first run here with `MONORL_REPORTER_ECHO=0` and stderr
+appended to `run.log`, not through the server; the second from
+`src/monorl/server/jobs.py`). The `verl` and `nemo_rl` backends run the framework in a child
+process whose output goes to `run.log` line by line (from the code, neither is installed here).
+
 ### `checkpoints/step-N/`
 
-Written by the reference trainer into `step-N.tmp` and renamed, so a `step-N` directory is always
-complete. Old checkpoints are not deleted. Contents: `model/` (`config.json`,
+Written by the reference trainer into `step-N.tmp` and renamed once the rows of step `N` are in
+`metrics.jsonl` and `trajectories.jsonl`, so a `step-N` directory is always complete and never
+ahead of the record files. Old checkpoints are not deleted. Contents: `model/` (`config.json`,
 `generation_config.json`, `model.safetensors`), or `adapter/` (the PEFT adapter) with
 `model.lora.enabled` (not run here), and `trainer_state.pt`, a `torch.save` dict with `step`,
 `optimizer`, `scheduler`, `scaler`, `value_head`, `mtp` and `rng`. The loop adds `loop_state.pt`
@@ -299,7 +492,7 @@ Rewards and episodes (`train` rows of the RL loop, `src/monorl/orchestrator/metr
 | Metric | Meaning |
 |---|---|
 | `reward/mean`, `reward/std` | mean and population standard deviation of episode rewards |
-| `reward/<name>` | mean of one reward part over all episodes: a reward function's name (`reward/exact_match`), `env`, `overlong_penalty` |
+| `reward/<name>` | mean of one reward part over all episodes: a reward function's name (`reward/exact_match`), `env`, `overlong_penalty`; what a function reports besides its score is `reward/<name>/<entry>` (`reward/llm_judge/failed`, [REWARDS.md](REWARDS.md)) |
 | `reward/success_rate` | share of episodes with `reward >= logging.success_threshold` |
 | `reward/pass_at_k` | share of prompt groups with at least one successful episode; only when a group has 2 or more episodes |
 | `episode/turns_mean`, `episode/turns_max` | policy turns per episode |
@@ -325,6 +518,7 @@ Rollouts and batch:
 | `tokens/sequences`, `tokens/truncated` | rows of the batch; rows cut at `trainer.max_seq_len` |
 | `tokens/truncated_turns` | SFT: trained turns that lost tokens to the cut |
 | `tokens/old_logprobs_recomputed` | 1 when the trainer recomputed the old log-probs instead of using the engine's |
+| `tokens/sequences_skipped` | RL, reference trainer: rows of the batch the update ran no pass for, because their advantage is 0 at every response token and they change nothing about it; see [ALGORITHMS.md](ALGORITHMS.md#options) |
 | `advantage/mean`, `advantage/abs_mean` | mean and mean magnitude of the advantage over response tokens |
 | `advantage/turn_spread`, `advantage/turn_spread_max`, `advantage/first_turn_abs`, `advantage/last_turn_abs` | per-turn credit, see [CREDIT_ASSIGNMENT.md](CREDIT_ASSIGNMENT.md) |
 
@@ -334,10 +528,10 @@ Loss and optimisation (`src/monorl/algorithms/losses.py`, `src/monorl/trainer/re
 |---|---|
 | `loss/policy` | clipped policy-gradient surrogate |
 | `loss/kl` | KL penalty to the reference policy before `algorithm.kl_coef`; 0.0 when `kl_coef` is 0 |
-| `loss/entropy` | mean token entropy of the policy, before `algorithm.entropy_coef` |
+| `loss/entropy` | mean token entropy of the policy, before `algorithm.entropy_coef`; over the rows the update computed, absent when it computed none (`tokens/sequences_skipped`) |
 | `loss/total` | the optimised loss: policy + `kl_coef` * kl - `entropy_coef` * entropy, plus the value and MTP terms when present |
 | `policy/clipfrac` | share of response tokens where the clipped surrogate is the active one |
-| `policy/approx_kl`, `policy/ratio_mean` | mean of `(ratio - 1) - log ratio` (k3 estimate of KL(old, new)); mean ratio new/old |
+| `policy/approx_kl`, `policy/ratio_mean` | mean of `(ratio - 1) - log ratio` (k3 estimate of KL(old, new)); mean ratio new/old; both over the rows the update computed, absent when it computed none |
 | `grad_norm` | gradient norm of the policy (and value head) before clipping to `trainer.max_grad_norm` |
 | `lr` | learning rate after the scheduler step |
 | `loss/sft`, `sft/ppl` | SFT loss (label smoothing included); `exp` of the unsmoothed token-mean NLL |
@@ -396,27 +590,100 @@ with the current weights and reports `eval/loss`, `eval/nll_token`, `eval/ppl` a
 
 ## Logging sinks
 
-`metrics.jsonl` is always written. `src/monorl/orchestrator/sinks.py` adds two optional sinks to
-the native loops; each receives the numeric metrics of every `metrics.jsonl` row, at the same step.
+`metrics.jsonl` is always written. `src/monorl/orchestrator/sinks.py` adds two optional sinks. Each
+gets every row of `metrics.jsonl` when it is written: every value the row records as a number,
+under the name it has there, at the row's step. Text and null values stay in `metrics.jsonl` only.
 
 | Key (default) | Package | Writes |
 |---|---|---|
-| `logging.wandb_project` (unset) | `wandb` | a W&B run in that project, named `run_name`, with the full config (`dir` is the run directory, `resume="allow"`); metrics under their names |
-| `logging.tensorboard` (false) | `tensorboard` | event files in `<run_dir>/tensorboard`; metrics under their names |
+| `logging.wandb_project` (unset) | `wandb` | a W&B run in that project, named `run_name`, with the full config; its files are in `<run_dir>/wandb/` (`WANDB_DIR` is not used) |
+| `logging.tensorboard` (false) | `tensorboard` | event files in `<run_dir>/tensorboard/`, one per start of the run |
 
-Neither package is a dependency of monorl. When the package is missing or initialisation fails the
-sink is skipped and the run continues, as in this run without the package (logging to an
-installed W&B or TensorBoard was not run here):
+Both packages are the extra `sinks` (`pip install "monorl[sinks]"`) and are pinned in
+`requirements.lock`, so `make install` has them; the CPU image does not (build it with
+`--build-arg MONORL_EXTRAS=trl,distributed,rewards,openenv,hermes,sinks`). This section was run
+with `tensorboard` 2.21.0 and `wandb` 0.31.0, the versions of the lock, W&B offline
+(`WANDB_MODE=offline`); nothing was sent to a W&B server, so what the W&B site shows was not seen.
+
+```bash
+WANDB_MODE=offline .venv/bin/monorl train \
+  --config configs/recipes/grpo_gsm8k_smollm_cpu.yaml \
+  --set trainer.max_steps=3 --set data.limit=4 --set rollout.max_new_tokens=16 \
+  --set data.eval_uri=hf://openai/gsm8k --set trainer.eval_every=2 \
+  --set trainer.save_every=2 --set logging.tensorboard=true \
+  --set logging.wandb_project=monorl-docs --run-dir /tmp/monorl-docs-runs/sinks
+```
+
+`run.log` says where each sink writes:
 
 ```text
-... logging.tensorboard is set but `tensorboard` is not installed; skipping
+... wandb: new run etztty9w in project monorl-docs, files in .../sinks/wandb/<run>/files
+... tensorboard: events in .../sinks/tensorboard
 ```
+
+where `<run>` is `offline-run-20261117_021215-etztty9w`. The four rows of that run (steps 1 to 3
+and the evaluation of step 2) hold 135 values. The event file, read with TensorBoard's
+`EventAccumulator`, and the W&B run, read from its `run-etztty9w.wandb` file, each hold those 135
+values at the same steps under the same names, and the W&B run holds the config of `config.yaml`.
+
+- **Who logs.** The RL loop, the SFT loop, `trainer.backend: trl` and every stage of a pipeline.
+  A `train`, `rejection_sample` or `eval` stage has a W&B run of its own, named like its stage
+  directory (`01-rejection_sample`), and a `tensorboard/` in that directory. Run here: a pipeline
+  of an SFT, a rejection sampling and an evaluation stage (50, 15 and 13 values, all in both sinks)
+  and `configs/recipes/trl_grpo_cpu.yaml` with an evaluation (see the next point). The backends
+  `verl` and `nemo_rl` log through their framework, see the table below.
+- **One W&B row per step.** The train and the evaluation metrics of a step are one row, which W&B
+  writes when the next step is logged or the run ends. A name that several rows of one step carry
+  (TRL repeats `train/epoch` in its evaluation and closing rows) is one value in W&B, the last,
+  and one point per row in TensorBoard: of the 122 values of the TRL run's 6 rows, TensorBoard had
+  122 and W&B the 119 with distinct name and step.
+- **Non-finite values.** NaN and the infinities are stored as such in both sinks.
+- **How a run ends.** The sinks are closed when a run succeeds, fails or is cancelled, and both
+  held every logged row in each of these cases. The W&B run ends with exit code 0 (finished) after
+  a run that succeeded or that stopped after its step on a signal, and with exit code 1 (failed)
+  after a run that failed or that a second signal interrupted. With `trainer.backend: trl` this was
+  run for a failed run: exit code 1 and every logged step in both sinks. After `SIGKILL` at step 12
+  the event file had all 12 steps and the W&B file the first 10, and its run has no exit code.
+- **Resume.** The first row a start of the run logs marks its step, and TensorBoard hides what
+  earlier starts wrote to the directory for that step and later ones. The run above, resumed with
+  `--resume` and `trainer.max_steps=4`, starts at the checkpoint of step 2 and logs step 3 again:
+  `tensorboard/` then has two event files that show steps 1 to 4 once each (188 points), step 3
+  with the values of the second start, the ones `metrics.jsonl` keeps
+  ([the record files after a resume](#the-record-files-after-a-resume)). For the same reason a run
+  started again in its directory without `--resume` shows the new run only. In W&B every start is
+  a new run of the same name: `run.log` has a second `wandb: new run 4dzz4bhc ...` line, the
+  first run keeps steps 1 to 3 and the second has steps 3 and 4. With wandb's `WANDB_RUN_ID` set,
+  both starts use that id (two `offline-run-*` directories with one id); whether the server joins
+  them was not run.
+- **A sink that cannot write.** A missing package, an initialisation that fails and a failure
+  while logging each write one line to `run.log`; the sink is skipped from there on and the run
+  continues. The first four lines are from runs, the last from the tests, where a writer fails:
+
+```text
+... logging.wandb_project is set but `wandb` is not installed; skipping wandb
+... logging.tensorboard is set but `tensorboard` is not installed; skipping
+... wandb init failed (ValidationError: 1 validation error for ...); skipping wandb
+... tensorboard init failed (FileExistsError: [Errno 17] File exists: ...); skipping
+... tensorboard logging failed (OSError: [Errno 28] No space left on device); skipping
+    tensorboard for the rest of the run
+```
+
+`trainer.backend: verl` and `nemo_rl` do not use these sinks. monorl turns the two keys into
+settings of the framework's own loggers, which write under the framework's metric names (from the
+code, not run here: neither framework is installed):
+
+| Backend | `logging.wandb_project` | `logging.tensorboard` |
+|---|---|---|
+| `verl` | adds `wandb` to `trainer.logger`; the run is named `run_name` and its project (`trainer.project_name`) is the value of the key | adds `tensorboard` to `trainer.logger`; monorl passes no directory |
+| `nemo_rl` | `logger.wandb_enabled`, with the project and `run_name` in `logger.wandb` | `logger.tensorboard_enabled`; `logger.log_dir` is `<run_dir>/nemo_rl/logs` |
 
 ## Pipeline backends and pipelines
 
 With `trainer.backend: trl | verl | nemo_rl` the framework owns the loop and writes through the
 same `RunReporter`, so `config.yaml`, `status.json`, `run.log` and its metrics land in the same
-run directory. Steps, metric names, checkpoints, cancelling and `--resume` (which `run()` does
-not forward to pipeline backends) are backend-specific: see [BACKENDS.md](BACKENDS.md).
+run directory. Steps, metric names, checkpoints and cancelling are backend-specific: see
+[BACKENDS.md](BACKENDS.md). `--resume` reaches the backend, which continues from its framework's
+newest checkpoint after taking the record files back to that step, or refuses; a run without it
+never continues an earlier one: see [Resume](BACKENDS.md#resume-with-a-pipeline-backend).
 
 Multi-stage pipelines write one such run directory per stage: see [PIPELINES.md](PIPELINES.md).

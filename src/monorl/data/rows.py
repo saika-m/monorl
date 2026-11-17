@@ -38,7 +38,7 @@ from monorl.core.errors import DataError
 from monorl.core.registry import Registry
 from monorl.core.registry import registry as default_registry
 from monorl.data import formats
-from monorl.data.uri import ParsedURI, filesystem_for
+from monorl.data.uri import HTTP_SCHEMES, ParsedURI, filesystem_for
 
 SHUFFLE_BUFFER = 1000
 
@@ -110,18 +110,37 @@ class RowSource(abc.ABC):
 # -- files ------------------------------------------------------------------------------------
 
 
+class DatasetNotFound(FileNotFoundError, DataError):
+    """The path of a dataset does not exist. A ``FileNotFoundError`` for the callers that answer
+    "not found" (the CLI, the server's 404) and a ``DataError`` for a run, whose config names it."""
+
+
 def expand_files(fs, parsed: ParsedURI) -> list[str]:
-    """Resolve a file / directory / glob into concrete data-file paths (sorted)."""
+    """Resolve a file / directory / glob into concrete data-file paths (sorted). A path that
+    exists is that file or directory, whatever characters it holds (``runs[v1]/train.jsonl``);
+    only one that does not is read as a glob."""
     path = parsed.path
-    if any(ch in path for ch in "*?["):
+    if parsed.scheme in HTTP_SCHEMES:  # one file: a web server has no listing to expand
+        if formats.format_of(path) is None:
+            raise DataError(
+                f"unsupported file type: {parsed.raw} (an http(s) dataset is one file, expected "
+                f"{sorted(formats.FORMAT_EXTENSIONS)})"
+            )
+        if not fs.exists(path):
+            raise FileNotFoundError(
+                f"dataset path not found: {parsed.raw} (the server did not answer or does not serve it)"
+            )
+        return [path]
+    exists = fs.exists(path)
+    if not exists and any(ch in path for ch in "*?["):
         fs.invalidate_cache()
         matches = [p for p in fs.glob(path) if fs.isfile(p)]
         files = formats.select_files(matches)
         if not files:
             raise DataError(f"glob {parsed.raw!r} matched no supported data files")
         return files
-    if not fs.exists(path):
-        raise FileNotFoundError(f"dataset path not found: {parsed.raw}")
+    if not exists:
+        raise DatasetNotFound(f"dataset path not found: {parsed.raw}")
     if fs.isdir(path):
         fs.invalidate_cache(path)
         files = formats.select_files(fs.find(path))
@@ -239,7 +258,7 @@ class HubRows(RowSource):
             self.dataset = load_dataset(
                 parsed.repo_id, name=config_name, split=split, streaming=streaming, **kwargs
             )
-        except (ValueError, FileNotFoundError) as e:
+        except (ValueError, OSError) as e:  # no such repo, split or config; the Hub cannot be reached
             raise DataError(
                 f"cannot load {parsed.raw!r} (split={split!r}, config={config_name!r}): {e}"
             ) from e

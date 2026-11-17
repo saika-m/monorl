@@ -168,6 +168,22 @@ def test_resume_continues_from_latest_checkpoint(make_config: Any, tmp_path: Pat
     assert _samples_by_step(run_dir, (3, 4)) == scratch_samples
 
 
+def test_run_in_the_directory_of_a_killed_run_keeps_its_first_rows(make_config: Any) -> None:
+    """Without ``--resume`` a run appends to the files that are there. A run that was killed in the
+    middle of a write left a line without its end: the first row of the next run must not join it."""
+    run_dir = Path(run(make_config(trainer={"max_steps": 2})).run_dir)
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write('{"step": 3, "time": 1.0, "pha')
+    with open(run_dir / "trajectories.jsonl", "a") as f:
+        f.write('{"step": 3, "phase": "train", "samp')
+    episodes = len(list(iter_trajectories(run_dir)))
+
+    again = run(make_config(trainer={"max_steps": 2}))
+    assert again.state == "succeeded" and Path(again.run_dir) == run_dir
+    assert [r["step"] for r in _rows(run_dir)] == [1, 2, 1, 2]
+    assert len(list(iter_trajectories(run_dir))) == 2 * episodes
+
+
 def test_resume_without_checkpoint_starts_fresh(make_config: Any) -> None:
     result = run(make_config(trainer={"max_steps": 1}), resume=True)
     assert result.state == "succeeded" and result.final_step == 1
@@ -357,8 +373,10 @@ def test_pipeline_backend_dispatch(make_config: Any, monkeypatch: pytest.MonkeyP
         def __init__(self, config: Any) -> None:
             self.config = config
 
-        def run(self, config: Any, run_dir: Path, *, reporter: Any) -> RunResult:
-            calls.append((config, run_dir, reporter))
+        def run(
+            self, config: Any, run_dir: Path, *, reporter: Any, resume: bool = False, cancel: Any = None
+        ) -> RunResult:
+            calls.append((config, run_dir, reporter, cancel, resume))
             reporter.log_metrics(1, {"reward/mean": 0.5})
             return RunResult(state="succeeded", final_step=1, run_dir=str(run_dir))
 
@@ -367,15 +385,20 @@ def test_pipeline_backend_dispatch(make_config: Any, monkeypatch: pytest.MonkeyP
     try:
         cfg = make_config(trainer={"backend": "trl"})
         assert cfg.is_pipeline_backend
-        result = run(cfg)
+        cancel = threading.Event()
+        result = run(cfg, cancel=cancel)
+        run(cfg, resume=True)
     finally:
         if previous is None:
             registry._items["pipeline_backend"].pop("trl", None)
         else:
             registry.register("pipeline_backend", "trl", previous, overwrite=True)
     assert result.state == "succeeded" and result.final_step == 1
-    config, run_dir, reporter = calls[0]
+    config, run_dir, reporter, *_ = calls[0]
     assert config.trainer.backend == "trl" and run_dir == reporter.run_dir
+    assert [resume for *_, resume in calls] == [False, True]  # --resume reaches the backend
+    # and so does the event of the first signal: the caller's, or the one run() made
+    assert calls[0][3] is cancel and isinstance(calls[1][3], threading.Event)
     assert read_status(run_dir)["state"] == "succeeded"
     assert (run_dir / "config.yaml").exists()
     assert fakes.TRAINERS == []  # the component loop never ran

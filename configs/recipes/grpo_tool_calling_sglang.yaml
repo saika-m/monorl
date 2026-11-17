@@ -53,7 +53,7 @@ env:
     tools: [calculator, python_exec]
     invalid_call_penalty: 0.1
 cluster:
-  mode: local
+  mode: ray
   gpus_per_node: 4
   placement: disaggregated
   rollout_gpus: 2

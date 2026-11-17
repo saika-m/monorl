@@ -8,14 +8,18 @@ user-facing. Backend-specific knobs go in the ``extra`` dicts, never as top-leve
 
 from __future__ import annotations
 
+import difflib
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args, get_origin
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from monorl.config.loader import mask_secrets
 from monorl.core.errors import ConfigError
+from monorl.core.home import DEFAULT_RUN_ROOT
+from monorl.core.params import unknown_params
 
 #: A dotted module path, as an import statement takes it.
 _MODULE_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
@@ -23,6 +27,68 @@ _MODULE_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+def _models_in(annotation: Any) -> list[type[BaseModel]]:
+    """The model classes an annotation names, at any depth (``X``, ``X | None``, ``list[X | Y]``)."""
+    if isinstance(annotation, type) and get_origin(annotation) is None and issubclass(annotation, BaseModel):
+        return [annotation]
+    return [model for arg in get_args(annotation) for model in _models_in(arg)]
+
+
+def _model_at(root: type[BaseModel], loc: tuple[int | str, ...]) -> type[BaseModel] | None:
+    """The model class the mapping at ``loc`` of a ``root`` document is validated as, or ``None``
+    when that is not one class. ``loc`` is as pydantic reports it: keys, list indices, and after
+    a list of tagged models the tag (``stages.0.train``)."""
+    candidates = [root]
+    for part in loc:
+        if isinstance(part, int):
+            continue
+        owners = [c for c in candidates if part in c.model_fields]
+        if owners:
+            candidates = [m for c in owners for m in _models_in(c.model_fields[part].annotation)]
+        else:
+            candidates = [
+                c
+                for c in candidates
+                if any(
+                    get_origin(f.annotation) is Literal and get_args(f.annotation) == (part,)
+                    for f in c.model_fields.values()
+                )
+            ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def validation_message(error: ValidationError, root: type[BaseModel]) -> str:
+    """What is wrong with a document validated as ``root``, one line per problem:
+    ``<dotted key>: <problem>``. An unknown key comes with the key it resembles or, when it
+    resembles none, the keys its mapping takes; a value of the wrong type or outside the allowed
+    ones comes with the value."""
+    lines: list[str] = []
+    for err in error.errors(include_url=False):
+        loc, kind, problem = err["loc"], err["type"], err["msg"]
+        if kind == "extra_forbidden":
+            problem = "unknown key"
+            model = _model_at(root, loc[:-1])
+            if model is not None:
+                close = difflib.get_close_matches(str(loc[-1]), list(model.model_fields), n=1)
+                problem += (
+                    f"; did you mean {close[0]}?"
+                    if close
+                    else f"; a {model.__name__} takes: {', '.join(model.model_fields)}"
+                )
+        elif kind == "value_error":
+            problem = problem.removeprefix("Value error, ")
+        elif (
+            kind != "missing"
+            and isinstance(err["input"], (str, int, float))
+            and len(repr(err["input"])) <= 80
+        ):
+            problem += f" (got {err['input']!r})"
+        where = ".".join(str(part) for part in loc)
+        lines.append(f"  {where}: {problem}" if where else f"  {problem}")
+    count = "1 problem" if len(lines) == 1 else f"{len(lines)} problems"
+    return f"invalid {root.__name__}, {count}:\n" + "\n".join(lines)
 
 
 class LoraConfig(_Model):
@@ -414,10 +480,36 @@ class TrainerConfig(_Model):
     )
 
 
+def _check_params(model: type[BaseModel], namespace: str, name: str, params: dict[str, Any]) -> None:
+    """Refuse the keys of a free-form ``params`` mapping that the built-in type ``name`` does not
+    read (:mod:`monorl.core.params`), each as a problem of its own at ``params.<key>``. A type
+    that is not built in takes what it likes."""
+    problems = unknown_params(namespace, name, params)
+    if problems:
+        raise ValidationError.from_exception_data(
+            model.__name__,
+            [
+                # the key stands in for the input: the value may be a secret
+                {
+                    "type": "value_error",
+                    "loc": ("params", *loc),
+                    "input": loc[-1],
+                    "ctx": {"error": ValueError(problem)},
+                }
+                for loc, problem in problems
+            ],
+        )
+
+
 class RewardSpec(_Model):
     type: str = Field(..., description="Reward function name (see /api/system for the list).")
     weight: float = Field(1.0, description="Multiplier when combining several rewards.")
     params: dict[str, Any] = Field(default_factory=dict, description="Parameters of the reward function.")
+
+    @model_validator(mode="after")
+    def _check_params(self) -> RewardSpec:
+        _check_params(RewardSpec, "reward", self.type, self.params)
+        return self
 
 
 class EnvConfig(_Model):
@@ -440,6 +532,11 @@ class EnvConfig(_Model):
         ),
     )
     params: dict[str, Any] = Field(default_factory=dict, description="Environment-specific parameters.")
+
+    @model_validator(mode="after")
+    def _check_params(self) -> EnvConfig:
+        _check_params(EnvConfig, "env", self.type, self.params)
+        return self
 
 
 class ClusterConfig(_Model):
@@ -464,7 +561,10 @@ class ClusterConfig(_Model):
 
 
 class LoggingConfig(_Model):
-    run_root: str = Field("~/.monorl/runs", description="Directory that holds run directories.")
+    run_root: str = Field(
+        DEFAULT_RUN_ROOT,
+        description="Directory that holds run directories; the default is `runs` under `$MONORL_HOME`.",
+    )
     log_every: int = Field(
         1, ge=1, description="Write metrics every this many steps (the last step is always written)."
     )
@@ -655,8 +755,8 @@ class RunConfig(_Model):
     def from_dict(cls, data: dict[str, Any]) -> RunConfig:
         try:
             return cls.model_validate(data)
-        except Exception as e:  # pydantic.ValidationError
-            raise ConfigError(str(e)) from e
+        except ValidationError as e:
+            raise ConfigError(validation_message(e, cls)) from e
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> RunConfig:
@@ -668,7 +768,7 @@ class RunConfig(_Model):
         return self.model_dump(mode="json")
 
     def to_yaml(self, path: str | Path | None = None) -> str:
-        text = yaml.safe_dump(self.to_dict(), sort_keys=False)
+        text = yaml.safe_dump(mask_secrets(self.to_dict()), sort_keys=False)
         if path is not None:
             Path(path).write_text(text)
         return text

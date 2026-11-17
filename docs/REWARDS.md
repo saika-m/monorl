@@ -18,8 +18,10 @@ rewards:
 
 `monorl.rewards.build_reward` turns the list into one `CompositeReward` whose score is the sum of
 `weight * score` over the entries; weights are not normalised. Each entry's unweighted score is
-kept in a breakdown under `params.name`, else the `type` (a repeated key gets `#2`, `#3`, ...). An
-unknown `type` passes config validation and raises `RegistryError` when the loop is built.
+kept in a breakdown under `params.name`, else the `type` (a repeated key gets `#2`, `#3`, ...).
+What a reward function reports besides its score is kept next to it under `<key>/<entry>`; of the
+built-ins `llm_judge` does, with `failed`. An unknown `type` passes config validation and raises
+`RegistryError` when the loop is built.
 
 A reward function receives whole `Trajectory` objects. Every built-in accepts `params.name`. All
 except `reward_model` and `composite` accept `scope`: `last` (default) scores the text of the
@@ -28,6 +30,15 @@ environment messages such as tool results are in neither. `reward_model` always 
 messages plus the final turn. The reference is `sample.reference` (see [DATA.md](DATA.md)), or
 with `reference_key: k` (`exact_match`, `math_verify`, `code_exec`, `llm_judge`) `reference[k]` of
 a dict reference holding `k`, else `sample.metadata[k]` when present, else the whole reference.
+
+A built-in reads the parameters of its table below and refuses any other, so that a misspelt key
+cannot change what a run trains on without a word. The config is refused when it is validated,
+before a model is loaded: the message names the key (`rewards.0.params.extrct`), says
+`unknown key`, the key it resembles if there is one (`did you mean extract?`) and the keys the
+reward takes. The members of a `composite` are checked the same way. A value a built-in cannot
+run with (an `extract` that does not exist, a missing `base_url`) is a `ConfigError` when the
+reward is built. A reward function of your own ([below](#writing-a-reward-function)) takes the
+`params` it likes.
 
 `rewards: []` is rejected at validation with `env.type: single_turn` and valid otherwise: the
 environment then supplies the whole reward. Per-turn rewards returned by an environment
@@ -67,6 +78,7 @@ acceptable answers. Two numbers (after removing `,`, `$`, a trailing `%`) are co
 | `extract` | `last_number` | `last_number`, `boxed` (last `\boxed{}`), `after_hash`, `none` |
 | `normalize` | `[whitespace, case]` | For string comparison: collapse whitespace, lower-case |
 | `numeric_tolerance` | `1e-6` | Absolute tolerance of the numeric comparison |
+| `scope`, `reference_key`, `name` | `last`, unset, `exact_match` | See the section above |
 
 ```yaml
 rewards:
@@ -89,6 +101,7 @@ Returns 1.0 when the response's final answer is mathematically equivalent to the
 | --- | --- | --- |
 | `timeout_s` | `5` | Parse/verify timeout, applied on the main thread only (`signal.alarm`) |
 | `float_rounding`, `numeric_precision`, `strict` | `6`, `15`, `True` | To `math_verify.verify` |
+| `scope`, `reference_key`, `name` | `last`, unset, `math_verify` | See the section above |
 
 ```yaml
 rewards:
@@ -107,9 +120,11 @@ Regex check of the response: 1.0 or 0.0, or a fraction in [0, 1] with `require_a
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `patterns` | required | List of regexes; one string, or the key `pattern`, also works |
+| `patterns` | required | List of regexes; one string also works |
+| `pattern` | unset | One regex, read when `patterns` is unset |
 | `require_all` | `True` | `True`: 1.0 only if every pattern matches. `False`: fraction matched |
 | `flags`, `fullmatch` | `[DOTALL]`, `False` | `re` flag names; `re.fullmatch`, not `re.search` |
+| `scope`, `name` | `last`, `format` | See the section above |
 
 ```yaml
 rewards:
@@ -132,6 +147,7 @@ Returns `base` when the response length is inside `[min_tokens, max_tokens]` and
 | `min_tokens`, `max_tokens` | `0`, unset | Band in `unit`; no upper bound when unset |
 | `penalty_per_token`, `base`, `min_reward` | `0.01`, `1.0`, `0.0` | See the formula above |
 | `unit` | `tokens` | `tokens` (completion token ids), `chars`, or `words` (whitespace split) |
+| `scope`, `name` | `last`, `length` | See the section above |
 
 ```yaml
 rewards:
@@ -158,6 +174,7 @@ accepted by `normalize_tests` in `src/monorl/rewards/code_exec.py`.
 | `timeout_s`, `memory_mb` | `5.0`, `512` | Per test case: wall-clock limit, memory cap (`0`: off) |
 | `language`, `python` | `python`, current interpreter | Fence tag; interpreter used |
 | `mode`, `max_workers` | `fraction`, `min(8, cpu_count)` | `fraction` or `all`; thread count |
+| `scope`, `reference_key`, `name` | `last`, unset, `code_exec` | See the section above |
 
 ```yaml
 rewards:
@@ -176,21 +193,75 @@ print(r.score, r.info["cases"])  # 0.5 ['passed', 'error']
 
 Asks an OpenAI-compatible chat-completions endpoint for a grade and parses the last
 `<score>N</score>` of the reply, clamped to `[0, max_score]`. The score is `N / max_score`, or `N`
-with `normalize: false`. Not run here against an endpoint; the entry below was validated only.
+with `normalize: false`. A request that fails for a passing reason is sent again; a judgment that
+fails for good scores 0.0 and is reported, see [Operational behaviour](#operational-behaviour).
+Run here against `httpx.MockTransport` and a local stand-in endpoint, not against a judge model;
+the entry below was validated by building the reward from it.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `base_url`, `model` | required | Endpoint root such as `http://host:8000/v1`; judge model name |
-| `rubric` | built-in | Template: `{prompt}`, `{response}`, `{reference}`, `{max_score}` |
+| `rubric` | built-in | `str.format` template, see below |
 | `api_key_env`, `system_prompt` | `OPENAI_API_KEY`, unset | Bearer token variable; system message |
-| `max_score`, `normalize` | `10`, `True` | Scale of `N`; whether to divide by it |
+| `max_score`, `normalize` | `10`, `True` | Scale of `N`, above 0; whether to divide by it |
 | `temperature`, `max_tokens`, `extra_body` | `0.0`, `512`, `{}` | Request fields; extra fields |
-| `timeout_s`, `max_workers`, `on_error` | `60`, `8`, `zero` | Seconds; threads; `zero` or `raise` |
+| `timeout_s`, `max_workers` | `60`, `8` | `httpx` timeout of a request (s); requests at a time |
+| `max_attempts` | `4` | Requests per judgment at most; `1` turns retrying off |
+| `retry_backoff_s` | `1.0` | Longest wait before the first retry, in seconds; doubles per retry |
+| `retry_max_wait_s` | `60` | Seconds a judgment may wait between its attempts in total |
+| `on_error` | `zero` | A judgment that failed for good: `zero` (score 0.0) or `raise` |
+| `scope`, `reference_key`, `name` | `last`, unset, `llm_judge` | See the section above |
+
+The rubric may use `{prompt}`, `{response}`, `{reference}` and `{max_score}` and has to ask for
+the `<score>N</score>` line; a literal brace in it is written `{{` or `}}`. A rubric that does not
+format, a `max_score` of 0 and a `max_attempts` below 1 raise `ConfigError` when the reward is
+built.
 
 ```yaml
 rewards:
   - type: llm_judge
     params: {base_url: "http://127.0.0.1:8000/v1", model: judge, api_key_env: JUDGE_KEY}
+```
+
+The factory takes two keyword arguments for tests: `client`, an `httpx.Client` to send through,
+and `wait(stop, seconds)`, called in place of each wait between attempts. Below, an endpoint that
+is busy once and then grades, one that stays down, and one whose reply has no score:
+
+```python
+import httpx
+
+def judge(*replies, **params):  # replies of the endpoint, the last one repeated
+    left = list(replies)
+    answer = lambda request: left.pop(0) if left[1:] else left[0]
+    client = httpx.Client(transport=httpx.MockTransport(answer))
+    params = {"base_url": "http://judge.test/v1", "model": "judge", **params}
+    wait = lambda stop, seconds: print("wait", seconds)
+    return registry.get("reward", "llm_judge")(params, client=client, wait=wait)
+
+def reply(text):
+    return httpx.Response(200, json={"choices": [{"message": {"content": text}}]})
+
+seven = traj("It is 7.", reference="7")
+busy = httpx.Response(429, headers={"Retry-After": "2"})
+r = judge(busy, reply("Right. <score>8</score>"))([seven])[0]
+# wait 2.0
+print(r.score, r.info)
+# 0.8 {'raw_score': 8.0, 'judge_output': 'Right. <score>8</score>', 'attempts': 2}
+
+r = judge(httpx.Response(503), max_attempts=3, retry_backoff_s=0)([seven])[0]
+# wait 0.0
+# wait 0.0
+# on stderr: reward llm_judge: 1 of 1 judgments failed and scored 0 (1x HTTPStatusError:
+#   503 Service Unavailable)
+print(r.score, r.info)
+# 0.0 {'error': 'HTTPStatusError: 503 Service Unavailable', 'attempts': 3}
+
+fn = judge(reply("Right."), reply("Right. <score>8</score>"), max_workers=1)
+for r in fn([seven, seven]):
+    print(r.score, r.breakdown, r.info.get("error"))
+# on stderr: reward llm_judge: 1 of 2 judgments failed and scored 0 (1x no_score)
+# 0.0 {'llm_judge': 0.0, 'failed': 1.0} no_score
+# 0.8 {'llm_judge': 0.8, 'failed': 0.0} None
 ```
 
 ### `reward_model`
@@ -205,6 +276,7 @@ checkpoint was loaded); the entry below was validated only.
 | `device`, `dtype` | `cpu`, `float32` | Torch device; `float32`, `bfloat16` or `float16` |
 | `batch_size`, `max_length` | `8`, `4096` | Texts per forward pass; truncation length in tokens |
 | `label_index`, `normalize` | `0`, `none` | Logit used as the score; `none` or `sigmoid` |
+| `name` | `reward_model` | See the section above |
 
 ```yaml
 rewards:
@@ -216,6 +288,11 @@ rewards:
 A weighted sum of member rewards as one entry: `params.rewards` (required) is a list shaped like
 top-level `rewards`. As a top-level entry its total is in the breakdown under its `name` and each
 member's score under `<name>/<member key>` (metric `reward/<name>/<member key>`).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `rewards` | required | Member entries, each with `type`, `weight` and `params` |
+| `name` | `composite` | See the section above |
 
 ```yaml
 rewards:
@@ -242,8 +319,58 @@ boundary: same user, filesystem and network access, no container, no CPU or proc
 
 `llm_judge` sends one `POST {base_url}/chat/completions` per trajectory, up to `max_workers` at a
 time. The only environment variable read is the one named by `api_key_env`, at construction; if
-unset, no `Authorization` header is sent. There are no retries. With `on_error: zero` an HTTP error,
-a malformed body or a reply without a score tag scores 0.0 with `info["error"]`; `raise` propagates.
+unset, no `Authorization` header is sent.
+
+A request is sent again after a connection error, a timeout or one of the statuses 408, 429, 500,
+502, 503 and 504, until the judgment has made `max_attempts` requests. The wait before retry `k`
+(from 1) is drawn between half of and all of `retry_backoff_s * 2 ** (k - 1)` seconds, so that the
+workers of a call do not return together, or is what the response's `Retry-After` header asks for
+(seconds, or a date) when that is longer. A wait that would take the waits of the judgment past
+`retry_max_wait_s` is not begun: the judgment ends with the error it has. A judgment whose
+requests each end within `timeout_s` therefore takes at most
+`max_attempts * timeout_s + retry_max_wait_s` seconds. Every other failure is final at once:
+another status (400, 401, 404, ...), a body that is not a chat completion, a reply without a
+score tag or without text.
+
+A judgment that failed for good scores 0.0 with `on_error: zero`; with `raise` the error
+propagates and ends the run. The 0.0 is the same number as a grade of 0 in `reward/mean` and
+`reward/<name>`, and it is trained on. What tells them apart:
+
+- `reward/<name>/failed` in `metrics.jsonl` (`eval/reward/<name>/failed` for an evaluation): the
+  share of the step's judgments that failed, 0.0 when none did. Every judgment has `failed`, 1.0
+  or 0.0, in its breakdown next to its score, so a row of `trajectories.jsonl` has it in
+  `reward_breakdown` as `<name>/failed`.
+- One warning per call of the reward, which the loop makes once with all trajectories of a step,
+  through Python's `logging` under `monorl.rewards.llm_judge`:
+  `reward <name>: N of M judgments failed and scored 0 (<count>x <error>, ...)`, followed by the
+  body of the first error response. During a run it is a line of `run.log`, with the time, and
+  the terminal shows that line (see [`run.log`](RUNS.md#runlog)); outside a run, as in the
+  snippet above, it goes to stderr and carries no time.
+- In `trajectories.jsonl`, `info.reward_info.<name>` of a row holds `error` (`no_score`, or the
+  exception's name and message, for a status `HTTPStatusError: 503 Service Unavailable`), `body`
+  (the first 300 characters of an error response), `judge_output` for a reply without a score,
+  and `attempts` when the judgment made more than one request, successful or not.
+- `time/reward` grows by the waits.
+
+Run here, one step of four episodes and an evaluation of four on a tiny random model against a
+local endpoint that always answers 503 with `Retry-After: 3`: the run succeeded with
+`reward/mean` 0.0, `reward/llm_judge/failed` and `eval/reward/llm_judge/failed` 1.0 and
+`time/reward` 9.11, the warning
+`reward llm_judge: 4 of 4 judgments failed and scored 0 (4x HTTPStatusError: 503 Service
+Unavailable)` with the response body after it was logged once for the step and once for the
+evaluation, and the rows had `attempts: 4` and `llm_judge/failed` 1.0. (That run read the
+warning on stderr; that it is a line of `run.log` was run with the CPU recipe against a port
+nobody listens on, see [`run.log`](RUNS.md#runlog).) Against an endpoint that answered every
+fourth request with 429, all rewards were the judge's 0.6, `reward/llm_judge/failed` was 0.0 and
+nothing was logged.
+
+A judgment that waits keeps its worker thread and nothing else; the other workers go on. When a
+call ends early (an error with `on_error: raise`, a `KeyboardInterrupt`), the waiting judgments
+give up at once. The first Ctrl-C or SIGTERM of a run ends it after the current step, and that
+step finishes its judgments, retries included; a second one stops at once. Run here against the
+endpoint above: a first SIGINT two seconds into the judgments of step 1 was followed by the rest
+of their nine seconds of waits and `cancelled after step 1`; a second one a second later gave
+`cancelled after step 0` within that second.
 
 `reward_model` loads tokenizer and model once, when the loop is built, in the loop's process. Each
 conversation is rendered with the tokenizer's chat template when it has one, else as
@@ -256,7 +383,9 @@ here with a reward that raises, the run ended `failed` at step 0 with the error 
 ## Metrics
 
 `reward/mean`, `reward/std`, `reward/<name>` per breakdown key (including `reward/env` and
-`reward/overlong_penalty`), `reward/success_rate`, `reward/pass_at_k`, `time/reward`,
+`reward/overlong_penalty`, and `reward/<name>/<entry>` for what a reward function reports besides
+its score, such as `reward/llm_judge/failed`), `reward/success_rate`, `reward/pass_at_k`,
+`time/reward`,
 `eval/reward_mean`, `eval/reward_std`, `eval/reward/<name>`: see [RUNS.md](RUNS.md#metrics).
 
 ## Pipeline backends
@@ -265,8 +394,11 @@ From the adapters' code, not run here. With `trainer.backend: trl` the composite
 TRL reward function (`src/monorl/adapters/trl/rewards.py`) that computes the total as above,
 including `env` and `overlong_penalty`. With `verl` (`src/monorl/adapters/verl/reward.py`) at
 least one entry is required: a generated `<run_dir>/monorl_reward.py` scores one response at a
-time, and the breakdown goes to verl's `reward_extra_info`. With `nemo_rl` (`env_bridge.py` of
-that adapter) the score is added to the final turn's reward. Under `verl` and `nemo_rl` a reward
+time, and the breakdown goes to verl's `reward_extra_info` as `reward/<name>`; verl 0.9.1 takes
+the names from the first response of a batch and reads each of them from every other response
+(`reward_loop.py`, `agent_loop.py`), so an entry has to be in every result or in none, as `failed`
+is. With `nemo_rl` (`env_bridge.py` of that adapter) the score is added to the final turn's reward
+and the breakdown is put into the episode's metadata. Under `verl` and `nemo_rl` a reward
 sees the decoded text of a response and no token ids, so `length` with `unit: tokens` (its
 default) is rejected at validation: use `chars` or `words`. See [BACKENDS.md](BACKENDS.md).
 
@@ -328,6 +460,33 @@ import my_rewards
 my_rewards.register(registry)
 print(registry.get("reward", "keyword")({"keyword": "seven"})([traj("Seven.")])[0])
 # RewardResult(score=1.0, breakdown={'keyword': 1.0}, info={})
+```
+
+A result's `breakdown` holds the score under the function's `name`. Every other entry in it is
+reported next to the score: under `<key>/<entry>` in the breakdown of the episode (the
+`reward_breakdown` of its row), where `<key>` is `params.name`, else the `type`, and as
+`reward/<key>/<entry>` in the metrics, the mean over all episodes of the step, in which an episode
+without the entry counts as 0. A name that a reward of the run already has gets `#2`. Two things
+follow: a function that keeps its score under another name than its `name` reports it twice, and
+under `verl` an entry has to be in every result or in none (see
+[Pipeline backends](#pipeline-backends)). Continuing the session:
+
+```python
+from monorl.rewards import CompositeReward
+
+class Tone:
+    name = "tone"
+
+    def __call__(self, trajs):
+        hedged = [float("maybe" in t.last_response_text.lower()) for t in trajs]
+        parts = [{"tone": 1 - h, "hedged": h} for h in hedged]
+        return [RewardResult(score=part["tone"], breakdown=part) for part in parts]
+
+fn = CompositeReward([("style", 0.5, Tone())])
+for r in fn([traj("Maybe 7?"), traj("It is 7.")]):
+    print(r.score, r.breakdown)
+# 0.0 {'style': 0.0, 'style/hedged': 1.0}
+# 0.5 {'style': 1.0, 'style/hedged': 0.0}
 ```
 
 A reward that belongs in monorl itself is added to `REWARD_NAMES` in

@@ -54,6 +54,9 @@ FAKE_HOME_FILES: dict[str, str] = {
         import argparse
         import json
         import os
+        import re
+        import signal
+        import subprocess
         import sys
         import time
 
@@ -85,15 +88,35 @@ FAKE_HOME_FILES: dict[str, str] = {
                     },
                     f,
                 )
+            if os.environ.get("FAKE_NEMO_RL_SLEEP") == "chatty":
+                # a framework that logs while it shuts down, more than the pipe to the backend holds
+                def shut_down(*_):
+                    for i in range(4000):
+                        print(f"shutting down {i:04d} " + "." * 100)
+                    print("shutdown complete", flush=True)
+                    sys.exit(0)
+
+                signal.signal(signal.SIGTERM, shut_down)
+            if os.environ.get("FAKE_NEMO_RL_SLEEP") == "stubborn":
+                # a framework that SIGTERM does not end, with a worker process (which inherits that)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+                with open(os.path.join(run_dir, "worker.pid"), "w") as f:
+                    f.write(str(worker.pid))
             if os.environ.get("FAKE_NEMO_RL_SLEEP"):
                 print("sleeping", flush=True)
                 while True:
                     time.sleep(0.1)
             logger = Logger(config["logger"])
-            for step in (1, 2):
+            # nemo_rl/algorithms/grpo.py setup(): the run continues after the newest step_<n> of the
+            # checkpoint directory (CheckpointManager.get_latest_checkpoint_path), whenever there is one
+            checkpoint_dir = config["checkpointing"]["checkpoint_dir"]
+            saved = [name for name in os.listdir(checkpoint_dir) if re.fullmatch(r"step_\\d+", name)] if os.path.isdir(checkpoint_dir) else []
+            total_steps = max((int(name.split("_")[1]) for name in saved), default=0)
+            for step in (total_steps + 1, total_steps + 2):
                 logger.log_metrics({"loss": 0.5 / step, "reward": 0.25 * step, "lr": 1e-6, "kl_penalty": 0.01}, step, prefix="train")
                 logger.log_metrics({"total_step_time": 3.0, "policy_training": 1.0}, step, prefix="timing/train")
-            ckpt = os.path.join(config["checkpointing"]["checkpoint_dir"], "step_2", "policy", "weights")
+            ckpt = os.path.join(checkpoint_dir, f"step_{total_steps + 2}", "policy", "weights")
             os.makedirs(ckpt, exist_ok=True)
             if os.environ.get("FAKE_NEMO_RL_FAIL"):
                 print("boom", flush=True)

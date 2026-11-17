@@ -14,7 +14,7 @@ from monorl.adapters.openenv.env import (
     observation_to_text,
     parse_json_action,
 )
-from monorl.core.errors import EnvironmentError_
+from monorl.core.errors import ConfigError, EnvironmentError_
 from monorl.core.interfaces import Environment
 from monorl.core.registry import Registry
 from monorl.core.types import Completion, Sample
@@ -52,12 +52,12 @@ def test_action_class_inference():
 
     assert InProcessBackend.resolve_action_class(ReverseEnv) is ReverseAction
     assert InProcessBackend.resolve_action_class(GuessEnv, "sample_envs.GuessAction") is GuessAction
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         InProcessBackend.resolve_action_class(ReverseEnv, "sample_envs.ReverseObservation")
 
 
 def test_backend_from_params_requires_target():
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         backend_from_params({})
 
 
@@ -146,7 +146,7 @@ def test_in_process_rejects_wrong_action_shape():
 
 
 def test_bad_action_mode():
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         make_openenv_env({"env_class": "sample_envs.GuessEnv", "action_mode": "yaml"}, max_turns=1)
 
 

@@ -6,12 +6,7 @@ orchestrator calls :func:`compute_advantages` on scalar rewards, or :func:`turn_
 :func:`gae` on per-turn tables (``algorithm.credit_assignment``, ``algorithm.name: ppo``).
 """
 
-from monorl.algorithms.advantages import (
-    apply_overlong_penalty,
-    compute_advantages,
-    discount_turn_rewards,
-    dynamic_sampling_mask,
-)
+from monorl.algorithms.advantages import compute_advantages
 from monorl.algorithms.credit import turn_advantages, turn_metrics, turn_returns, turn_table
 from monorl.algorithms.kl import kl_penalty
 from monorl.algorithms.losses import METRIC_KEYS, PolicyLossOutput, masked_aggregate, policy_loss
@@ -29,10 +24,7 @@ __all__ = [
     "SFT_METRIC_KEYS",
     "PolicyLossOutput",
     "ValueLossOutput",
-    "apply_overlong_penalty",
     "compute_advantages",
-    "discount_turn_rewards",
-    "dynamic_sampling_mask",
     "explained_variance",
     "gae",
     "kl_penalty",

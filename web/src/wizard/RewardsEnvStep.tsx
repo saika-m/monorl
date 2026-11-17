@@ -7,14 +7,13 @@ import { HarnessForm } from "./HarnessForm";
 import { SftNote } from "./TrainingStep";
 
 const REWARD_HINTS: Record<string, string> = {
-  exact_match: "1 if the extracted answer equals the reference answer (params: normalize, extract_regex).",
+  exact_match: "1 if the extracted answer equals the reference answer (params: extract, normalize, numeric_tolerance).",
   format: "Regex/structure check on the response (params: pattern, flags).",
-  regex: "Regex match against the response (params: pattern).",
   math_verify: "Symbolic equivalence via math-verify; robust to formatting.",
-  code_exec: "Runs tests against generated code in a sandbox (params: timeout).",
-  length: "Length shaping (params: target, penalty).",
-  llm_judge: "LLM-as-judge via an OpenAI-compatible API (params: model, base_url, rubric).",
-  reward_model: "Scores with a sequence-classification reward model (params: name_or_path).",
+  code_exec: "Runs tests against generated code in a sandbox (params: timeout_s, memory_mb, mode).",
+  length: "Length shaping (params: min_tokens, max_tokens, penalty_per_token, unit).",
+  llm_judge: "LLM-as-judge via an OpenAI-compatible API (params: model, base_url, rubric; retries with max_attempts).",
+  reward_model: "Scores with a sequence-classification reward model (params: model, normalize).",
   composite: "Nested weighted combination (params: rewards).",
 };
 
@@ -121,10 +120,12 @@ export default function RewardsEnvStep({ config, set, system, envs }: StepProps)
             value={env.type}
             onChange={(v) => {
               set("env.type", v);
-              // Params of one type mean nothing to another: start remote and harness from their defaults, clear theirs when leaving.
-              if (v === "harness") set("env.params", { command: HARNESS_EXAMPLE_COMMAND });
-              else if (v === "remote" && !("transport" in params)) set("env.params", { transport: "stdio", command: [], cwd: null });
-              else if (v !== "remote" && ("transport" in params || harness)) set("env.params", {});
+              // Params of one type mean nothing to another, and a built-in type refuses a key it does not read: a new type starts from its defaults.
+              if (v !== env.type) {
+                if (v === "harness") set("env.params", { command: HARNESS_EXAMPLE_COMMAND });
+                else if (v === "remote") set("env.params", { transport: "stdio", command: [], cwd: null });
+                else set("env.params", {});
+              }
               if (v === "single_turn") set("env.max_turns", 1);
               else if (env.max_turns === 1) set("env.max_turns", 8);
             }}

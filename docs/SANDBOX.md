@@ -142,6 +142,7 @@ it with `env.params.gateway`:
 
 ```yaml
 env:
+  type: harness
   params:
     gateway:
       bind: 172.17.0.1      # Linux: listen on the Docker bridge only instead of every interface
@@ -206,7 +207,8 @@ my-task/
 
 Each task is one `Sample`: `id` = the directory name, `messages` = `[user: instruction]`
 (`data.system_prompt`, `prompt_template`, `max_prompt_tokens`, `shuffle`, `limit` apply as for
-any dataset), `reference` = `None`, and `metadata["row"]["task"]` = the task's settings.
+any dataset), `reference` = `None`, `metadata["row"]["task"]` = the task's settings and
+`metadata["task_dir"]` = the directory.
 `monorl data inspect <dir>` and the UI's dataset preview show the rows.
 
 ### Mapping
@@ -219,7 +221,7 @@ any dataset), `reference` = `None`, and `metadata["row"]["task"]` = the task's s
 | `[environment].build_timeout_sec` (600) | `sandbox.build_timeout` |
 | `[environment].workdir` | the working directory; unset: the image's `WORKDIR` |
 | `[environment].cpus`, `memory_mb` (or the deprecated `memory = "2G"`), `gpus` | `sandbox.cpus`, `memory`, `gpus` |
-| `[environment].env` | the container's environment; a value that is exactly `${VAR}` or `${VAR:-default}` is read from monorl's environment (unset without default: `ConfigError`) |
+| `[environment].env` | the container's environment; a value that is exactly `${VAR}` or `${VAR:-default}` is read from monorl's environment when `env.params.host_env` lists `VAR` (not listed, or unset without default: `ConfigError`), see "What a task may set" below |
 | `[environment.healthcheck]` | run before the agent with Docker `HEALTHCHECK` semantics (`command` via `bash -c`, `interval_sec`, `timeout_sec`, `start_period_sec`, `start_interval_sec`, `retries`); a failing check fails the episode |
 | image `ENTRYPOINT` | kept (`keep_entrypoint`), with `sh -c "sleep infinity"` as command, as Harbor's Docker environment does |
 | `[agent].timeout_sec` | the agent's timeout for this sample; unset: `env.params.timeout` |
@@ -232,9 +234,58 @@ any dataset), `reference` = `None`, and `metadata["row"]["task"]` = the task's s
 | `[metadata]` | kept in the task mapping; not shown to the agent |
 | `solution/`, `[solution]` | ignored |
 
-The other `env.params.sandbox` options (`mounts`, `network`, `pids_limit`, `platform`, `python`,
-`args`, `keep_processes`) apply to every task; `env.params.command` is the agent for all of them.
-`env.params.verifier` is not used for task samples. Tasks need `sandbox.backend: docker`.
+`env.params.command` is the agent for every task. `env.params.verifier` is not used for a task
+that brings tests. Tasks need `sandbox.backend: docker` in the run config.
+
+### What a task may set
+
+A task is part of the dataset: whoever wrote the dataset wrote it, and that need not be whoever
+runs monorl. A task therefore describes its own container, and everything that reaches beyond
+the container stays with the run config.
+
+| `env.params.sandbox` option | Who sets it |
+|---|---|
+| `image` or `build` (the context directory only), `build_timeout`, `workdir`, `cpus`, `memory`, `gpus`, `keep_entrypoint` | the task; its value replaces the run config's for that sample |
+| `backend`, `mounts`, `network`, `args`, `user`, `pids_limit`, `platform`, `python`, `keep_processes`, `start_timeout`, and the `build` settings `dockerfile`, `args`, `target` | the run config only; they apply to every task |
+
+Outside `sandbox`, a task sets the variables of its container and of its verifier, the user the
+agent and `test.sh` run as inside the container, its timeouts and its health check.
+
+A sample whose task goes further is refused with a `ConfigError` that names the sample and
+everything it tried, before an image is pulled or a container is started for it:
+
+- **Sandbox options.** A task that sets an option of the second row is refused. Nothing is
+  dropped silently.
+- **Variables of the host.** `${VAR}` and `${VAR:-default}` in a task's `env` are read from
+  monorl's environment only for the names in `env.params.host_env` (default: none). The error
+  names the variable, never its value. To let the tasks of a dataset read a key:
+
+  ```yaml
+  env:
+    type: harness
+    params:
+      command: ["{python}", "/opt/monorl-agents/shell_agent.py"]
+      host_env: [JUDGE_API_KEY]
+      sandbox: {backend: docker, mounts: ["examples/sandbox/agents:/opt/monorl-agents:ro"]}
+  ```
+
+  A variable that a task reads under its own name (`JUDGE_API_KEY = "${JUDGE_API_KEY}"`) is
+  handed over by name (`docker run -e JUDGE_API_KEY`), so its value is not on a command line.
+  Every other variable of a task is passed by value (`-e NAME=value`) and can be seen in the
+  host's process list while the Docker CLI runs. This includes a host variable that the task
+  renames (`KEY = "${JUDGE_API_KEY}"`). The names a task chooses never become variables of the
+  Docker CLI process on the host.
+- **Directories of the host.** `tests/` and the build context `environment/` are directories on
+  the trainer host. They are accepted only from a task directory that `data.uri` names: the
+  data layer marks the samples of such a source (`metadata["task_dir"]`, which no column of a
+  dataset can set), and the task has to be, entry for entry, what its `task.toml` says on disk
+  when the episode starts. A row of another source that names a host directory
+  (`verifier.tests`, `sandbox.build`) is refused, also when it names a task directory that
+  exists on the host. Editing a task directory while a run uses it makes the run refuse that
+  task: start the run again.
+- **Images.** A task may name any image, and with `keep_entrypoint` the image's entrypoint
+  runs. That is what a task is for, and it is also the risk: use datasets of tasks whose
+  images you would run yourself (section 4).
 
 **Reward.** As in Harbor, `reward.json` wins over `reward.txt`. `reward.txt` holds one number.
 `reward.json` holds an object of labelled numbers (or one number): the reward is its `reward`
@@ -288,9 +339,11 @@ root, the paths are relative):
 monorl train --config configs/recipes/grpo_harness_tasks_docker_cpu.yaml
 ```
 
-A dataset row of any other source can bring the same settings: a `task` column holding
-`{"sandbox": {...}, "timeout": ..., "verifier": {...}}` (shape: `monorl.envs.harness`) is used
-for that sample in the same way.
+A dataset row of any other source (a JSONL file, a Hub dataset) can bring a task as well: a
+`task` column holding `{"sandbox": {...}, "env": {...}, "timeout": ...}` (shape:
+`monorl.envs.harness`) is used for that sample under the rules of "What a task may set". Such a
+row names an image, not a build context, and it cannot bring tests: its episodes are scored by
+`env.params.verifier` or by reward functions.
 
 ## 4. Security notes
 
@@ -314,8 +367,16 @@ for that sample in the same way.
   on the trajectory, or a verifier that only reads the agent's output, are harder to game.
 - **Requests from the trainer host.** Image URLs in a sandboxed agent's requests are not
   fetched unless `env.params.fetch_images: true` (§2).
-- **Secrets.** monorl's environment is not passed into containers; what `env.params.env` and a
-  task's `${VAR}` entries name is.
+- **Secrets.** monorl's environment is not passed into containers; what `env.params.env` sets
+  is, and of a task's `${VAR}` entries the variables that `env.params.host_env` lists. Every
+  task of the dataset can read a listed variable, and so can the agent in its container.
+- **Datasets.** A task comes with the dataset, also from a `task` column of a Hub dataset. It
+  can choose the image that runs (with its entrypoint, as root inside the container unless the
+  run config sets `user`, with network access) and raise `cpus`, `memory` and `gpus`. It cannot
+  mount host paths, add `docker run` arguments, change the network or read host variables and
+  directories that the run config did not give it (section 3, "What a task may set"). Run
+  task datasets you trust to pick images, and tighten every task at once with the run config's
+  `args`.
 - With `user` set, the episode directory is made world-readable and its working directory
   world-writable on the host so that the container user can use them.
 

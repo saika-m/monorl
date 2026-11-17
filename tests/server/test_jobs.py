@@ -18,6 +18,8 @@ from monorl.server import routes_jobs
 from monorl.server.app import ServerSettings, create_app
 from monorl.server.jobs import TERMINAL_STATES, JobManager, JobNotFound, train_command
 
+from .conftest import signed_in
+
 
 @pytest.fixture
 def terminal(client: TestClient, wait_for):  # noqa: ANN001, ANN201
@@ -234,7 +236,7 @@ def test_cancel_escalates_to_sigkill(
 ) -> None:
     monkeypatch.setenv("FAKE_TRAINER_MODE", "stubborn")
     jobs = JobManager(settings.home, grace_seconds=0.3)
-    with TestClient(create_app(settings, jobs=jobs)) as client:
+    with signed_in(create_app(settings, jobs=jobs)) as client:
         job = client.post("/api/jobs", json={"config": config_dict}).json()
         wait_for(lambda: client.get(f"/api/jobs/{job['id']}/metrics").json()["rows"])
         t0 = time.time()
@@ -406,3 +408,52 @@ def _collect_sse(client: TestClient, url: str, params: dict[str, Any] | None = N
             if events and events[-1][0] == "end":
                 break
     return events
+
+
+def test_a_secret_of_a_recipe_is_in_no_response_and_no_file_of_its_job(
+    client: TestClient,
+    recipes_dir: Path,
+    config_dict: dict[str, Any],
+    tmp_path: Path,
+    home: Path,
+    terminal,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recipe with ``api_key: ${JUDGE_API_KEY}``: the wizard is given the reference, the job that
+    is started from it records the reference, and so does a job whose config has the value itself."""
+    from monorl.config import loader
+
+    api_key = "sk-server-0123456789abcdef"
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("JUDGE_API_KEY", api_key)
+    reference = {"api_key": "${JUDGE_API_KEY}"}
+    config_dict["rewards"] = [{"type": "my_judge", "params": reference}]  # a provider's reward
+    (recipes_dir / "judged.yaml").write_text("# Judged.\n" + yaml.safe_dump(config_dict))
+
+    responses = [client.get("/api/recipes")]
+    (recipe,) = responses[0].json()
+    assert recipe["valid"] is True and recipe["config"]["rewards"][0]["params"] == reference
+
+    pasted = json.loads(json.dumps(recipe["config"]).replace("${JUDGE_API_KEY}", api_key))
+    for config in (recipe["config"], pasted):
+        responses.append(client.post("/api/config/validate", json={"config": config}))
+        assert responses[-1].json()["ok"] is True
+        created = client.post("/api/jobs", json={"config": config})
+        assert created.status_code == 201, created.text
+        job = created.json()
+        assert job["config"]["rewards"][0]["params"] == reference
+        assert terminal(job["id"])["state"] == "succeeded"
+        written = yaml.safe_load((Path(job["run_dir"]) / "config.yaml").read_text())
+        assert written["rewards"][0]["params"] == reference
+        responses += [created, client.get(f"/api/jobs/{job['id']}")]
+        responses += [
+            client.get(f"/api/jobs/{job['id']}/{part}")
+            for part in ("logs", "metrics", "trajectories", "checkpoints")
+        ]
+    responses.append(client.get("/api/jobs"))
+    assert len(responses[-1].json()) == 2
+
+    assert [str(r.request.url) for r in responses if api_key in r.text] == []
+    files = [p for root in (home, tmp_path / "runs") for p in root.rglob("*") if p.is_file()]
+    assert (home / "jobs.json") in files and len([p for p in files if p.name == "config.yaml"]) == 2
+    assert [str(p) for p in files if api_key.encode() in p.read_bytes()] == []

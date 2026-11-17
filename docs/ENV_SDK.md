@@ -49,7 +49,10 @@ Semantics:
 - `step` returns the messages to append *after* the assistant turn (tool results, the next user
   turn) and `done`. The orchestrator stops after `done` or `spec.max_turns` assistant turns.
   `reward` is the per-turn reward; the orchestrator folds the turns into one trajectory
-  return (`Σ gamma^k · reward_k`, `algorithm.gamma`) reported as `reward/env`.
+  return (`Σ gamma^k · reward_k`, `algorithm.gamma`) reported as `reward/env`. It must be a
+  finite JSON number (left out, it is 0). The client fails the episode on anything else,
+  including `NaN` and `Infinity`, which some JSON encoders write and which would turn the loss
+  of the training step into NaN.
 - Episodes are identified by `episode_id`. Servers may host many concurrently
   (`spec.parallel_episodes` tells the client how many); the client never sends two requests
   for the same episode at once. `close` is idempotent. Calling `reset` on a live id replaces
@@ -57,6 +60,8 @@ Semantics:
 - Errors: `{"error": {"type": str, "message": str}}`. Types used by the SDKs:
   `invalid_request` (400), `unknown_episode` (404), `unknown_op`/`not_found` (404),
   `method_not_allowed` (405), `env_error` (500 — the environment threw/returned an error).
+  The http transport also answers `forbidden` (403) and `unsupported_media_type` (415), see
+  [below](#requests-an-http-server-refuses).
   Lists/objects are never `null` on the wire (`messages: []`, `info: {}`, `tools: []`).
 - Multimodal messages carry `content` as a list of parts. Media parts hold only a **reference**
   (`image`: absolute local path, `file://`/`s3://`/`http(s)://` URI or `data:image/...;base64,`
@@ -75,7 +80,8 @@ Transports:
   episode and exits 0.
 - **http** — `GET /spec`, `GET /health` (POST also accepted), `POST /reset`, `POST /step`,
   `POST /close` with JSON bodies; HTTP status mirrors the error type. Different episodes are
-  served concurrently from different connections.
+  served concurrently from different connections. Every `POST` carries
+  `Content-Type: application/json`.
 
 Both SDKs serve both transports from one `Env` implementation and accept the same flags:
 
@@ -88,6 +94,61 @@ binds a free port and the server prints `... listening on http://127.0.0.1:<port
 `--idle-timeout` (Go: a duration such as `10m`; C++: seconds) closes episodes that received no
 request for that long (default 10 minutes; a negative value such as `-1s` disables it in Go,
 `0` or negative in C++).
+
+### Requests an http server refuses
+
+An http environment server is for environment clients, not for browsers. A web page open in a
+browser on the same machine can send requests to `http://127.0.0.1:<port>`, and to any address
+that machine reaches, so a page of any site could reset, step and close the episodes of a
+server that answered it. The servers of both SDKs refuse what a page can send, before any route:
+
+| Request | Answer |
+|---|---|
+| it has an `Origin` header, whatever its value | 403, error type `forbidden` |
+| `POST` whose `Content-Type` is not `application/json` | 415, error type `unsupported_media_type` |
+
+The media type is compared without its case and without the parameters after `;`, so
+`application/json; charset=utf-8` is answered; a `POST` without a `Content-Type` is not, on
+`/spec` and `/health` too. The answer is the error envelope above with a message that names what
+was refused, and the server writes one line about it to stderr. A refused request never reaches
+`Env`.
+
+Why these two: a page can send `text/plain` and the two form types (`<form>`, `fetch` with
+`mode: "no-cors"`) to another site without asking that site first, but not `application/json`,
+and browsers add `Origin` to every request a page sends to another site and to every `POST` it
+sends, also to the site it came from. The second part covers the page whose domain was pointed
+at the server after it loaded (DNS rebinding): its `POST` to what it takes for its own site
+carries `Origin` as well. Checked here with Chromium 150 against `go-arith` and `cpp-arith`
+after the change: a page on another port of `127.0.0.1` got 403 for its `no-cors` `POST /reset`,
+for the preflight of a JSON `POST /reset` and for `GET /spec`, no episode was opened, and its
+`POST` to its own origin carried `Origin` while its `GET` did not.
+
+monorl's clients (`env.type: remote`, `monorl env check --url`, `monorl bench env --url`) send
+`application/json` and no `Origin`. By hand:
+
+```
+curl -s -X POST localhost:8081/close -H 'Content-Type: application/json' \
+  -d '{"episode_id":"e1"}'
+```
+
+Without the `-H`, `curl -d` declares a form body and gets the 415.
+
+Unlike the Python server (`monorl env serve`,
+[ENVIRONMENTS.md](ENVIRONMENTS.md#serving-and-checking-it-over-mep1)) the SDK servers do not
+look at `Host`, so they need no option to be reached under a DNS name such as the
+`http://monorl-env-wordle-1:8080` of `docker-compose.yml`. What that leaves to a page whose
+domain was pointed at the server: `GET /spec` and `GET /health`, which a browser sends without
+`Origin` to the page's own site. Both only read (the `Spec` of the environment and
+`{"ok": true}`), so keep out of `Spec` what a web page must not read.
+
+These checks are not authentication: whoever can connect and sends a well-formed request is
+served. A server on `0.0.0.0` belongs on a network where only your runs reach it.
+
+A server written without the SDKs, in any language, has to refuse the same two kinds of request
+on its http transport before it acts on them, and should check `Host` too if it can be given the
+names it is reached by (answer IP addresses and `localhost`, refuse other names). A server that
+routes by path alone and parses whatever body arrives as JSON is driven by any page its user
+opens. The stdio transport has no such exposure.
 
 ## 2. Go SDK — `envs/sdk/go` (`github.com/monorl/envsdk/mep`)
 
@@ -141,12 +202,13 @@ API surface (`mep` package, stdlib only):
 - `Handler` — transport-agnostic dispatcher with the session table: one lock per episode,
   idle reaper, `CloseAll()` on shutdown.
 - `ServeStdio(ctx, handler, in, out)`, `ListenHTTP(handler, addr)` (+ `Serve`, `Shutdown`,
-  `URL()`), `NewHTTPHandler(handler)` (plain `http.Handler` if you want to mount it yourself).
+  `URL()`), `NewHTTPHandler(handler)` (plain `http.Handler` if you want to mount it yourself;
+  the [refusals](#requests-an-http-server-refuses) are part of it).
 - `Serve(env, Options{Transport, Addr, IdleTimeout, Logger, In, Out})`, `Flags(*flag.FlagSet)`,
   `ParseFlags(args)`, `Main(env)`.
 
-Tests: `cd envs/sdk/go && go test ./...` (stdio loop, http routes/status codes, 16 concurrent
-episodes, idle reaper, flags).
+Tests: `cd envs/sdk/go && go test ./...` (stdio loop, http routes/status codes, the requests the
+http transport refuses, 16 concurrent episodes, idle reaper, flags).
 
 ## 3. C++ SDK — `envs/sdk/cpp` (`include/mep/mep.hpp`, C++17, header-only)
 
@@ -187,7 +249,8 @@ API surface (`namespace mep`):
 - `serve_stdio(env, in, out, idle)`; `serve_http(env, host, port, idle)` /
   `HttpServer(env, host, port)` — minimal HTTP/1.1 on POSIX sockets: thread per connection,
   keep-alive, `Content-Length` bodies (`Expect: 100-continue` honoured, chunked requests
-  rejected with 411), GET/POST routing with the status codes above; `SIGINT`/`SIGTERM` stop it.
+  rejected with 411), GET/POST routing with the status codes above, the
+  [refusals](#requests-an-http-server-refuses); `SIGINT`/`SIGTERM` stop it.
 - `run_main(argc, argv, env)` parses `--transport`, `--addr`, `--idle-timeout` and returns the
   exit code.
 
@@ -248,6 +311,24 @@ Spec, sampling, rewards and advantages work exactly as with Python envs: the env
 rewards become the `env` term of the trajectory reward (discounted by `algorithm.gamma`) and are
 added to the score of any `rewards:` entries you configure.
 
+The client checks what a server sends before the run uses it:
+
+- A step whose `reward` is not a finite number fails the episode with an error that names the
+  environment, its address and the episode, and the client closes the episode at the server.
+  Like every failed episode it fails the run unless `env.max_failed_frac` tolerates it.
+- A response larger than `params.max_response_bytes` (default `67108864`, 64 MiB) is not read
+  to its end and fails the episode. Over stdio the limit counts the characters of a response
+  line, and the process is restarted. Over http the client asks for an uncompressed response
+  and refuses a compressed one, whose size it could not bound. Raise the limit for an
+  environment whose observations inline media as `data:` URLs of that size.
+
+The http servers of the Go and C++ SDKs refuse the requests a web page open in a browser can
+send them (one with an `Origin` header, a `POST` that is not `application/json`), as the Python
+server (`monorl env serve`) does: see [section 1](#requests-an-http-server-refuses). A client
+of your own that got 200 for a `POST` without `Content-Type: application/json` gets 415 now.
+They answer every other client that can connect, so keep a server whose episodes have effects
+beyond their own state on an address that only your runs reach.
+
 ### Scaling parallel episodes
 
 The orchestrator opens all episodes of a step at once and batches their generation calls,
@@ -288,5 +369,6 @@ rollout:
 (skipped per language when `go` or `clang++` is missing) and, for every example, drives a
 scripted episode over stdio and http using only `monorl.envs.protocol` helpers: spec/health,
 protocol version, rewards/done/messages, interleaved episodes on one stdio stream, error
-envelopes and HTTP status codes for bad input, four concurrent http episodes from threads, seed
-determinism, and clean exit on stdin EOF.
+envelopes and HTTP status codes for bad input, the requests a web page can send and their
+refusals, four concurrent http episodes from threads, seed determinism, and clean exit on stdin
+EOF.

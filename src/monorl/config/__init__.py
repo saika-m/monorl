@@ -1,4 +1,4 @@
-from monorl.config.loader import apply_overrides, interpolate_env, load_yaml
+from monorl.config.loader import apply_overrides, interpolate_env, load_yaml, mask_secrets
 from monorl.config.schema import (
     PIPELINE_BACKENDS,
     AlgorithmConfig,
@@ -30,4 +30,5 @@ __all__ = [
     "apply_overrides",
     "interpolate_env",
     "load_yaml",
+    "mask_secrets",
 ]

@@ -169,6 +169,8 @@ class Layout:
             image_fields=[f for f in image_fields if f],
         )
         if layout.format not in ("chat", "prompt_answer", "text"):
+            if not columns:
+                raise DataError(f"{config.uri} has no rows, so its format cannot be detected")
             raise DataError(f"could not infer dataset format from columns {sorted(columns)}; set data.format")
         if layout.format == "chat" and not layout.messages_field:
             raise DataError(f"format=chat needs messages_field; columns: {sorted(columns)}")
@@ -211,6 +213,9 @@ class SampleMapper:
     """``row_id -> base location`` for relative image paths (``RowSource.media_base``)."""
     null_filled: bool = False
     """``RowSource.null_filled``: ``null``-valued keys are dropped from tool schemas."""
+    task_dirs: bool = False
+    """The rows are task directories (``TaskRows``): a sample's ``metadata["task_dir"]`` is its
+    row id, the directory. It is outside ``metadata["row"]``, so no column of a dataset sets it."""
     dropped: int = 0
     """Rows dropped by the token filter so far (diagnostic)."""
     _resolvers: dict[str | None, MediaResolver] = field(default_factory=dict)
@@ -219,8 +224,11 @@ class SampleMapper:
     def from_config(
         cls, config: DataConfig, layout: Layout, tokenizer: Any = None, rows: RowSource | None = None
     ) -> SampleMapper:
+        from monorl.data.tasks import TaskRows  # imports this package
+
         return cls(
             layout=layout,
+            task_dirs=isinstance(rows, TaskRows),
             system_prompt=config.system_prompt,
             prompt_template=config.prompt_template,
             tokenizer=tokenizer,
@@ -301,6 +309,8 @@ class SampleMapper:
                 metadata["tools"] = tools
                 skip.add(tools_field)
         metadata["row"] = {k: v for k, v in row.items() if k not in skip}
+        if self.task_dirs:
+            metadata["task_dir"] = row_id
         sample_id = str(row["id"]) if row.get("id") not in (None, "") else row_id
         return Sample(id=sample_id, messages=messages, reference=reference, metadata=metadata)
 

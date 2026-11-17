@@ -272,8 +272,8 @@ def test_client_routes_image_prompts_through_chat_completions(
     client.shutdown()
 
     paths = [r.url.path for r in server.requests]
-    assert paths == ["/v1/completions", "/v1/chat/completions", "/v1/chat/completions"]
-    chat_body = json.loads(server.requests[1].content)
+    assert sorted(paths) == ["/v1/chat/completions", "/v1/chat/completions", "/v1/completions"]
+    chat_body = json.loads(next(r for r in server.requests if r.url.path == "/v1/chat/completions").content)
     assert chat_body["model"] == "policy" and chat_body["n"] == 2 and chat_body["max_completion_tokens"] == 4
     assert (
         chat_body["logprobs"] is True

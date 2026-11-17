@@ -14,17 +14,32 @@ expression, or a list of acceptable answers.
 from __future__ import annotations
 
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from monorl.core.errors import BackendUnavailable
+from monorl.core.params import declare_params
 from monorl.core.types import RewardResult, Trajectory
 from monorl.rewards.base import (
     check_trajectories,
     reference_value,
     references_as_list,
+    response_scope,
     response_text,
     reward_name,
+    reward_params,
+)
+
+declare_params(
+    "reward",
+    "math_verify",
+    "name",
+    "timeout_s",
+    "float_rounding",
+    "numeric_precision",
+    "strict",
+    "scope",
+    "reference_key",
 )
 
 
@@ -39,14 +54,15 @@ def _import_math_verify() -> Any:
 
 
 class MathVerifyReward:
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: Mapping[str, Any]) -> None:
+        params = reward_params("math_verify", params)
         self._mv = _import_math_verify()
         self.name = reward_name(params, "math_verify")
         self.timeout_s = int(params.get("timeout_s", 5))
         self.float_rounding = int(params.get("float_rounding", 6))
         self.numeric_precision = int(params.get("numeric_precision", 15))
         self.strict = bool(params.get("strict", True))
-        self.scope = str(params.get("scope", "last"))
+        self.scope = response_scope(params, "math_verify")
         self.reference_key = params.get("reference_key")
 
     def _timeout(self) -> int | None:
@@ -98,5 +114,5 @@ class MathVerifyReward:
         return out
 
 
-def make_math_verify(params: dict[str, Any], **_: Any) -> MathVerifyReward:
+def make_math_verify(params: Mapping[str, Any], **_: Any) -> MathVerifyReward:
     return MathVerifyReward(params)

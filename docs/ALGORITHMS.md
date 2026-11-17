@@ -65,8 +65,9 @@ A_i = (R_i - mean_g) / (std_g + 1e-6)
 
 `compute_advantages` with `advantage_norm: group` (the default). `std_g` is the unbiased standard
 deviation (divisor `n - 1`); a group whose rewards are all equal gets advantage 0 for every
-member. `advantage_norm` and `advantage_std_norm` change the formula (see [Options](#options)).
-Requires `rollout.group_size >= 2`.
+member, and the reference trainer does not compute its sequences where the update is the same
+without them (see [Options](#options)). `advantage_norm` and `advantage_std_norm` change the
+formula. Requires `rollout.group_size >= 2`.
 
 ```yaml
 algorithm:
@@ -170,7 +171,7 @@ centering to the policy term and chooses the anchor of `logp_old`: [OFF_POLICY.m
 | `loss_agg` | `token` | Mean used for the policy, KL and entropy terms (`masked_aggregate`). |
 | `kl_coef` | `0.0` | Weight of the KL penalty to the reference policy. `0` skips the reference pass. |
 | `kl_estimator` | `k3` | Per-token estimator in `kl_penalty`: `k1`, `k2` or `k3`. |
-| `entropy_coef` | `0.0` | Subtracts `entropy_coef * agg(entropy)`: the entropy of the trainer's temperature-scaled next-token distribution at the response positions. `loss/entropy` is reported whatever the value. |
+| `entropy_coef` | `0.0` | Subtracts `entropy_coef * agg(entropy)`: the entropy of the trainer's temperature-scaled next-token distribution at the response positions. `loss/entropy` is reported whatever the value, over the sequences the update computes. |
 | `dynamic_sampling` | `false` | Drops groups whose rewards are all identical and resamples. |
 | `overlong_penalty` | `0.0` | Subtracted from `R` when the last turn's `finish_reason` is `length`. |
 | `credit_assignment` | `episode` | `episode` or `turn` (previous section). |
@@ -205,6 +206,33 @@ is filtered the same way and gives as many groups as are missing, for at most
 therefore usually costs one more prompt, not a whole step. A batch can
 hold fewer groups; with none left the step makes no update (`rollout/skipped: 1`).
 `rollout/groups_dropped` counts the groups that were rolled out and dropped.
+
+**Sequences without advantage.** A sequence whose advantage is exactly 0 at every response token
+adds exactly 0 to the policy term and to its gradient. Under `grpo`, `dapo` and `rloo` that is
+every episode of a group whose rewards are all equal: with a reward of 0 or 1, a success rate `p`
+and groups of 4, a share `p^4 + (1 - p)^4` of the groups, 66% at `p = 0.1`. The reference trainer
+runs no forward or backward pass for such a sequence when the update is the same without it, and
+reports the number it left out as `tokens/sequences_skipped`. The loss means keep their
+denominators over the whole batch, so the optimizer is handed the gradient of the step that
+computes every sequence, up to float32 rounding. When no sequence is left the optimizer steps
+on a gradient of zeros, as before: Adam's momentum and the weight decay still move the weights, the
+schedule advances and `grad_norm` is 0. Every sequence is computed when one of these holds:
+
+- Another term of the loss reads it: a batch with `logp_ref` (`kl_coef > 0`), `entropy_coef > 0`,
+  `ppo` (the value loss), `model.mtp.train`, `sft`, or a loss function handed to the trainer.
+- A forward pass in training mode draws random numbers, as `model.lora.dropout > 0` makes it (the
+  default is `0.05`): a pass left out would shift the dropout masks of every pass after it. The
+  trainer measures this once, when it is built. Set `model.lora.dropout: 0` to train LoRA
+  adapters without those passes.
+- `trainer.precision: fp16` on CUDA, where a `GradScaler` keeps books on every backward pass.
+- The batch holds images or other model inputs besides tokens; or a value that is not finite
+  among its advantages, old log-probs or loss weights, or an old log-prob below -80 (0 times the
+  ratio would not be 0); or loss weights that are negative, lie off the response tokens or add
+  up to less than 1e-7 on a sequence.
+
+The `off_policy` corrections multiply the policy term and change nothing about this. With
+several trainer ranks every rank leaves out its own. `dynamic_sampling` goes further: it replaces
+such groups before the update.
 
 ## SFT
 
@@ -243,7 +271,8 @@ Names only; meanings are in [RUNS.md](RUNS.md#metrics).
 | Reported | Metric names |
 |---|---|
 | every RL step | `reward/mean`, `reward/std`, `reward/<reward name>`, `advantage/mean`, `advantage/abs_mean`, `rollout/num_sequences`, `rollout/groups_dropped`, `rollout/resample_rounds`, `policy/staleness` |
-| every RL update | `loss/policy`, `loss/kl`, `loss/entropy`, `loss/total`, `policy/clipfrac`, `policy/approx_kl`, `policy/ratio_mean`, `grad_norm`, `lr` |
+| every RL update | `loss/policy`, `loss/kl`, `loss/total`, `policy/clipfrac`, `grad_norm`, `lr`, `tokens/sequences_skipped` |
+| every RL update that computes a sequence | `loss/entropy`, `policy/approx_kl`, `policy/ratio_mean` |
 | conditionally | `tokens/old_logprobs_recomputed`, `rollout/skipped`, `reward/overlong_penalty`, `reward/env` |
 | `credit_assignment: turn` | `advantage/turn_spread`, `advantage/turn_spread_max`, `advantage/first_turn_abs`, `advantage/last_turn_abs` |
 | `ppo` | `loss/value`, `value/clipfrac`, `value/mean`, `value/return_mean`, `value/explained_variance`, `time/values` |
@@ -252,6 +281,14 @@ Names only; meanings are in [RUNS.md](RUNS.md#metrics).
 
 `loss/kl` is 0 unless `kl_coef > 0`. `loss/total` is the optimised loss: the policy, KL and
 entropy terms, plus `value_coef * loss/value` for `ppo`.
+
+`loss/entropy`, `policy/approx_kl` and `policy/ratio_mean` (and `offpolicy/sc_coef_l1` and
+`offpolicy/sc_tail_ratio` under score centering) need a forward pass. They are means over the
+sequences the update computed, and the row of an update that computed none does not have them:
+with `num_epochs: 1`, a step in which every group had equal rewards (see "Sequences without
+advantage" under [Options](#options)). `loss/policy`, `loss/total` and `policy/clipfrac` are 0
+for a sequence that was left out and stay means over the whole batch. `tokens/sequences_skipped`
+is 0 where every sequence is computed; `sft` rows do not have it.
 
 ## Other backends
 

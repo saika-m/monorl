@@ -130,22 +130,23 @@ monorl train --config configs/recipes/grpo_gsm8k_smollm_cpu.yaml --set trainer.m
 
 # web UI
 make web                    # build web/dist once
-monorl serve                # http://127.0.0.1:8000, opens a browser tab
+monorl serve                # prints a sign-in URL for http://127.0.0.1:8000 and opens it
 
 # look at data before training
 monorl data inspect hf://openai/gsm8k --config-name main --limit 3
 AWS_ENDPOINT_URL=http://localhost:9000 monorl data inspect s3://my-bucket/data/train.jsonl
 ```
 
-A run writes `~/.monorl/runs/<run_name>/`: `config.yaml`, `status.json`, `metrics.jsonl`,
-`trajectories.jsonl`, `run.log`, `checkpoints/` and the exported model in `final/`. `--resume`
-continues from the latest checkpoint.
+A run writes `~/.monorl/runs/<run_name>/` (`$MONORL_HOME/runs/<run_name>/` when that is set):
+`config.yaml`, `status.json`, `metrics.jsonl`, `trajectories.jsonl`, `run.log`, the exported model
+in `final/` and, every `trainer.save_every` steps, a checkpoint under `checkpoints/` (every 10 in
+this recipe, so the five steps above write none). `--resume` continues from the latest checkpoint.
 
 `make install` installs the versions pinned in [`requirements.lock`](requirements.lock), the ones
 CI runs the tests on: monorl's dependencies with the extras `dev`, `trl`, `distributed`,
-`rewards`, `openenv`, `hermes` and `multimodal` (image prompts), and PyTorch's CPU build (on
-macOS the regular build, MPS included). `make sync` brings an existing `.venv` back to the lock
-after a pull.
+`rewards`, `openenv`, `hermes`, `multimodal` (image prompts) and `sinks` (W&B and TensorBoard),
+and PyTorch's CPU build (on macOS the regular build, MPS included). `make sync` brings an
+existing `.venv` back to the lock after a pull.
 
 GPU engines and backends are extras (`.[vllm]`, `.[sglang]`, `.[verl]`) and are not part of the
 lock. Unsloth gets its own venv (`make install-unsloth`) and NeMo-RL is a git checkout
@@ -288,17 +289,17 @@ SDK is header-only (`envs/sdk/cpp/include/mep/mep.hpp`) and serves the same prot
 |---|---|
 | `monorl train` | Run a training job: `--config PATH` (a `RunConfig` YAML), `--set key.path=value` to override a field, `--run-dir DIR`, `--resume` from the latest checkpoint |
 | `monorl pipeline` | Run a multi-stage pipeline (SFT, RL, rejection sampling and eval stages). Same options; `--resume` skips the stages that already succeeded |
-| `monorl serve` | Web UI and API (`--host`, `--port`, `--no-open`, `--reload`) |
+| `monorl serve` | Web UI and API (`--host`, `--port`, `--no-open`, `--reload`, `--allowed-host`, `--token`); every request needs the access token ([docs](docs/WEB_UI.md#access)) |
 | `monorl doctor` | System, frameworks, patches and registered components (`--json`) |
 | `monorl bench` | `rollout`, `env`, `sync`, `plan`: size a run by tokens/s, episodes/s, sync time and a placement plan |
 | `monorl patches` | `list`, `status [FRAMEWORK]`, `apply FRAMEWORK`: inspect and apply the patchsets |
-| `monorl data inspect URI` | Preview a dataset and the samples built from it (`--limit`, `--split`, `--config-name`, `--json`) |
-| `monorl env check` | Drive a MEP/1 server (`--command CMD...` or `--url URL`) through spec, health, reset, step and close |
-| `monorl env serve TYPE` | Expose a Python environment as a MEP/1 server (`--transport stdio\|http`, `--port`) |
+| `monorl data inspect URI` | Preview a dataset and the samples built from it (`--limit`, `--split`, `--config-name`, `--provider`, `--json`) |
+| `monorl env check` | Drive a MEP/1 server (`--command WORD`, repeated for every word of its command line, or `--url URL`) through spec, health, reset, step and close; `--sample`, `--reference` and `--action` choose the sample and the action |
+| `monorl env serve TYPE` | Expose a Python environment as a MEP/1 server (`--transport stdio\|http`, `--host`, `--port`, `--allowed-host` for the names an http server answers to) |
 | `monorl recipes` | `list`, `show NAME`: browse the bundled recipes |
 
-`python -m monorl.cli ...` is equivalent (the web server launches runs that way); `python -m monorl.bench`
-is the same as `monorl bench`.
+`python -m monorl.cli ...` is equivalent (the web server launches runs that way);
+`python -m monorl.bench` is the same as `monorl bench`.
 
 ## Support matrix
 
@@ -321,7 +322,7 @@ The native loop: rollout engines and trainers behind monorl's orchestrator.
 | Off-policy corrections (`algorithm.off_policy`) | decoupled PPO, truncated IS weights, ratio mask, score centering | yes (top-k for score centering) | yes (top-k for score centering) | yes |
 | Colocated (sleep) | n/a | yes | yes | – |
 | Disaggregated / Ray | yes | yes | yes | – |
-| Weight sync | inprocess | cuda_ipc, broadcast, checkpoint | cuda_ipc, broadcast, checkpoint | inprocess |
+| Weight sync | inprocess, broadcast, checkpoint | inprocess, cuda_ipc, broadcast, checkpoint | inprocess, cuda_ipc, broadcast, checkpoint | inprocess |
 | Patched | – | yes | yes | – |
 
 Pipeline backends: the same config compiled for another framework's loop.
@@ -374,7 +375,7 @@ stated. `make test` and `make lint` pass there; CI runs the suite on Linux witho
 | Failures and context | A run whose agent crashes on some episodes finishes with those episodes left out or retried; a context budget ends episodes instead of truncating them in training |
 | Sandbox | Harness episodes in real Docker containers (agent and verifier inside, reward from the verifier, containers removed); `grpo_harness_tasks_docker_cpu.yaml` on its Harbor-format example tasks |
 | Async rollouts | `rollout.async_steps_ahead: 2` with decoupled PPO, importance weights and a ratio mask, and with score centering |
-| MTP | A tiny random Mellum with one MTP layer (`grpo_mtp_tiny_cpu.yaml`): rollouts drafted by the layer, the layer trained and pushed back every step (`mtp/accept_rate` from 0 to 0.17 on sampled rollouts and 0.41 in greedy evaluation, over 16 steps), and the export loads with it in transformers |
+| MTP | A tiny random Mellum with one MTP layer (`grpo_mtp_tiny_cpu.yaml`): rollouts drafted by the layer, the layer trained and pushed back every step (`mtp/accept_rate` from 0 to 0.35 on sampled rollouts and 0.75 in greedy evaluation, over 16 steps), and the export loads with it in transformers |
 | Web UI | Launches a pipeline on the real server and streams its stage table, charts, log and trajectories; the transcript viewer and the wizard's fields for everything above |
 | Containers | `docker/Dockerfile.{cpu,envs}` build, `docker compose up` comes up healthy, and the five example environments pass `monorl env check` from the container |
 
@@ -444,7 +445,8 @@ scripts/vendor.py --fetch vllm     # clone a pinned upstream source (or `all`)
 ```bash
 scripts/dev/bootstrap.sh     # .venv (uv, Python 3.12), example envs in envs/bin, web/dist
 scripts/dev/smoke.sh         # CPU end to end: 2-step GRPO run, then `monorl serve` probes
-docker compose up --build    # UI on :8000 and four `env-wordle` MEP/1 replicas
+docker compose up --build    # UI on 127.0.0.1:8000 and four `env-wordle` MEP/1 replicas
+docker compose logs ui       # the URL that signs a browser in to that UI
 docker compose --profile gpu up ray-head    # Ray head on the vLLM image (NVIDIA runtime)
 ```
 

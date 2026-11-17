@@ -22,6 +22,10 @@ uses Node 24 and pnpm 10. `pnpm dev:mock` also needs [Bun](https://bun.sh) on `P
 `monorl serve --no-open` or `pnpm dev:mock` unchanged. `make web` from the repository root runs
 the install and the build.
 
+`monorl serve` wants a sign-in ([docs/WEB_UI.md](../docs/WEB_UI.md#access)): open
+`http://localhost:5173/?token=<token>` with the token of the URL it printed. Vite passes that
+request and `/api` on to the server (`vite.config.ts`); the mock needs no token.
+
 ## Build output
 
 `pnpm build` empties and rewrites `web/dist/` (gitignored): `index.html` plus hashed files under
@@ -42,8 +46,9 @@ under `dist/` returns the file, any other path outside `/api` returns `index.htm
 | `src/defaults.ts` | `defaultRunConfig()`: the pydantic defaults, restated; merge helpers. |
 | `src/pipeline.ts` | Stage defaults and structural checks mirroring `config/pipeline.py`. |
 | `src/schema.ts`, `src/api.ts` | Schema lookup by dotted config path; typed fetch and SSE client. |
-| `mock/server.ts` | Bun mock of the server API: seeded runs, a fake job, a pipeline schema literal. |
+| `mock/server.ts` | Bun mock of the server API: seeded runs, a fake job. |
 | `mock/config_schema.json` | The config schema the mock serves, generated from `RunConfig`. |
+| `mock/pipeline_schema.json` | The pipeline schema it serves, generated from `PipelineConfig`. |
 
 ## Adding a config field
 
@@ -55,15 +60,16 @@ hand, so a field added to `src/monorl/config/schema.py` also needs:
 its type in `src/types.ts`; its default in `src/defaults.ts` (`defaultRunConfig()`), or
 `src/pipeline.ts` for a stage; an input in the wizard step that owns the section
 (`src/wizard/*Step.tsx`), with `path` set so the description comes from the schema; and a
-regenerated `mock/config_schema.json`, so `pnpm dev:mock` shows the description (a stage field: an
-entry in the `PIPELINE_SCHEMA` literal in `mock/server.ts` instead). From the repository root:
+regenerated `mock/config_schema.json`, so `pnpm dev:mock` shows the description (a stage field:
+`mock/pipeline_schema.json`). From the repository root:
 
 ```bash
 .venv/bin/python -m monorl.config.schema_json --write web/mock/config_schema.json
+.venv/bin/python -m monorl.config.schema_json --pipeline --write web/mock/pipeline_schema.json
 ```
 
-The mock imports that file and needs no Python to run; `tests/config/test_schema_json.py` fails when
-a field or a description of the schema is not in it.
+The mock imports those files and needs no Python to run; `tests/config/test_schema_json.py` fails
+when a field or a description of a schema is not in its file.
 
 Then run `pnpm build` and `pnpm lint`. `tsconfig.*.tsbuildinfo` are tracked; a build with no
 source changes left them byte-identical here.

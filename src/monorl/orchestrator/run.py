@@ -7,6 +7,7 @@ dispatch between pipeline backends (trl/verl/nemo_rl own their loop, SFT include
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -14,12 +15,25 @@ import traceback
 from pathlib import Path
 
 from monorl.config.schema import RunConfig
+from monorl.core.errors import BackendUnavailable, ConfigError, DataError, RegistryError
+from monorl.core.home import run_root
 from monorl.core.registry import ensure_providers, registry
-from monorl.core.reporting import CONFIG_FILE, RunReporter, list_checkpoints
+from monorl.core.reporting import (
+    CONFIG_FILE,
+    METRICS_FILE,
+    TRAJECTORIES_FILE,
+    RunReporter,
+    drop_rows,
+    list_checkpoints,
+)
 from monorl.core.signals import signal_guard
 from monorl.core.types import RunResult
 from monorl.orchestrator.loop import ComponentLoop
 from monorl.orchestrator.sft import SFTLoop
+
+USER_ERRORS = (ConfigError, DataError, RegistryError, BackendUnavailable)
+"""What a run fails with when its config, its data or its installation has to change. The message
+says what; the traceback, which only shows where monorl noticed, is left out of the log."""
 
 
 def default_run_name(config: RunConfig) -> str:
@@ -31,29 +45,84 @@ def default_run_name(config: RunConfig) -> str:
 
 
 def resolve_run_dir(config: RunConfig) -> Path:
-    """``<logging.run_root>/<run_name>`` (run_name defaults to ``<model>-<algorithm>-<timestamp>``)."""
-    return Path(config.logging.run_root).expanduser() / (config.run_name or default_run_name(config))
+    """``<logging.run_root>/<run_name>`` (run_name defaults to ``<model>-<algorithm>-<timestamp>``;
+    the default run root is ``runs`` under ``$MONORL_HOME``, :func:`monorl.core.home.run_root`)."""
+    return run_root(config.logging.run_root) / (config.run_name or default_run_name(config))
 
 
-def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False) -> RunResult:
+def check_local_model(config: RunConfig) -> None:
+    """Raise :class:`ConfigError` when ``model.name_or_path`` or ``model.tokenizer_name_or_path``
+    is written as a path (it starts with ``/``, ``./``, ``../`` or ``~``) and is not a directory.
+
+    The loaders (transformers, and the frameworks that load through it) read a string that is no
+    directory as a Hub id, and say of a path only that it is no valid repository name. They take
+    the string as it is written: ``~`` is not expanded, so neither is it here. With
+    ``cluster.ray_address`` the model is loaded on the nodes of that cluster, which may hold a path
+    this machine does not, and nothing is checked."""
+    if config.cluster.mode == "ray" and config.cluster.ray_address:
+        return
+    for key in ("name_or_path", "tokenizer_name_or_path"):
+        path = getattr(config.model, key)
+        if not path or not path.startswith(("/", "./", "../", "~")) or os.path.isdir(path):
+            continue
+        problem = "is a file, not a model directory" if os.path.isfile(path) else "does not exist"
+        if path.startswith("~"):
+            home = os.path.expanduser(path)
+            hint = f"write {home}" if os.path.isdir(home) else f"{home} does not exist either"
+            problem = f"does not exist: '~' is not expanded when a model is loaded ({hint})"
+        elif not os.path.isabs(path):
+            problem += f" (looked for {os.path.abspath(path)})"
+        raise ConfigError(f"model.{key}: the local path {path} {problem}")
+
+
+def run(
+    config: RunConfig,
+    run_dir: Path | None = None,
+    *,
+    resume: bool = False,
+    cancel: threading.Event | None = None,
+) -> RunResult:
+    """Run ``config`` in ``run_dir``. ``cancel`` is the event that the first SIGINT or SIGTERM sets
+    while the run is in progress. A caller with more to do after this run (the pipeline, between
+    its stages) passes its own: the result alone does not tell it that it was asked to stop, since
+    a run that was in its last step when the signal came ends ``succeeded``."""
     if config.run_name is None:
         config = config.model_copy(update={"run_name": default_run_name(config)})
     target = Path(run_dir).expanduser() if run_dir is not None else resolve_run_dir(config)
     reporter = RunReporter(target)
+    with reporter.capture_logging():
+        return _run(config, reporter, resume=resume, cancel=cancel)
+
+
+def _run(
+    config: RunConfig, reporter: RunReporter, *, resume: bool, cancel: threading.Event | None
+) -> RunResult:
     config.to_yaml(reporter.run_dir / CONFIG_FILE)
-    cancel = threading.Event()
+    if not resume:
+        # This run appends to the records of a run that was here before. A line that one did not
+        # finish goes first, or the first row of this run would share it and be unreadable. (A
+        # resume does the same when it takes the files back to its checkpoint.)
+        for name in (METRICS_FILE, TRAJECTORIES_FILE):
+            if drop_rows(reporter.run_dir / name, lambda row: False):
+                reporter.log(f"removed the unfinished last line an earlier run left in {name}")
+    if cancel is None:
+        cancel = threading.Event()
     backend = config.trainer.backend
     kind = "pipeline" if config.is_pipeline_backend else "sft" if config.is_sft else "component"
-    with signal_guard(cancel, reporter, "finishing the current step, then stopping"):
+    interrupt = threading.Event()
+    with signal_guard(cancel, reporter, "finishing the current step, then stopping", interrupt=interrupt):
         reporter.set_status("running", f"starting {kind} backend {backend!r} (resume={resume})", step=0)
         try:
+            check_local_model(config)
             ensure_providers(config)
             if config.is_pipeline_backend:
-                result = _run_pipeline(config, reporter)
+                result = _run_pipeline(config, reporter, resume, cancel)
             elif config.is_sft:
                 result = SFTLoop(config, reporter, cancel=cancel, resume=resume).run()
             else:
-                result = ComponentLoop(config, reporter, cancel=cancel, resume=resume).run()
+                result = ComponentLoop(
+                    config, reporter, cancel=cancel, resume=resume, interrupt=interrupt
+                ).run()
         except KeyboardInterrupt:
             result = RunResult(
                 state="cancelled",
@@ -63,14 +132,17 @@ def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False)
                 error="interrupted",
             )
         except Exception as e:  # noqa: BLE001 - every failure must land in status.json
-            tb = traceback.format_exc()
-            reporter.log(tb)
+            error = f"{type(e).__name__}: {e}"
+            if not isinstance(e, USER_ERRORS):
+                tb = traceback.format_exc()
+                reporter.log(tb)
+                error = f"{error}\n{tb}"
             result = RunResult(
                 state="failed",
                 final_step=int(reporter.status.get("step", 0)),
                 run_dir=str(reporter.run_dir),
                 checkpoints=list_checkpoints(reporter.run_dir),
-                error=f"{type(e).__name__}: {e}\n{tb}",
+                error=error,
             )
             reporter.set_status("failed", f"{type(e).__name__}: {e}", step=result.final_step)
             return result
@@ -83,9 +155,11 @@ def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False)
     return result
 
 
-def _run_pipeline(config: RunConfig, reporter: RunReporter) -> RunResult:
+def _run_pipeline(
+    config: RunConfig, reporter: RunReporter, resume: bool, cancel: threading.Event
+) -> RunResult:
     backend = registry.get("pipeline_backend", config.trainer.backend)(config)
-    result = backend.run(config, reporter.run_dir, reporter=reporter)
+    result = backend.run(config, reporter.run_dir, reporter=reporter, resume=resume, cancel=cancel)
     if not result.checkpoints:
         result.checkpoints = list_checkpoints(reporter.run_dir)
     return result

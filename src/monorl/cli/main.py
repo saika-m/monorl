@@ -20,10 +20,11 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from monorl.config.loader import apply_overrides, load_yaml
+from monorl.config.loader import apply_overrides, load_yaml, mask_secrets
 from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, MonorlError
+from monorl.core.reporting import LOG_FILE
 from monorl.core.types import MEDIA_PART_TYPES, message_media, message_text
 
 app = typer.Typer(
@@ -51,8 +52,50 @@ EXIT_BY_STATE: dict[str, int] = {"succeeded": 0, "failed": 1, "cancelled": 130}
 
 
 def _fail(message: str, code: int = 1) -> None:
-    err_console.print(f"[bold red]error:[/bold red] {message}")
+    err_console.print(f"[bold red]error:[/bold red] {escape(message)}")
     raise typer.Exit(code)
+
+
+def _print_version(wanted: bool) -> None:
+    if wanted:
+        from importlib.metadata import version
+
+        typer.echo(f"monorl {version('monorl')}")
+        raise typer.Exit()
+
+
+@app.callback()
+def root(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_print_version,
+        is_eager=True,
+        help="Print the version of the installed monorl and exit.",
+    ),
+) -> None:
+    pass
+
+
+def _recipe_hint(config: Path) -> str:
+    """For a ``--config`` that is no file but names a bundled recipe: where that recipe is."""
+    from monorl.config.recipes import get_recipe
+
+    if config.exists():
+        return ""
+    try:
+        return f" (the recipe of that name is passed by its path: --config {get_recipe(str(config)).path})"
+    except ConfigError:
+        return ""
+
+
+def _print_run_error(error: str, run_dir: str) -> None:
+    """The error of a run that did not succeed, once. A failed run reports its message followed by
+    the traceback, which the run log has printed already and keeps in ``run.log``."""
+    message, cut, _ = error.partition("\nTraceback (most recent call last)")
+    if cut:
+        message += f" (traceback in {Path(run_dir) / LOG_FILE})"
+    err_console.print(f"[red]{escape(message)}[/red]")
 
 
 def _yes_no(flag: bool | None) -> str:
@@ -92,15 +135,15 @@ def train(
     try:
         data = apply_overrides(load_yaml(config), set_)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(str(e) + _recipe_hint(config))
         return
     if is_pipeline_payload(data):
-        _run_pipeline(data, run_dir, resume)
+        _run_pipeline(config, data, run_dir, resume)
         return
     try:
         cfg = RunConfig.from_dict(data)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(f"{config}: {e}")
         return
     from monorl.orchestrator import run
 
@@ -109,10 +152,13 @@ def train(
     except MonorlError as e:
         _fail(str(e))
         return
-    console.print(f"run dir: {result.run_dir}")
+    except OSError as e:  # what a run does not record as its failure: its directory cannot be written
+        _fail(f"cannot write the run directory: {e}")
+        return
+    console.print(f"run dir: {escape(result.run_dir)}")
     console.print(f"state: {result.state}  final step: {result.final_step}")
     if result.error:
-        err_console.print(f"[red]{result.error}[/red]")
+        _print_run_error(result.error, result.run_dir)
     if result.metrics:
         table = Table(title="final metrics", show_lines=False)
         table.add_column("metric")
@@ -121,7 +167,7 @@ def train(
             table.add_row(key, f"{result.metrics[key]:.6g}")
         console.print(table)
     if result.final_model_path:
-        console.print(f"final model: {result.final_model_path}")
+        console.print(f"final model: {escape(result.final_model_path)}")
     raise typer.Exit(EXIT_BY_STATE.get(result.state, 1))
 
 
@@ -143,19 +189,19 @@ def pipeline(
     try:
         data = apply_overrides(load_yaml(config), set_)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(str(e) + _recipe_hint(config))
         return
     if not is_pipeline_payload(data):
         _fail(f"{config} is not a pipeline config (needs top-level `base:` and `stages:`)")
         return
-    _run_pipeline(data, run_dir, resume)
+    _run_pipeline(config, data, run_dir, resume)
 
 
-def _run_pipeline(data: dict[str, Any], run_dir: Path | None, resume: bool) -> None:
+def _run_pipeline(config: Path, data: dict[str, Any], run_dir: Path | None, resume: bool) -> None:
     try:
         cfg = PipelineConfig.from_dict(data)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(f"{config}: {e}")
         return
     from monorl.pipeline import run_pipeline
 
@@ -164,7 +210,10 @@ def _run_pipeline(data: dict[str, Any], run_dir: Path | None, resume: bool) -> N
     except MonorlError as e:
         _fail(str(e))
         return
-    console.print(f"pipeline dir: {result.run_dir}")
+    except OSError as e:  # what a pipeline does not record as its failure: its directory cannot be written
+        _fail(f"cannot write the pipeline directory: {e}")
+        return
+    console.print(f"pipeline dir: {escape(result.run_dir)}")
     table = Table(title="stages", show_lines=False)
     table.add_column("#", justify="right")
     table.add_column("name")
@@ -173,14 +222,18 @@ def _run_pipeline(data: dict[str, Any], run_dir: Path | None, resume: bool) -> N
     table.add_column("step", justify="right")
     for stage in result.stages:
         table.add_row(
-            str(stage["index"] + 1), stage["name"], stage["type"], stage["state"], str(stage.get("step", 0))
+            str(stage["index"] + 1),
+            escape(stage["name"]),
+            stage["type"],
+            stage["state"],
+            str(stage.get("step", 0)),
         )
     console.print(table)
     console.print(f"state: {result.state}")
     if result.error:
-        err_console.print(f"[red]{result.error}[/red]")
+        _print_run_error(result.error, result.run_dir)
     if result.final_model_path:
-        console.print(f"final model: {result.final_model_path}")
+        console.print(f"final model: {escape(result.final_model_path)}")
     raise typer.Exit(EXIT_BY_STATE.get(result.state, 1))
 
 
@@ -193,14 +246,34 @@ def serve(
     port: int = typer.Option(8000, "--port"),
     open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the UI in a browser."),
     reload: bool = typer.Option(False, "--reload", help="Auto-reload on source changes (development)."),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        help="Access token of the API (default: MONORL_SERVER_TOKEN, else a new random one). "
+        "Prefer the variable: an option shows in the process list.",
+    ),
+    allowed_host: list[str] = typer.Option(
+        [],
+        "--allowed-host",
+        help="Accept this name in the Host header besides localhost, 127.0.0.1 and [::1] "
+        "(repeatable; MONORL_ALLOWED_HOSTS takes a comma-separated list).",
+    ),
 ) -> None:
-    """Start the local web UI + API server."""
+    """Start the local web UI + API server. Every API request needs the access token: open the
+    sign-in URL this prints, or read the token from $MONORL_HOME/server_token."""
     import uvicorn
 
-    url = f"http://{host}:{port}"
-    console.print(f"monorl server at [bold]{url}[/bold]")
+    from monorl.server import auth
+
+    try:
+        token = auth.configure(host, token, allowed_host)
+    except ConfigError as e:
+        _fail(str(e))
+        return
+    for line in auth.startup_lines(host, port, token):
+        console.print(line, markup=False, highlight=False, soft_wrap=True)
     if open_browser:
-        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+        threading.Timer(1.0, webbrowser.open, args=(auth.signin_url(host, port, token),)).start()
     uvicorn.run("monorl.server.app:create_app", factory=True, host=host, port=port, reload=reload)
 
 
@@ -266,7 +339,7 @@ def doctor(as_json: bool = typer.Option(False, "--json", help="Emit the report a
     if report.errors:
         err_console.print("[yellow]warnings:[/yellow]")
         for line in report.errors:
-            err_console.print(f"  - {line}")
+            err_console.print(f"  - {escape(line)}")
 
 
 # -- patches ---------------------------------------------------------------------------------
@@ -306,7 +379,7 @@ def _status_table(framework: str, statuses: list[Any]) -> Table:
             _yes_no(s.applicable),
             _yes_no(s.applied),
             _yes_no(s.verified),
-            s.reason or "",
+            escape(s.reason or ""),
         )
     return table
 
@@ -337,7 +410,13 @@ def patches_status(
     """Show applicability / applied / verified state of patches against installed versions."""
     patching = _patching_module()
     _load_adapters()
-    frameworks = [framework] if framework else patching.registered_frameworks()
+    registered = patching.registered_frameworks()
+    if framework is not None and framework not in registered:
+        _fail(
+            f"no patches are registered for {framework!r}; "
+            f"frameworks with patches: {', '.join(registered) or '(none)'}"
+        )
+    frameworks = [framework] if framework else registered
     if as_json:
         typer.echo(
             json.dumps({fw: [s.to_dict() for s in patching.status(fw)] for fw in frameworks}, indent=2)
@@ -356,7 +435,9 @@ def patches_apply(
     framework: str = typer.Argument(..., help="Framework whose patchset to apply."),
     force: bool = typer.Option(False, "--force", help="Re-apply even if already applied."),
 ) -> None:
-    """Apply the registered patchset for FRAMEWORK to the installed package."""
+    """Apply the patchset of FRAMEWORK in this process and report which patches took. Nothing is
+    written to the installed package: a run applies the patches itself when it builds a component
+    of the framework, so this is a check that they apply to the installed version."""
     patching = _patching_module()
     _load_adapters()
     try:
@@ -368,9 +449,9 @@ def patches_apply(
     for pid in report.applied:
         console.print(f"  [green]applied[/green]  {pid}")
     for pid, reason in report.skipped:
-        console.print(f"  [yellow]skipped[/yellow]  {pid}: {reason}")
+        console.print(f"  [yellow]skipped[/yellow]  {pid}: {escape(reason)}")
     for pid, error in report.failed:
-        console.print(f"  [red]failed[/red]   {pid}: {error}")
+        console.print(f"  [red]failed[/red]   {pid}: {escape(error)}")
     if report.failed:
         raise typer.Exit(1)
 
@@ -381,7 +462,8 @@ def patches_apply(
 @data_app.command("inspect")
 def data_inspect(
     uri: str = typer.Argument(
-        ..., help="Local path, hf://org/name, s3://bucket/key, or the scheme of a --provider's data source."
+        ...,
+        help="Local path, hf://org/name, s3://bucket/key, http(s)://host/file, or the scheme of a --provider's data source.",
     ),
     limit: int = typer.Option(5, "--limit", "-n", min=1, help="Rows / samples to show."),
     split: str | None = typer.Option(None, "--split", help="Split for Hub datasets."),
@@ -421,11 +503,14 @@ def data_inspect(
     if as_json:
         typer.echo(json.dumps({**preview, "samples": samples}, indent=2, default=str))
         return
-    console.print(f"[bold]{uri}[/bold]")
+    console.print(f"[bold]{escape(uri)}[/bold]")
     inferred = preview.get("inferred") or {}
     console.print(
-        "format: {format}  prompt: {prompt_field}  answer: {answer_field}  messages: {messages_field}".format(
-            **{k: inferred.get(k) for k in ("format", "prompt_field", "answer_field", "messages_field")}
+        escape(
+            "format: {format}  prompt: {prompt_field}  answer: {answer_field}  "
+            "messages: {messages_field}".format(
+                **{k: inferred.get(k) for k in ("format", "prompt_field", "answer_field", "messages_field")}
+            )
         )
     )
     if preview.get("num_rows") is not None:
@@ -433,12 +518,12 @@ def data_inspect(
     columns = preview.get("columns") or {}
     table = Table(title="rows")
     for name in columns:
-        table.add_column(f"{name} ({columns[name]})", overflow="fold", max_width=60)
+        table.add_column(escape(f"{name} ({columns[name]})"), overflow="fold", max_width=60)
     for row in preview.get("rows") or []:
-        table.add_row(*(str(row.get(name, ""))[:200] for name in columns))
+        table.add_row(*(escape(str(row.get(name, ""))[:200]) for name in columns))
     console.print(table)
     for s in samples:
-        console.print(f"[bold]sample {s['id']}[/bold] reference={s['reference']!r}")
+        console.print(f"[bold]sample {escape(str(s['id']))}[/bold] reference={escape(repr(s['reference']))}")
         for m in s["messages"]:
             console.print(escape(_message_line(m, 300)))
 
@@ -478,6 +563,8 @@ def env_check(
 
     if bool(command) == bool(url):
         _fail("pass exactly one of --command or --url", code=2)
+    if not timeout > 0:
+        _fail(f"--timeout must be greater than 0 seconds, got {timeout}", code=2)
     try:
         reset_with = check_sample(sample, reference)
     except ValueError as e:
@@ -498,16 +585,18 @@ def env_check(
     if as_json:
         typer.echo(json.dumps(report.to_dict(), indent=2, default=str))
     else:
-        console.print(f"[bold]{report.transport}[/bold] {report.target}")
+        console.print(f"[bold]{report.transport}[/bold] {escape(report.target)}")
         if report.spec:
             spec = report.spec
             console.print(
-                f"spec: name={spec['name']} version={spec['version']} protocol={spec['protocol']} "
-                f"max_turns={spec['max_turns']} parallel_episodes={spec['parallel_episodes']} "
-                f"tools={len(spec.get('tools') or [])}"
+                escape(
+                    f"spec: name={spec['name']} version={spec['version']} protocol={spec['protocol']} "
+                    f"max_turns={spec['max_turns']} parallel_episodes={spec['parallel_episodes']} "
+                    f"tools={len(spec.get('tools') or [])}"
+                )
             )
             if spec.get("description"):
-                console.print(f"  {spec['description']}")
+                console.print(escape(f"  {spec['description']}"))
         if report.health is not None:
             console.print("health: ok")
         if report.reset_messages:
@@ -516,12 +605,14 @@ def env_check(
                 console.print(escape(_message_line(m, 200)))
         for s in report.steps:
             console.print(
-                f"step {s.turn}: reward={s.reward} done={s.done} messages={len(s.messages)} info={s.info}"
+                escape(
+                    f"step {s.turn}: reward={s.reward} done={s.done} messages={len(s.messages)} info={s.info}"
+                )
             )
         if report.closed:
             console.print("close: ok")
         if report.error:
-            err_console.print(f"[bold red]protocol error:[/bold red] {report.error}")
+            err_console.print(f"[bold red]protocol error:[/bold red] {escape(report.error)}")
         else:
             console.print("[green]MEP/1 conformance: OK[/green]")
     if not report.ok:
@@ -541,13 +632,33 @@ def env_serve(
         None, "--param", "-p", help="env.params override key=value (repeatable)."
     ),
     parallel: int = typer.Option(8, "--parallel", min=1, help="Concurrent episodes the server accepts."),
+    allowed_host: list[str] | None = typer.Option(
+        None,
+        "--allowed-host",
+        help=(
+            "With --transport http: a DNS name clients may address the server by, besides localhost "
+            "and its IP addresses (repeatable; '*' accepts any). Needed when other machines reach "
+            "the server under a name, as in http://env-1:8080."
+        ),
+    ),
 ) -> None:
     """Expose a Python environment as a MEP/1 server (stdio or http)."""
     if transport not in ("stdio", "http"):
         _fail("--transport must be stdio or http", code=2)
+    if allowed_host and transport != "http":
+        _fail("--allowed-host applies to --transport http; the stdio transport has no Host names", code=2)
     from monorl.core.registry import ensure_providers, registry
+    from monorl.envs.server import allowed_host_names
     from monorl.envs.server import serve as serve_env
 
+    for item in param or []:
+        key, eq, _ = item.partition("=")
+        if not eq or not all(key.strip().split(".")):
+            _fail(f"--param must look like key=value, got {item!r}", code=2)
+    try:
+        allowed_host_names(allowed_host or ())
+    except ValueError as e:
+        _fail(f"--allowed-host: {e}", code=2)
     try:
         if config is not None:
             data = load_yaml(config)
@@ -573,6 +684,7 @@ def env_serve(
         port=port,
         name=env_type,
         parallel_episodes=parallel,
+        allowed_hosts=allowed_host or (),
     )
 
 
@@ -622,7 +734,7 @@ def recipes_list(as_json: bool = typer.Option(False, "--json")) -> None:
     table.add_column("kind")
     table.add_column("description", overflow="fold")
     for r in recipes:
-        table.add_row(r.name, r.kind, r.description)
+        table.add_row(escape(r.name), r.kind, escape(r.description))
     console.print(table)
 
 
@@ -649,7 +761,7 @@ def recipes_show(
                     "name": recipe.name,
                     "description": recipe.description,
                     "kind": kind,
-                    "config": cfg.to_dict(),
+                    "config": mask_secrets(cfg.to_dict()),
                 },
                 indent=2,
             )

@@ -21,6 +21,11 @@ const maxBody = 64 << 20
 //
 // Errors are JSON envelopes with the status carried by *Error (400 invalid request,
 // 404 unknown episode/route, 405 wrong method, 500 env error).
+//
+// The handler is for environment clients, not for browsers. A page open in a browser on the
+// machine of the server can send requests to it, so the ones a page can send are refused
+// before any route: a request with an Origin header (403 forbidden) and a POST whose
+// Content-Type is not application/json (415 unsupported_media_type).
 func NewHTTPHandler(h *Handler) http.Handler {
 	return &httpHandler{h: h}
 }
@@ -29,7 +34,38 @@ type httpHandler struct {
 	h *Handler
 }
 
+// refusal is the error for a request that a web page can send, nil for any other. Browsers add
+// Origin to every request a page sends to another site and to every POST, also to its own
+// site; the body types a page can send to another site without asking first are text/plain
+// and the two form types, never application/json.
+func refusal(r *http.Request) *Error {
+	if _, ok := r.Header["Origin"]; ok {
+		return NewError(ErrTypeForbidden, http.StatusForbidden,
+			"request refused: it carries an Origin header, which browsers add to the requests of web pages; "+
+				"an environment server answers environment clients only. Send the request without Origin "+
+				"(monorl's clients and curl send none)")
+	}
+	if r.Method == http.MethodPost {
+		contentType := r.Header.Get("Content-Type")
+		mediaType, _, _ := strings.Cut(contentType, ";")
+		if !strings.EqualFold(strings.TrimSpace(mediaType), "application/json") {
+			if len(contentType) > 80 {
+				contentType = contentType[:80]
+			}
+			return NewError(ErrTypeUnsupportedMediaType, http.StatusUnsupportedMediaType,
+				"request refused: the body of a POST must be sent with Content-Type: application/json, got %q",
+				contentType)
+		}
+	}
+	return nil
+}
+
 func (s *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if perr := refusal(r); perr != nil {
+		s.h.logger.Printf("%s %s: %s", r.Method, r.URL.Path, perr.Message)
+		writeJSON(w, perr.Status, perr.Envelope())
+		return
+	}
 	op := strings.Trim(r.URL.Path, "/")
 	switch op {
 	case "spec", "health":

@@ -11,6 +11,14 @@ each section.
 Unknown keys are rejected. A key marked "required" has no default. Bounds on numbers are listed
 with the type.
 
+A string of a config file may read the environment: `${NAME}` is replaced with the value of the
+variable `NAME` when the file is loaded, `${NAME:-default}` with `default` when the variable is not
+set, and `${NAME}` of a variable that is not set is an error. Values given with `--set` or sent to
+the API are taken as written. Name a variable that holds a secret with `KEY`, `TOKEN`, `SECRET`,
+`PASSWORD` or `CREDENTIALS` as a word of its name (`OPENAI_API_KEY`, `HF_TOKEN`): the run then
+writes `${NAME}` instead of the value it read from the variable to its directory and to W&B. A
+default is written as it is (see [`config.yaml` in RUNS.md](RUNS.md#configyaml)).
+
 ## Top-level fields
 
 See: [RUNS.md](RUNS.md)
@@ -208,7 +216,7 @@ See: [RUNS.md](RUNS.md)
 
 | Key | Type, default | Description |
 | --- | --- | --- |
-| `logging.run_root` | string; default `~/.monorl/runs` | Directory that holds run directories. |
+| `logging.run_root` | string; default `~/.monorl/runs` | Directory that holds run directories; the default is `runs` under `$MONORL_HOME`. |
 | `logging.log_every` | integer, >= 1; default `1` | Write metrics every this many steps (the last step is always written). |
 | `logging.save_trajectories` | boolean; default `true` | Write sampled rollouts to trajectories.jsonl. |
 | `logging.trajectories_per_step` | integer, >= 0; default `8` | Rollouts saved per logged step at most; 0 saves none. |

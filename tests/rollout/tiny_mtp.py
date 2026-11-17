@@ -7,7 +7,8 @@ them from there.
 
 Mellum checkpoints hold at most one MTP layer. :func:`two_layer_mtp` builds a two-layer
 ``MtpModel`` in memory for the tests of the depth logic, on a policy with tied embeddings (the
-saved model has an output head of its own).
+saved model has an output head of its own); :func:`mtp_layers_on` builds one of any depth on a
+policy that exists.
 """
 
 from __future__ import annotations
@@ -120,22 +121,29 @@ def two_layer_mtp(*, seed: int = 0, vocab_size: int = 128) -> tuple[Any, Any]:
     memory only."""
     import torch
     from transformers import MellumForCausalLM
-    from transformers.modeling_layers import MtpModel
 
     torch.manual_seed(seed)
     config = tiny_mellum_config(vocab_size, pad_token_id=0, bos_token_id=1, eos_token_id=2)
     model = MellumForCausalLM(config).eval()
     init_parameters(model)
+    return model, mtp_layers_on(model, 2)
+
+
+def mtp_layers_on(model: Any, depth: int) -> Any:
+    """An ``MtpModel`` of ``depth`` random layers on ``model`` (a tiny Mellum), in memory only;
+    the model's config then declares that many."""
+    from transformers.modeling_layers import MtpModel
+
     # Mellum's config validation allows one MTP layer (its checkpoints hold one); the layer
     # classes do not care, and nothing here is saved.
-    config.__dict__.update(
-        num_nextn_predict_layers=2,
-        mtp_layer_types=["sliding_attention"] * 2,
-        mtp_mlp_layer_types=["sparse"] * 2,
+    model.config.__dict__.update(
+        num_nextn_predict_layers=depth,
+        mtp_layer_types=["sliding_attention"] * depth,
+        mtp_mlp_layer_types=["sparse"] * depth,
     )
-    mtp_model = MtpModel(model, 2).eval()
+    mtp_model = MtpModel(model, depth).eval()
     init_parameters(mtp_model.layers)
-    return model, mtp_model
+    return mtp_model
 
 
 def fit_to_greedy(
@@ -156,7 +164,9 @@ def fit_to_greedy(
     examples = []
     with torch.no_grad():
         for prompt in prompts:
-            ids = model.generate(input_ids=torch.tensor([prompt]), generation_config=config)
+            ids = model.generate(
+                input_ids=torch.tensor([prompt], device=layers.device), generation_config=config
+            )
             hidden = layers.last_hidden_states(model(input_ids=ids, **layers.last_hidden_request))
             mask = torch.zeros_like(ids)
             mask[:, len(prompt) :] = 1

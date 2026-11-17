@@ -39,6 +39,7 @@ openenv = ["openenv-core>=0.3.0"]
 hermes = ["hermes-agent>=0.19"]
 rewards = ["math-verify>=0.7"]
 multimodal = ["pillow>=10", "torchvision>=0.20"]
+sinks = ["wandb>=0.31", "tensorboard>=2.20"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",

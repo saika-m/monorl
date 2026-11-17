@@ -15,6 +15,7 @@ hydra-style overrides appended to the command), ``nemo_rl`` (config deep-merge, 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -33,6 +34,7 @@ from monorl.adapters.nemo_rl.patches import ALGORITHM_ENV, RUN_DIR_ENV
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError
 from monorl.core.reporting import CHECKPOINT_DIR, RunReporter, iter_metrics
+from monorl.core.signals import signal_guard
 from monorl.core.types import RunResult, RunState
 
 ENTRY_MODULE = "monorl.adapters.nemo_rl.entry"
@@ -41,6 +43,8 @@ ENTRY_MODULE = "monorl.adapters.nemo_rl.entry"
 STEP_REFRESH_INTERVAL = 5.0
 #: Grace period after SIGTERM before SIGKILL on cancel.
 CANCEL_GRACE_SECONDS = 30.0
+#: Seconds between two looks of the thread that cancels the child once a signal asked for it.
+CANCEL_POLL_SECONDS = 0.05
 
 
 def nemo_rl_home(config: RunConfig) -> Path:
@@ -134,6 +138,17 @@ def final_model_path(checkpoints: list[str]) -> str | None:
     return None
 
 
+def resume_step(run_dir: Path) -> int:
+    """The step NeMo-RL continues after in ``run_dir``; 0 when it starts at step 0. Every algorithm
+    (``nemo_rl/algorithms/grpo.py``, ``sft.py``) sets itself up from
+    ``CheckpointManager.get_latest_checkpoint_path()`` (``nemo_rl/utils/checkpoint.py``): the
+    ``step_<n>`` with the largest ``n`` in ``checkpointing.checkpoint_dir``, whenever there is one.
+    No key of its config turns that off. A checkpoint is written as ``tmp_step_<n>`` and renamed,
+    so a ``step_<n>`` is complete."""
+    names = (p.name for p in (run_dir / CHECKPOINT_DIR).glob("step_*"))
+    return max((int(name[5:]) for name in names if re.fullmatch(r"step_\d+", name)), default=0)
+
+
 def latest_step(run_dir: Path) -> int:
     step = 0
     for _, row in iter_metrics(run_dir):
@@ -175,10 +190,38 @@ class NemoRLBackend:
             _signal_group(proc, signal.SIGKILL)
 
     # -- run -----------------------------------------------------------------------------
-    def run(self, config: RunConfig, run_dir: Path, *, reporter: RunReporter) -> RunResult:
+    def run(
+        self,
+        config: RunConfig,
+        run_dir: Path,
+        *,
+        reporter: RunReporter,
+        resume: bool = False,
+        cancel: threading.Event | None = None,
+    ) -> RunResult:
+        """``cancel`` is the event that the first SIGINT or SIGTERM sets. Set while the run is
+        being prepared, it ends the run before the child is started. While the child runs the
+        backend handles the two signals with it (on the main thread; with an event of its own
+        when it is given none): the first makes it :meth:`cancel` the child, a second one kills
+        the child's process group (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
         run_dir = Path(run_dir).expanduser().resolve()
         home = nemo_rl_home(config)
         self._cancelled.clear()
+        step = resume_step(run_dir)
+        if resume:
+            reporter.log(
+                f"NeMo-RL continues after step {step}, from {run_dir / CHECKPOINT_DIR / f'step_{step}'}"
+                if step
+                else "resume requested but NeMo-RL has no checkpoint to continue from; it starts from step 0"
+            )
+            reporter.drop_rows_after(step)
+        elif step:
+            raise ConfigError(
+                f"{run_dir / CHECKPOINT_DIR} holds NeMo-RL checkpoints up to step_{step}, and NeMo-RL "
+                "continues from the newest checkpoint of its checkpoint directory whenever there is one: "
+                "it cannot start this run at step 0 there. Pass --resume to continue that run, or start "
+                "this one in another run directory (--run-dir, or another run_name)."
+            )
         reporter.set_status("pending", "compiling NeMo-RL config")
         exported = export_dataset(config, run_dir, tokenizer=_load_tokenizer(config, reporter))
         write_bridge_module(run_dir)
@@ -190,6 +233,17 @@ class NemoRLBackend:
         )
         cmd = build_command(config, home, yaml_path, run_dir)
         env = build_env(config, home, run_dir)
+        stop = cancel if cancel is not None else threading.Event()
+        if stop.is_set():
+            # Asked to stop while the run was being prepared: there is no child to stop yet.
+            step = latest_step(run_dir)
+            reporter.set_status("cancelled", "cancelled before NeMo-RL was started", step=step)
+            return RunResult(
+                state="cancelled",
+                final_step=step,
+                run_dir=str(run_dir),
+                checkpoints=list_checkpoints(run_dir),
+            )
         reporter.log(f"launching (cwd={home}): {shlex.join(cmd)}")
 
         proc = subprocess.Popen(
@@ -206,16 +260,36 @@ class NemoRLBackend:
             self._proc = proc
         reporter.set_status("running", "NeMo-RL training started", child_pid=proc.pid, backend=self.name)
 
-        with _signal_handlers(self._on_signal):
-            self._stream(proc, reporter)
+        # The first signal only sets an event. Its handler runs on the main thread, which copies
+        # the child's output: stopping the child (SIGTERM, a wait, SIGKILL) is left to a thread,
+        # so that the output is still copied while the child shuts down.
+        interrupted, finished = False, threading.Event()
+        canceller = threading.Thread(
+            target=self._cancel_when, args=(stop, finished), name="monorl-nemo-rl-cancel", daemon=True
+        )
+        canceller.start()
+        try:
+            with signal_guard(stop, reporter, "stopping NeMo-RL"):
+                self._stream(proc, reporter)
+                returncode = proc.wait()
+        except BaseException as e:
+            # The second signal, or a failure of the copying: the child does not outlive the run.
+            _signal_group(proc, signal.SIGKILL)
             returncode = proc.wait()
+            if not isinstance(e, KeyboardInterrupt):
+                raise
+            interrupted = True
+        finally:
+            finished.set()
+            canceller.join()
 
         checkpoints = list_checkpoints(run_dir)
         step = latest_step(run_dir)
         state: RunState
         error: str | None = None
-        if self.cancelled:
+        if interrupted or self.cancelled:
             state, message = "cancelled", "cancelled by user"
+            error = "interrupted" if interrupted else None
         elif returncode == 0:
             state, message = "succeeded", f"NeMo-RL finished at step {step}"
         else:
@@ -233,8 +307,12 @@ class NemoRLBackend:
             error=error,
         )
 
-    def _on_signal(self, signum: int, _frame: Any) -> None:
-        self.cancel()
+    def _cancel_when(self, requested: threading.Event, finished: threading.Event) -> None:
+        """:meth:`cancel` once ``requested`` is set, unless the run has ``finished`` before."""
+        while not finished.is_set():
+            if requested.wait(CANCEL_POLL_SECONDS):
+                self.cancel()
+                return
 
     def _stream(self, proc: subprocess.Popen[str], reporter: RunReporter) -> None:
         assert proc.stdout is not None
@@ -261,25 +339,6 @@ def _signal_group(proc: subprocess.Popen[str], sig: signal.Signals) -> None:
             proc.send_signal(sig)
         except (ProcessLookupError, OSError):
             pass
-
-
-class _signal_handlers:
-    """Install ``handler`` for SIGTERM/SIGINT while active (main thread only) and restore after."""
-
-    def __init__(self, handler: Any) -> None:
-        self.handler = handler
-        self._previous: dict[int, Any] = {}
-
-    def __enter__(self) -> None:
-        if threading.current_thread() is not threading.main_thread():
-            return
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            self._previous[sig] = signal.signal(sig, self.handler)
-
-    def __exit__(self, *exc: Any) -> None:
-        for sig, previous in self._previous.items():
-            signal.signal(sig, previous)
-        self._previous.clear()
 
 
 def _load_tokenizer(config: RunConfig, reporter: RunReporter) -> Any:
@@ -313,4 +372,5 @@ __all__ = [
     "make_backend",
     "monorl_src_root",
     "nemo_rl_home",
+    "resume_step",
 ]

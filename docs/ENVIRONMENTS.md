@@ -62,7 +62,7 @@ batched by arrival.
 | `env.max_turns` | `1` | turn limit, as described above |
 | `env.retries` | `0` | times a failed episode is restarted with a fresh environment |
 | `env.max_failed_frac` | `0.0` | share of a rollout batch that may fail for good and be left out; above it, and always at `0`, a failed episode fails the run |
-| `env.params` | `{}` | parameters of the chosen type |
+| `env.params` | `{}` | parameters of the chosen type; a built-in type refuses a key it does not take |
 
 With `env.max_failed_frac > 0` a run reports `rollout/failed_episodes`, `rollout/failed_frac` and
 `rollout/groups_incomplete`. The schema rejects `env.max_failed_frac > 0` for `trainer.backend`
@@ -85,11 +85,22 @@ and `nemo_rl` ([BACKENDS.md](BACKENDS.md)), and any type but `single_turn` for
 gateway; it is not stepped but runs the whole episode itself (`EpisodeDriver.run_episode`).
 `remote` drives a server over stdio or http ([Python server](#serving-and-checking-it-over-mep1)).
 
+Each of these types reads the `env.params` keys of its table (`harness`: the table in
+[GATEWAY.md](GATEWAY.md), section 3) and refuses any other when the config is validated, before
+a model is loaded. `env.params.max_turn` with `env.type: tool_calling` is reported as
+`unknown key; did you mean max_turns?`, followed by the keys the type takes. A value a type
+cannot run with (a tool that does not exist, a `remote` without `command` or `url`) is a
+`ConfigError` when the environment is built. A type of your own
+([below](#writing-an-environment-in-python)) takes the `env.params` it likes.
+
 ## `single_turn`
 
 `reset` returns the sample's messages and `step` ends the episode with reward 0, so at least one
-entry in `rewards:` is required. One parameter: `env.params.system_prompt` (default
-`data.system_prompt`), inserted first when the sample has no `system` message; others are ignored.
+entry in `rewards:` is required.
+
+| `env.params` key | Default | Meaning |
+|---|---|---|
+| `system_prompt` | `data.system_prompt` | inserted first when the sample has no `system` message |
 
 ## `tool_calling`
 
@@ -104,12 +115,26 @@ tool schemas are also passed to the chat template as `tools`.
   `sin`, `cos`, `tan`, `floor`, `ceil`, `pi` and `e`. An exponent above 1000 in absolute value, or
   anything else (names, attributes, strings), returns `error: ...`.
 - `python_exec` (argument `code`) runs `sys.executable -I -c <code>`: the interpreter that runs
-  monorl, in isolated mode (no `PYTHON*` variables, no user site), with an environment of only
-  `PATH`, `PYTHONHASHSEED=0` and `PYTHONDONTWRITEBYTECODE=1`, stdin from `/dev/null` and the
-  system temp directory as working directory. It is killed after `python_timeout_s` seconds of
-  wall-clock time (`error: execution timed out after 5.0s`). The result is stdout, then `stderr:`
-  and `exit code: N` when present, or `(no output)`. This is not a sandbox: the code runs as your
-  user with file system, network and installed packages, and has no memory or CPU limit.
+  monorl, with `-I` (no `PYTHON*` variables, no user site), stdin from `/dev/null` and an
+  environment of only `PATH`, `HOME`, `TMPDIR`, `PYTHONHASHSEED=0` and
+  `PYTHONDONTWRITEBYTECODE=1`. Every call gets a new directory as its working directory, `HOME`
+  and `TMPDIR`, deleted when the call returns, and a process group of its own. The group is
+  killed when the program ends (so a process it started and left running ends with it), after
+  `python_timeout_s` seconds of wall-clock time (`error: execution timed out after 5.0s`), or
+  when the resident memory of the program and the processes it started passes
+  `python_memory_mb` (`error: execution used more than the memory limit of 512 MB`). The memory
+  is read every 20 ms, that of started processes every 250 ms, so a fast allocation passes the
+  limit for that long. The result is stdout, then `stderr:` and `exit code: N` when present, or
+  `(no output)`.
+
+  These limits clean up after a program; they do not confine it. What the policy writes runs
+  on the machine that runs the environment, as the user who runs it: it reads and writes that
+  user's files by absolute path, uses the network and the installed packages, has no CPU limit,
+  and a program that starts a session of its own (`os.setsid()`) leaves the process group and
+  can outlive the call. Offer `python_exec` only where that user may run whatever the policy
+  writes, for example in a container or a virtual machine made for the run. `tools` left unset
+  includes `python_exec`; list the tools (`tools: [calculator, lookup]`) to leave it out.
+  Episodes in Docker containers are what `env.type: harness` has ([SANDBOX.md](SANDBOX.md)).
 - `lookup` (argument `query`) returns the `env.params.corpus` value of an exact key match,
   otherwise up to `lookup_max_results` lines `key: value` whose key or value contains the query
   (case-insensitive), otherwise `no results for '<query>'`.
@@ -135,6 +160,7 @@ not counted as an invalid call. Two call syntaxes are accepted:
 | `max_calls_per_turn` | `8` | calls executed per turn; more are ignored and make the turn invalid |
 | `max_turns` | `4` | turn limit when `env.max_turns` is not set |
 | `python_timeout_s` | `5.0` | `python_exec` timeout |
+| `python_memory_mb` | `512` | `python_exec` memory limit in MB; `0` for none |
 | `max_tool_output_chars` | `4000` | cap on a built-in tool's result (custom tools: always 4000) |
 | `corpus` | `{}` | mapping searched by `lookup` |
 | `lookup_max_results` | `3` | lines returned by a `lookup` substring search |
@@ -197,6 +223,26 @@ $ PYTHONPATH=$DEMO .venv/bin/python $DEMO/drive_tools.py
 0.0 True []
 ```
 
+## `remote`
+
+The client of an environment server that speaks MEP/1. [ENV_SDK.md](ENV_SDK.md) has the protocol,
+the SDKs and how the number of parallel episodes is chosen. The turn limit is `env.max_turns` if
+set, else the server's.
+
+| `env.params` key | Default | Meaning |
+|---|---|---|
+| `transport` | `stdio` | `stdio`: monorl starts the server and talks to it over its stdin and stdout. `http`: a server that is already running |
+| `command` | required for `stdio` | argv list of the server |
+| `cwd`, `env` | none | `stdio`: working directory of the server process; environment variables added to monorl's own for it |
+| `url` | required for `http` | address of the server |
+| `urls` | none | `http`: addresses of identical replicas, in place of `url`; an episode stays on one of them |
+| `headers` | none | `http`: headers sent with every request |
+| `parallel` | the server's `spec.parallel_episodes` | episodes open at a time on one process or server |
+| `timeout_s` | `60.0` | seconds a request may take |
+| `max_response_bytes` | `67108864` | a response larger than this is not read to its end and fails the episode |
+
+Not run for this section: the table was compared with `src/monorl/envs/remote.py`.
+
 ## `openenv` and `hermes`
 
 Both need an optional dependency (extras `openenv` and `hermes` in `pyproject.toml`), else the
@@ -218,6 +264,7 @@ completion becomes the action, reward and `done` come from the OpenEnv step (a m
 | `action_mode` | `text` | `text`: the action is `{action_field: <completion text>}`. `json`: the completion must contain a JSON object (fenced or bare), which is the action |
 | `action_field` | `text` | field name used in `text` mode |
 | `observation_template` | none | `str.format` template over the observation fields (missing ones are empty). Unset: the value of a lone string field, else the observation as JSON |
+| `observation_to_text` | none | a second name of `observation_template`, read when that is unset |
 | `system_prompt` | `data.system_prompt` | first message |
 | `invalid_action_penalty` | `0.0` | `json` mode: cost of a completion without a JSON object |
 | `reset_kwargs`, `seed` | `{}`, none | extra arguments of `reset` |
@@ -378,6 +425,32 @@ of the `--config` file are loaded, so it serves your types too. Checked here ove
 `monorl env serve tool_calling --transport http --port 18473 --param 'tools=[calculator]'` and
 `monorl env serve guess --config serve.yaml --transport http --port 18474` (a config with the
 three keys above), each followed by `monorl env check --url http://127.0.0.1:<port>`.
+
+The http transport answers environment clients, not browsers. A page open in a browser on the
+same machine can send requests to `127.0.0.1`, so the server refuses the ones a page can make:
+
+| Request | Answer |
+|---|---|
+| `Host` is a name other than `localhost` and the `--allowed-host` names | 403, error type `forbidden` |
+| it has an `Origin` header | 403, error type `forbidden` |
+| `POST` whose `Content-Type` is not `application/json` | 415, error type `unsupported_media_type` |
+
+monorl's clients (`env.type: remote`, `monorl env check`, `monorl bench env`) send none of these,
+and neither does `curl` with `-H 'Content-Type: application/json'`. The refusal is a MEP/1 error
+envelope whose message names what was refused, and the server logs it.
+
+The `Host` check is about names: a page whose domain was pointed at `127.0.0.1` after it loaded
+sends that domain as `Host`, never an address. A `Host` that is an IP address is therefore always
+answered, and a run that addresses the server as `http://10.0.0.5:8080` needs nothing. A server
+that other machines reach under a DNS name needs the name they use in the environment's `url`:
+started with `--host 0.0.0.0 --allowed-host env-1` it answers `http://env-1:8080` (repeat the
+option for more names; in a script, `serve(..., allowed_hosts=["env-1"])`).
+`--allowed-host '*'` accepts every `Host`, for a server behind a proxy that rewrites it; the
+other two checks have no switch. These checks are not authentication: whoever can connect and
+sends a well-formed request is served, so a server on `0.0.0.0` belongs on a network where only
+your runs reach it. Checked here on `127.0.0.1`: the first server above with
+`--allowed-host env-1` added answers `curl -H 'Host: env-1:8080' http://127.0.0.1:18473/health`
+with `{"ok":true}`, and with 403 without the option. `--host 0.0.0.0` was not run.
 
 ### When to use another language
 

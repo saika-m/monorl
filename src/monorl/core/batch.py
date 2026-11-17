@@ -120,6 +120,42 @@ class TrainBatch:
             extra={k: _slice_extra(v, start, stop) for k, v in self.extra.items()},
         )
 
+    def select(self, rows: torch.Tensor) -> TrainBatch:
+        """The sequences at ``rows`` (1-D indices along the batch dimension), in that order;
+        everything :meth:`slice` cuts is gathered."""
+        index = rows.tolist()
+
+        def take(t: torch.Tensor | None) -> torch.Tensor | None:
+            return None if t is None else t[rows]
+
+        def take_extra(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value[rows]
+            if isinstance(value, list):
+                return [value[i] for i in index]
+            return value
+
+        return TrainBatch(
+            input_ids=self.input_ids[rows],
+            attention_mask=self.attention_mask[rows],
+            response_mask=self.response_mask[rows],
+            advantages=self.advantages[rows],
+            rewards=self.rewards[rows],
+            group_ids=[self.group_ids[i] for i in index],
+            old_logprobs=take(self.old_logprobs),
+            ref_logprobs=take(self.ref_logprobs),
+            position_ids=take(self.position_ids),
+            loss_weights=take(self.loss_weights),
+            behavior_logprobs=take(self.behavior_logprobs),
+            behavior_top_ids=take(self.behavior_top_ids),
+            behavior_top_logprobs=take(self.behavior_top_logprobs),
+            values=take(self.values),
+            returns=take(self.returns),
+            value_mask=take(self.value_mask),
+            meta=dict(self.meta),
+            extra={k: take_extra(v) for k, v in self.extra.items()},
+        )
+
     def narrow(self, width: int) -> TrainBatch:
         """The first ``width`` positions of every sequence: all ``[B, T, ...]`` tensors cut along
         ``T``, ``extra`` tensors included when their second dimension is ``T``. The batch itself

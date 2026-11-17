@@ -65,8 +65,10 @@ class UnsupportedTask(DataError):
 
 def find_task_dirs(path: str) -> list[Path]:
     """The task directories ``path`` names — a task directory, a directory whose children are
-    task directories, or a glob matching either — sorted; empty when it names none."""
-    matches = sorted(glob.glob(path)) if any(ch in path for ch in "*?[") else [path]
+    task directories, or a glob matching either — sorted; empty when it names none. A path that
+    exists is not read as a glob."""
+    is_glob = any(ch in path for ch in "*?[") and not Path(path).exists()
+    matches = sorted(glob.glob(path)) if is_glob else [path]
     found: list[Path] = []
     for match in map(Path, matches):
         if not match.is_dir():

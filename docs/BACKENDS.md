@@ -25,7 +25,7 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 | OpenEnv | 0.3.0 | environment | `env.type: openenv` |
 | Hermes Agent | 0.19.0 | environment | `env.type: hermes` |
 | Go / C++ / any (MEP/1) | – | environment | `env.type: remote` |
-| Ray | 2.59 | placement / worker groups | `cluster.mode: ray` |
+| Ray | 2.60 | placement / worker groups | `cluster.mode: ray` |
 
 | Framework | Runs here on CPU | Modes |
 |---|---|---|
@@ -48,7 +48,7 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 | reference trainer (torch) | – |
 | vLLM | worker extension `monorl_update_weights` / `monorl_load_weights_from_path` via `collective_rpc` (vLLM's `GPUWorker` already owns `update_weights`), per-token logprob extraction, `SamplingParams` mapping, `sleep(level)`/`wake_up` journaling, `/monorl/update_weights` + `/load_weights_from_path` mounted on the API server |
 | SGLang | `sglang.logprob_floats` (float/int coercion in `TokenizerManager.detokenize_logprob_tokens`), `sglang.seeded_parallel_sampling` (`Engine.generate` with `sampling_seed` + `n>1` gets one seed per sample), `sglang.release_memory_guard` / `sglang.resume_memory_guard` (no-op without CUDA or `enable_memory_saver`), `sglang.update_weights_named_tensors` (dict/generator inputs, contiguous detached tensors) |
-| Unsloth | `FastLanguageModel` inside the reference loop; `unsloth.trl.*` patches reconcile Unsloth's TRL rewrites with monorl's TRL patchset. **Pin conflict:** declares `trl<=1.15.0`, `transformers<=5.17.0` vs monorl's trl 1.17.1 / transformers 5.22 — see below |
+| Unsloth | `FastLanguageModel` inside the reference loop; `unsloth.trl.*` patches reconcile Unsloth's TRL rewrites with monorl's TRL patchset. **Pin conflict:** declares `trl<=1.15.0`, `transformers<=5.17.0` vs monorl's trl 1.17.1 / transformers 5.23; see below |
 | TRL | `GRPOTrainer` reporter hook → `metrics.jsonl`/`status.json`; env rollouts in place of plain generation |
 | verl | reward manager → monorl rewards; dataset → monorl data source; `python -m monorl.adapters.verl.entry` runs `main_ppo` with the compiled Hydra tree and applies the `Tracking` metrics patch inside the Ray actor |
 | NeMo-RL | `monorl.adapters.nemo_rl.env_actor.MonorlEnvironment` (`EnvironmentInterface`) bridge to monorl envs; reward bridge; config compiled to `<run_dir>/nemo_rl/nemo_rl.yaml` |
@@ -77,8 +77,9 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
   `VLLM_SERVER_DEV_MODE=1` (vLLM's own `/sleep`, `/wake_up`, `/is_sleeping`,
   `/reset_prefix_cache`) plus monorl's `/monorl/update_weights` (many tensors per request, raw
   bytes, at most `rollout.extra.weight_request_bytes` of them, default 64 MiB) and
-  `/load_weights_from_path`. Image prompts are one chat request each, in flight together; an
-  image is encoded to a data URL once per run (`rollout.extra.image_cache_bytes`).
+  `/load_weights_from_path`. Image prompts are one chat request each, in flight together with
+  the call's completion requests; an image is encoded to a data URL once per run
+  (`rollout.extra.image_cache_bytes`).
 * `sglang` — `sglang.srt.entrypoints.engine.Engine` (colocate, default) or an httpx client for
   `sglang.launch_server` (`rollout.extra.mode: server`, `url`/`urls`) using `/generate` and
   `/update_weights_from_tensor`; the tensor route only works when trainer and server share a host
@@ -149,6 +150,14 @@ Chat prompts with `{"type": "image", ...}` parts (`data.image_field`, see `docs/
 | `vllm` / server | `POST /v1/chat/completions` with `image_url` data-URL parts, `logprobs=true, top_logprobs=0`, `return_token_ids=true`; one request per prompt (`n` choices). The chat endpoint's logprob entries carry token *strings*, so ids come from `choices[i].token_ids` and the prompt ids from the response-level `prompt_token_ids` (rendered by the server's chat template) | server `prompt_token_ids` |
 | `sglang` / colocate | `Engine.async_generate(input_ids=<processor ids>, image_data=[[PIL…] or None per request])` run on the engine's loop; sglang's multimodal processor decodes the ids, re-expands the image placeholders and returns the final ids | processor chat template |
 | `sglang` / server | `POST /generate` with `image_data` = per-request lists of `data:image/png;base64,…` URLs (sglang `load_image`) | processor chat template |
+
+In vLLM server mode all the requests of a `generate` call are in flight together: one
+`/v1/completions` request per distinct cap and one chat request per image prompt. The
+completions come back in the order of the prompts, and every request has the body it has when
+it is sent alone. A request that fails drops the others before the call raises its error,
+`cancel()` disconnects all of them, and weight updates and sleep wait for the call. The client
+builds the body of every request before it sends any, so its memory grows with the batch;
+httpx's pool (100 connections by default) bounds how many reach the server at a time.
 
 Text-only models never load a processor (`load_processor` decides from the HF config); a VLM
 prompt against a text-only model is a `ConfigError`. Audio/video parts are not forwarded by the
@@ -249,7 +258,10 @@ Hydra and NeMo-RL yaml, `GRPOConfig` kwargs for TRL).
   single-turn completions and never step it; `rollout.stop` has no verl equivalent and is
   ignored; `rollout.backend: hf` falls back to vLLM (verl only has `vllm`/`sglang`); the
   per-reward breakdown is only available in
-  verl's `reward_extra_info` (the scalar `score` is the reward). `trainer.extra` keys are
+  verl's `reward_extra_info` (the scalar `score` is the reward). A secret that the config read
+  from an environment variable is `${NAME}` in `monorl_reward.py` and `config.yaml`, and verl's
+  reward workers resolve it themselves: set the variable on every node of the Ray cluster
+  ([RUNS.md](RUNS.md#configyaml)). `trainer.extra` keys are
   deep-merged into the Hydra tree, except `verl_python`, which picks the interpreter that runs
   the entry (default: the current one).
   Multimodal: the parquet follows `examples/data_preprocess/geo3k.py` — message content keeps
@@ -289,6 +301,129 @@ Hydra and NeMo-RL yaml, `GRPOConfig` kwargs for TRL).
   `trainer.extra`: `nemo_rl` (yaml overrides, deep-merged last so they win over everything the
   compiler derived), `nemo_rl_overrides` (hydra-style list), `nemo_rl_launcher` (`uv`|`python`),
   `nemo_rl_python`, `dtensor: {...}`, `megatron: {enabled: true, ...}` (Megatron policy config).
+
+### Resume with a pipeline backend
+
+`monorl train --resume` reaches the backend (`PipelineBackend.run(..., resume=True)`). The backend
+continues from the newest checkpoint its framework can load, and first takes `metrics.jsonl` and
+`trajectories.jsonl` back to the step of that checkpoint, as the loops do
+([RUNS.md](RUNS.md#the-record-files-after-a-resume)): rows of later steps and an unfinished last
+line are removed, because the framework writes those steps again. Without a checkpoint the run
+starts at step 0 and `run.log` says so. Without `--resume` no backend continues an earlier run.
+
+* **TRL.** `--resume` gives `Trainer.train(resume_from_checkpoint=...)` the newest
+  `checkpoints/checkpoint-<n>` whose `trainer_state.json` can be read. `Trainer` writes that file
+  last, so a checkpoint that a killed run left half-written is passed over. The trainer restores
+  the weights, the optimizer, the scheduler, its state and the random generators of the process.
+  Without `--resume` training starts at step 0, and a `checkpoint-<n>` that is there is written
+  over when its step is saved.
+  Run here on CPU: `trl_grpo_cpu.yaml` with `trainer.max_steps=4`, `trainer.save_every=2`,
+  `data.limit=8`, `rollout.max_new_tokens=24`, `trainer.learning_rate=1e-4` and the `length`
+  reward (`unit: chars, max_tokens: 100, penalty_per_token: 0.01`), once to the end, once with
+  `trainer.max_steps=2` followed by `--resume` to 4, and once killed with `kill -9` when
+  `metrics.jsonl` had the row of step 3 and resumed. In all three the rows of steps 1 to 4 were
+  the same apart from the wall-clock fields (`time`, `trl/step_time`), the 32 trajectory rows were
+  the same, and `final/model.safetensors` was identical in all 134,515,008 values. The resume of
+  the killed run removed 1 line of `metrics.jsonl` and 8 of `trajectories.jsonl` (TRL samples the
+  episodes of a step before it trains on them). The same finished directory started again without
+  `--resume` and with another learning rate trained its 4 steps with that rate.
+  What is not the uninterrupted run:
+  - The row `Trainer` logs when training ends holds `trl/train_loss`, which it averages over the
+    steps of the process: 0.00474 after the resume, 0.00358 for the run to the end. A run that
+    ended at step 2 and is resumed with a larger `trainer.max_steps` keeps its row of that kind.
+  - A checkpoint past the first pass over the dataset. `GRPOTrainer`'s sampler draws the prompt
+    order of every pass from a generator of its own, seeded when the sampler is built, and a
+    resumed `Trainer` starts at the pass of its checkpoint without the draws of the passes before
+    it. With `data.limit=4` (2 steps are one pass) the run resumed from step 2 trained steps 3
+    and 4 on the prompt order of steps 1 and 2, and its final weights differed from those of the
+    run to the end in 133,501,909 values (largest difference 3.1e-4).
+  - `algorithm.name: sft` on this backend was not run with `--resume`.
+* **verl.** `--resume` compiles `trainer.resume_mode: auto`, a run without it `disable`. At the
+  pin (`_load_checkpoint` in `verl/trainer/ppo/ray_trainer.py` and `v1/trainer_base.py`,
+  `_determine_resume_path` in `verl/utils/checkpoint/checkpoint_handler.py` for SFT) `auto` loads
+  the `global_step_<n>` that `checkpoints/latest_checkpointed_iteration.txt` names (actor, critic,
+  dataloader state) and continues with step `n + 1`, or trains from scratch when the marker or the
+  directory is missing; `disable` loads nothing. The marker is written when the checkpoint is
+  complete, and the backend takes the record files back to its step. PPO saves the checkpoint of
+  a step before it logs the step, so a run killed in between has no row of that step. Not run
+  here (no GPU): the tests use a stand-in entry that follows these rules. How closely a resumed
+  verl run repeats the run it resumes was not looked at.
+* **NeMo-RL.** It has no setting for this. Every algorithm sets itself up from
+  `CheckpointManager.get_latest_checkpoint_path()` (`nemo_rl/utils/checkpoint.py`, called in
+  `nemo_rl/algorithms/grpo.py` and `sft.py` at the pin): the `step_<n>` with the largest `n` in
+  `checkpointing.checkpoint_dir`, whenever there is one. So `--resume` is what NeMo-RL does in a
+  directory with checkpoints, with the record files taken back to step `n` first. A run without
+  `--resume` in such a directory is refused with a `ConfigError` before anything is launched,
+  because NeMo-RL cannot start at step 0 there: pass `--resume`, or use another run directory.
+  NeMo-RL renames a finished checkpoint from `tmp_step_<n>`, and writes it before the `train` row
+  of step `n`, so a run killed in between has no such row. Not run here: the tests use the fake
+  checkout, whose training script continues after the newest `step_<n>` as NeMo-RL does.
+
+### Signals with a pipeline backend
+
+[RUNS.md](RUNS.md#cancelling) says what SIGINT and SIGTERM do in a run: the first ends it after
+the step in flight, with a checkpoint of that step, and a second one stops it at once. `run()`
+gives the backend the event that the first signal sets (`PipelineBackend.run(..., cancel=event)`).
+
+* **TRL** trains in the process of `monorl train` and does the same. A callback reads the event at
+  the end of every step. Once it is set, `Trainer` logs that step and saves
+  `checkpoints/checkpoint-<n>` (`step-<n>`), whatever `logging.log_every` and `trainer.save_every`
+  are, and leaves its loop. `final/` is not written, the state is `cancelled`, the exit code 130,
+  and `--resume` continues from that checkpoint. A signal in the last step leaves nothing to
+  cancel and the run ends `succeeded`. A signal that arrives before step 1 has ended, also while
+  the model is loading, ends the run after step 1. A second signal raises `KeyboardInterrupt`
+  inside `Trainer.train`: the state is `cancelled`, and the step it interrupted has no checkpoint.
+  Run here on CPU: `trl_grpo_cpu.yaml` with `trainer.max_steps=4`, `trainer.save_every=4`,
+  `data.limit=8`, `rollout.max_new_tokens=32` and LoRA, SIGINT six seconds into step 1:
+
+  ```text
+  2026-11-17 02:59:30 received SIGINT: finishing the current step, then stopping
+  2026-11-17 02:59:41 stopping after step 1 (cancel requested)
+  2026-11-17 02:59:42 checkpoint saved: .../checkpoints/step-1
+  2026-11-17 02:59:42 [cancelled] cancelled after step 1
+  ```
+
+  `--resume` then logged `resuming from .../checkpoints/checkpoint-1`, trained steps 2 to 4 and
+  ended `succeeded`; `metrics.jsonl` has the row of every step from 1 to 4 once, and
+  `trajectories.jsonl` the 8 episodes of each.
+* **verl** and **NeMo-RL** run the framework in a child process and do not finish the step. What
+  the backends do is tested against stand-ins for the two frameworks (a stand-in entry, a fake
+  checkout); what the frameworks do is read from the pinned sources. Neither was run with a
+  signal here. Common to both: a signal that arrives while monorl prepares the run (compiling
+  the config, exporting the data) is logged with the line of any run, the preparation is
+  finished, and the run ends `cancelled` without starting the child
+  (`cancelled before verl was started`, `cancelled before NeMo-RL was started`); a second signal
+  in that time ends the run at once. From the start of the child to its end the backend handles
+  the two signals for the same event. The first one asks the child to stop and gives it 30
+  seconds; `run.log` has `received SIGINT: stopping the verl driver` or `stopping NeMo-RL`. A
+  second one kills the child at once, with the line `received SIGINT again: stopping now`. The
+  training loops of the two frameworks handle neither signal at the pin (`verl/trainer/`;
+  `nemo_rl/algorithms/grpo.py` and `sft.py`, `examples/run_grpo.py` and `run_sft.py`): the step
+  in flight is lost, no checkpoint is written for the signal, and `--resume` continues from the
+  checkpoint the framework saved last on its own schedule. The run ends `cancelled` with exit
+  code 130.
+  * **verl.** Within a second of the first signal (the backend looks once a second) the driver,
+    `python -m monorl.adapters.verl.entry`, gets SIGTERM, and `run.log` the line
+    `cancel requested: sent SIGTERM to verl driver`. A driver that is still running 30 seconds
+    later (`VerlBackend.grace_seconds`, with the line
+    `verl driver did not exit in time: sending SIGKILL`) is killed, and so is the driver at a
+    second signal: SIGKILL to the driver first, then to every process that descends from it. The
+    process tree is read twice for that, before the driver is killed and again before its
+    descendants are, for what they started in between. Not reached: a process that is no longer
+    in the driver's tree (its parent has ended, or it was started detached; whether the daemons
+    Ray starts for the driver are among them was not looked at), and a process the driver starts
+    between the first reading and its own SIGKILL. The driver stays in the process group of
+    `monorl train`, so that Ctrl-C in a terminal reaches it as SIGINT as well, and so does what
+    the server sends to the group of a job it cancels. The status message is
+    `verl run cancelled`, and the step is that of `checkpoints/latest_checkpointed_iteration.txt`,
+    or of the last row of `metrics.jsonl` when verl saved no checkpoint.
+  * **NeMo-RL.** The child runs in a session of its own, so Ctrl-C in a terminal reaches only
+    monorl. At the first signal the child's process group gets SIGTERM, and SIGKILL if the child
+    is still running 30 seconds later (`CANCEL_GRACE_SECONDS`). What the child prints while it
+    shuts down is copied to `run.log` like the rest of its output. At a second signal the group
+    gets SIGKILL at once: the child and what it started, as far as that stayed in its group. The
+    status message is `cancelled by user`, and the step is that of the last row of
+    `metrics.jsonl`.
 
 ## Choosing
 

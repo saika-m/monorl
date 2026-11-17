@@ -29,9 +29,10 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from monorl.config.schema import DataConfig, RunConfig
+from monorl.config.loader import mask_secrets
+from monorl.config.schema import DataConfig, RunConfig, validation_message
 from monorl.core.errors import ConfigError
 
 
@@ -146,8 +147,8 @@ class PipelineConfig(_Model):
     def from_dict(cls, data: dict[str, Any]) -> PipelineConfig:
         try:
             return cls.model_validate(data)
-        except Exception as e:  # pydantic.ValidationError
-            raise ConfigError(str(e)) from e
+        except ValidationError as e:
+            raise ConfigError(validation_message(e, cls)) from e
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:
@@ -159,7 +160,7 @@ class PipelineConfig(_Model):
         return self.model_dump(mode="json")
 
     def to_yaml(self, path: str | Path | None = None) -> str:
-        text = yaml.safe_dump(self.to_dict(), sort_keys=False)
+        text = yaml.safe_dump(mask_secrets(self.to_dict()), sort_keys=False)
         if path is not None:
             Path(path).write_text(text)
         return text

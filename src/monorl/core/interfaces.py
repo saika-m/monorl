@@ -258,11 +258,35 @@ class WeightSync(Protocol):
 
 @runtime_checkable
 class PipelineBackend(Protocol):
-    """A framework that runs the entire RL loop itself (verl, NeMo-RL, TRL-native)."""
+    """A framework that runs the entire RL loop itself (verl, NeMo-RL, TRL-native).
+
+    ``resume`` is ``monorl train --resume``: continue the run of ``run_dir`` from its newest
+    checkpoint, after ``reporter.drop_rows_after`` took the record files back to that step.
+    Without it the run starts at step 0. A backend whose framework cannot do what was asked
+    raises :class:`~monorl.core.errors.ConfigError`; it never does the other thing instead.
+
+    ``cancel`` is the event that the first SIGINT or SIGTERM sets while ``run()`` of the
+    orchestrator handles the signals of the process. A backend that trains in this process ends
+    the run once the step in flight is done, as the loops do: the step is logged, the framework's
+    checkpoint of it exists for a resume, nothing is exported, and the result is ``cancelled``
+    unless that step was the last one. A backend that runs its framework in a child process
+    cannot have the step finished: it does not start the child when the event is set by then,
+    and while the child runs it handles the signals itself, for the same event, asks the child
+    to stop at the first and kills it at a second one; ``docs/BACKENDS.md`` says what each
+    backend does.
+    """
 
     name: str
 
-    def run(self, config: RunConfig, run_dir: Path, *, reporter: RunReporter) -> RunResult: ...
+    def run(
+        self,
+        config: RunConfig,
+        run_dir: Path,
+        *,
+        reporter: RunReporter,
+        resume: bool = False,
+        cancel: threading.Event | None = None,
+    ) -> RunResult: ...
 
 
 class RolloutEngineFactory(Protocol):

@@ -15,6 +15,7 @@ import fakes
 import pytest
 import yaml
 
+from monorl.config.pipeline import PipelineConfig
 from monorl.core.registry import registry
 from monorl.core.reporting import iter_metrics, iter_trajectories, read_status
 from monorl.pipeline import PipelineResult, read_manifest, run_pipeline
@@ -210,11 +211,53 @@ def test_nothing_accepted_fails_stage(make_pipeline: Any) -> None:
     assert "accepted 0" in read_status(result.run_dir)["message"]
 
 
+def test_warnings_of_a_sampling_stage_are_in_the_log_of_that_stage(make_pipeline: Any) -> None:
+    stages = [
+        {"type": "rejection_sample", "name": "rs", "num_samples": 2, "min_reward": 0.0},
+        {"type": "eval", "name": "eval", "max_prompts": 2},
+    ]
+    result = run_pipeline(make_pipeline(stages, rewards=[{"type": "test_warning"}]))
+    assert result.state == "succeeded", result.error
+    for stage, scored in zip(result.stages, ([4, 4, 4], [2]), strict=True):
+        log = (Path(stage["run_dir"]) / "run.log").read_text().splitlines()
+        warnings = [line[20:] for line in log if "reward test_warning" in line]
+        prefix = "WARNING monorl.rewards.test_warning: reward test_warning:"
+        assert warnings == [f"{prefix} {n} scored" for n in scored]
+    pipeline_log = (Path(result.run_dir) / "run.log").read_text()
+    assert "reward test_warning" not in pipeline_log
+
+
 def test_invalid_override_fails_before_running(make_pipeline: Any) -> None:
-    stages = [{"type": "train", "name": "bad", "overrides": {"trainer": {"max_steps": "many"}}}]
+    stages = [
+        {"type": "train", "name": "good", "overrides": {"trainer": {"max_steps": 1}}},
+        {"type": "train", "name": "bad", "overrides": {"trainer": {"max_steps": "many", "max_stps": 1}}},
+        {"type": "eval", "name": "worse", "rollout_overrides": {"temprature": 0.5}},
+    ]
     result = run_pipeline(make_pipeline(stages))
-    assert result.state == "failed" and "invalid stage configuration" in (result.error or "")
-    assert result.stages[0]["state"] == "pending"
+    assert result.state == "failed"
+    assert (result.error or "").splitlines() == [
+        "invalid stage configuration: stage 2/3 'bad' (train), the base with the stage's overrides: "
+        "invalid RunConfig, 2 problems:",
+        "  trainer.max_steps: Input should be a valid integer, unable to parse string as an integer "
+        "(got 'many')",
+        "  trainer.max_stps: unknown key; did you mean max_steps?",
+    ]
+    assert read_status(result.run_dir)["message"] == result.error
+    assert [stage["state"] for stage in result.stages] == ["pending"] * 3
+    assert not fakes.TRAINERS
+
+
+def test_an_invalid_override_of_a_sampling_stage_names_the_stage(make_pipeline: Any) -> None:
+    stages = [
+        {"type": "train", "name": "good", "overrides": {"trainer": {"max_steps": 1}}},
+        {"type": "eval", "name": "scores", "rollout_overrides": {"temprature": 0.5}},
+    ]
+    result = run_pipeline(make_pipeline(stages))
+    assert (result.error or "").splitlines() == [
+        "invalid stage configuration: stage 2/2 'scores' (eval), the base with the stage's overrides: "
+        "invalid RunConfig, 1 problem:",
+        "  rollout.temprature: unknown key; did you mean temperature?",
+    ]
     assert not fakes.TRAINERS
 
 
@@ -275,6 +318,29 @@ def test_resume_skips_succeeded_stages(make_pipeline: Any, tmp_path: Path) -> No
     assert "already succeeded; reusing" in (run_dir / "run.log").read_text()
 
 
+def test_resumed_stage_without_a_checkpoint_has_every_row_once(make_pipeline: Any) -> None:
+    """A stage that failed after it had logged a step and before its first checkpoint starts over
+    on resume, and so do its record files."""
+
+    def stages(extra: dict[str, Any]) -> list[dict[str, Any]]:
+        trainer = {"max_steps": 3, "save_every": 100, "extra": extra}
+        return [{"type": "train", "name": "only", "overrides": {"trainer": trainer}}]
+
+    first = run_pipeline(make_pipeline(stages({"fake_fail_at": 2})))
+    assert first.state == "failed"
+    stage_dir = Path(first.stages[0]["run_dir"])
+    assert [row["step"] for _, row in iter_metrics(stage_dir)] == [1]
+    assert not (stage_dir / "checkpoints").exists()
+
+    resumed = run_pipeline(make_pipeline(stages({})), Path(first.run_dir), resume=True)
+    assert resumed.state == "succeeded", resumed.error
+    assert [row["step"] for _, row in iter_metrics(stage_dir)] == [1, 2, 3]
+    assert {row["step"] for _, row in iter_trajectories(stage_dir)} == {1, 2, 3}
+    assert len(list(iter_trajectories(stage_dir))) == 3 * len(
+        [row for _, row in iter_trajectories(stage_dir) if row["step"] == 3]
+    )
+
+
 def test_resume_rejects_mismatched_stages(make_pipeline: Any) -> None:
     stages = [{"type": "train", "name": "a", "overrides": {"trainer": {"max_steps": 1}}}]
     first = run_pipeline(make_pipeline(stages))
@@ -321,6 +387,81 @@ def test_sigterm_during_train_stage_cancels_pipeline(
     assert read_manifest(result.run_dir)["state"] == "cancelled"
     assert result.final_model_path is None
     assert "received SIGTERM" in (Path(result.stages[1]["run_dir"]) / "run.log").read_text()
+
+
+def test_sigterm_during_the_last_step_of_a_train_stage_stops_the_pipeline_after_it(
+    make_pipeline: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage has nothing left to cancel and ends ``succeeded``; the request to stop is for the
+    pipeline all the same, which must not start the next stage."""
+    stages = [
+        {"type": "train", "name": "first", "overrides": {"trainer": {"max_steps": 2}}},
+        {"type": "train", "name": "second", "overrides": {"trainer": {"max_steps": 2}}},
+        {"type": "eval", "name": "eval"},
+    ]
+    original = fakes.FakeTrainer.train_step
+
+    def train_step(self: Any, batch: Any) -> dict[str, float]:
+        out = original(self, batch)
+        if self.config.run_name == "00-first" and self.step == 2:
+            _sigterm_self()
+        return out
+
+    monkeypatch.setattr(fakes.FakeTrainer, "train_step", train_step)
+    result = run_pipeline(make_pipeline(stages))
+    assert [s["state"] for s in result.stages] == ["succeeded", "pending", "pending"]
+    assert result.state == "cancelled"
+    assert result.stages[0]["step"] == 2 and (Path(result.stages[0]["run_dir"]) / "final").is_dir()
+    assert read_status(result.stages[0]["run_dir"])["state"] == "succeeded"
+    assert "received SIGTERM" in (Path(result.stages[0]["run_dir"]) / "run.log").read_text()
+    assert not Path(result.stages[1]["run_dir"]).exists()
+    assert read_status(result.run_dir)["state"] == "cancelled"
+    assert "cancelled after 1 of 3 stages" in read_status(result.run_dir)["message"]
+    assert read_manifest(result.run_dir)["state"] == "cancelled"
+    assert result.final_model_path is None
+
+
+@pytest.mark.parametrize("last", ["train", "eval"])
+def test_sigterm_when_nothing_is_left_to_cancel_ends_the_pipeline_succeeded(
+    last: str, make_pipeline: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The signal arrives in the last step of the last stage (a train stage: in its last train
+    step; an eval stage: while its last chunk is scored). Every stage ends ``succeeded``, and so
+    does the pipeline, with its final model: there was nothing left to stop."""
+    stages: list[dict[str, Any]] = [
+        {"type": "train", "name": "first", "overrides": {"trainer": {"max_steps": 2}}},
+        {"type": "train", "name": "second", "overrides": {"trainer": {"max_steps": 2}}},
+    ]
+    if last == "train":
+        original = fakes.FakeTrainer.train_step
+
+        def train_step(self: Any, batch: Any) -> dict[str, float]:
+            out = original(self, batch)
+            if self.config.run_name == "01-second" and self.step == 2:
+                _sigterm_self()
+            return out
+
+        monkeypatch.setattr(fakes.FakeTrainer, "train_step", train_step)
+    else:
+        stages.append({"type": "eval", "name": "eval", "max_prompts": 2})  # one chunk
+        score = fakes.ExactReward.__call__
+
+        def scored(self: Any, trajectories: Any) -> Any:
+            if trajectories[0].group_id.startswith("eval"):
+                _sigterm_self()
+            return score(self, trajectories)
+
+        monkeypatch.setattr(fakes.ExactReward, "__call__", scored)
+    result = run_pipeline(make_pipeline(stages))
+    assert [s["state"] for s in result.stages] == ["succeeded"] * len(stages)
+    logs = [Path(s["run_dir"]) / "run.log" for s in result.stages[-1:]] + [Path(result.run_dir) / "run.log"]
+    assert any("received SIGTERM" in log.read_text() for log in logs)  # the signal did arrive
+    assert result.state == "succeeded"
+    final = str(Path(result.stages[1]["run_dir"]) / "final")
+    assert result.final_model_path == final and Path(final).is_dir()
+    status, manifest = read_status(result.run_dir), read_manifest(result.run_dir)
+    assert status["state"] == "succeeded" and status["message"] == f"finished {len(stages)} stages"
+    assert manifest["state"] == "succeeded" and manifest["final_model_path"] == final
 
 
 def test_sigterm_during_rejection_stage_cancels_pipeline(
@@ -422,3 +563,28 @@ def test_sigterm_aborts_sampling_stage_generation_in_flight(
     assert engine.shutdown_count >= 1
     leftovers = ("monorl-episode", "monorl-batching")
     assert not [t.name for t in threading.enumerate() if t.name.startswith(leftovers)]
+
+
+def test_no_file_of_the_pipeline_directory_holds_a_secret_of_the_config(
+    make_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``api_key: ${JUDGE_API_KEY}`` in the base config: ``pipeline.yaml``, the manifest and the
+    ``config.yaml`` of every stage name the variable, and the pipeline file loads back."""
+    from monorl.config import loader
+
+    api_key = "sk-pipeline-0123456789abcdef"
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("JUDGE_API_KEY", api_key)
+    rewards = [{"type": "test_exact", "params": {"api_key": "${JUDGE_API_KEY}"}}]
+    source = tmp_path / "user-pipeline.yaml"
+    source.write_text(yaml.safe_dump(make_pipeline(rewards=rewards).to_dict()))
+    cfg = PipelineConfig.from_yaml(source)
+    assert cfg.base.rewards[0].params == {"api_key": api_key}
+
+    result = run_pipeline(cfg)
+    assert result.state == "succeeded"
+    run_dir = Path(result.run_dir)
+    files = [p for p in run_dir.rglob("*") if p.is_file()]
+    assert len([p for p in files if p.name == "config.yaml"]) == len(cfg.stages)
+    assert [str(p.relative_to(run_dir)) for p in files if api_key.encode() in p.read_bytes()] == []
+    assert PipelineConfig.from_yaml(run_dir / "pipeline.yaml") == cfg

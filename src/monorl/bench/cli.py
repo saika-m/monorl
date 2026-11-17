@@ -15,9 +15,11 @@ from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from monorl.bench.report import render_env, render_plan, render_rollout, render_sync, write_json
 from monorl.config.loader import apply_overrides, load_yaml
+from monorl.config.pipeline import is_pipeline_payload
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, MonorlError, RegistryError
 from monorl.core.registry import ensure_providers
@@ -26,6 +28,7 @@ app = typer.Typer(
     name="bench",
     help="Measure rollout, environment and weight-sync throughput to size an RL run for this hardware.",
     no_args_is_help=True,
+    add_completion=False,
     rich_markup_mode="rich",
 )
 console = Console()
@@ -33,7 +36,7 @@ err_console = Console(stderr=True)
 
 
 def _fail(message: str, code: int = 1) -> None:
-    err_console.print(f"[bold red]error:[/bold red] {message}")
+    err_console.print(f"[bold red]error:[/bold red] {escape(message)}")
     raise typer.Exit(code)
 
 
@@ -49,7 +52,17 @@ def _int_list(text: str, flag: str) -> list[int]:
 
 def _load_config(path: Path, overrides: list[str] | None) -> RunConfig:
     try:
-        config = RunConfig.from_dict(apply_overrides(load_yaml(path), overrides))
+        data = load_yaml(path)
+        if is_pipeline_payload(data):
+            _fail(
+                f"{path} is a pipeline config (`base:` and `stages:`) and bench measures one run: pass a "
+                "RunConfig YAML, for example the config.yaml in the run directory of one of the "
+                "pipeline's training stages (<pipeline dir>/stages/<NN>-<name>/config.yaml)"
+            )
+        try:
+            config = RunConfig.from_dict(apply_overrides(data, overrides))
+        except ConfigError as e:
+            _fail(f"{path}: {e}")
         ensure_providers(config)
         return config
     except (ConfigError, RegistryError) as e:
@@ -60,8 +73,11 @@ def _load_config(path: Path, overrides: list[str] | None) -> RunConfig:
 def _emit(result: Any, json_path: Path | None, render: Any) -> None:
     render(result, console)
     if json_path is not None:
-        out = write_json(result, json_path)
-        console.print(f"json: {out}")
+        try:
+            out = write_json(result, json_path)
+        except OSError as e:
+            _fail(f"cannot write --json {json_path}: {e}")
+        console.print(f"json: {escape(str(out))}")
 
 
 # -- rollout ---------------------------------------------------------------------------------
@@ -108,8 +124,11 @@ def rollout(
     try:
         from monorl.data import open_source
 
-        source = open_source(cfg.data, tokenizer=engine.tokenizer, seed=cfg.seed)
-        prompt_list = [s.messages for s in islice(iter(source), prompts)]
+        try:
+            source = open_source(cfg.data, tokenizer=engine.tokenizer, seed=cfg.seed)
+            prompt_list = [s.messages for s in islice(iter(source), prompts)]
+        except FileNotFoundError as e:  # a data.uri that is not there
+            _fail(str(e))
         if not prompt_list:
             _fail(f"no usable samples in {cfg.data.uri}")
         params = SamplingParams(
@@ -123,7 +142,7 @@ def rollout(
             logprobs=True,
         )
         console.print(
-            f"benchmarking {cfg.rollout.backend} on {cfg.model.name_or_path}: {len(prompt_list)} prompts × n={params.n}, "
+            f"benchmarking {escape(cfg.rollout.backend)} on {escape(cfg.model.name_or_path)}: {len(prompt_list)} prompts × n={params.n}, "
             f"max_new_tokens={params.max_new_tokens}, batch sizes {sizes}"
         )
         from monorl.bench.rollout import run_rollout_benchmark
@@ -175,6 +194,8 @@ def env(
 
     if bool(command) == bool(url):
         _fail("pass exactly one of --command or --url", code=2)
+    if not timeout > 0:
+        _fail(f"--timeout must be greater than 0 seconds, got {timeout}", code=2)
     levels = _int_list(parallel, "--parallel")
     target = EnvTarget(
         command=list(command) if command else None, url=url, cwd=str(cwd) if cwd else None, timeout_s=timeout

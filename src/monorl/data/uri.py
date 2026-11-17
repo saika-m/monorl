@@ -8,6 +8,8 @@ Supported shapes:
   driver is installed. S3 credentials come **only** from the environment
   (``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_SESSION_TOKEN``,
   ``AWS_DEFAULT_REGION``/``AWS_REGION``, ``AWS_ENDPOINT_URL``), never from config.
+* ``http://host/file.jsonl`` or ``https://``: one file a web server serves, in the file formats
+  of a local file. A web server lists nothing, so a directory or a glob is not read this way.
 * local path or ``file://`` — file, directory or glob. A string without ``://`` is always a
   path: a Hub dataset needs the ``hf://`` prefix.
 * ``<scheme>://anything`` for a scheme a provider module registered a ``data_source`` for
@@ -16,6 +18,7 @@ Supported shapes:
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +27,8 @@ from typing import Any, Literal
 from monorl.core.errors import DataError
 
 Kind = Literal["local", "hf", "remote"]
+
+HTTP_SCHEMES: tuple[str, ...] = ("http", "https")
 
 S3_ENV_VARS: tuple[str, ...] = (
     "AWS_ACCESS_KEY_ID",
@@ -44,7 +49,8 @@ class ParsedURI:
     ``gs``...) or the scheme of a provider's data source."""
     path: str
     """Local: absolute path. Remote: what follows ``://`` without surrounding slashes
-    (``bucket/key``). HF: ``org/name``."""
+    (``bucket/key``); for ``http`` and ``https`` the whole URL, which is how fsspec's filesystem
+    for them names a file. HF: ``org/name``."""
     revision: str | None = None
     """HF only: ``@revision``."""
     subpath: str | None = None
@@ -56,7 +62,7 @@ class ParsedURI:
 
     def with_path(self, path: str) -> str:
         """Render a URI for a path on the same filesystem (used for per-file ids and browse)."""
-        if self.kind == "local":
+        if self.kind == "local" or self.scheme in HTTP_SCHEMES:
             return path
         return f"{self.scheme}://{path}"
 
@@ -74,6 +80,8 @@ def parse_uri(uri: str) -> ParsedURI:
         scheme, _, rest = uri.partition("://")
         if not scheme.isidentifier():
             raise DataError(f"unsupported dataset uri {uri!r}")
+        if scheme in HTTP_SCHEMES:
+            return ParsedURI(raw=uri, kind="remote", scheme=scheme, path=uri)
         return ParsedURI(raw=uri, kind="remote", scheme=scheme, path=rest.strip("/") if rest != "" else "")
     return ParsedURI(raw=uri, kind="local", scheme="file", path=str(Path(uri).expanduser().absolute()))
 
@@ -149,6 +157,19 @@ def filesystem_for(parsed: ParsedURI):
         raise DataError("hf:// datasets are loaded through `datasets`, not fsspec")
     scheme = "file" if parsed.kind == "local" else parsed.scheme
     try:
-        return fsspec.filesystem(scheme, **storage_options_for(scheme))
+        cls = fsspec.get_filesystem_class(scheme)
+        # A filesystem is opened from its scheme and the environment. One that takes more than
+        # that (ftp and smb a host, github an org and a repo) cannot be, and is not constructed.
+        needs = [
+            name
+            for name, param in list(inspect.signature(cls.__init__).parameters.items())[1:]
+            if param.default is param.empty and param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
+        ]
+        if not needs:
+            return cls(**storage_options_for(scheme))
     except (ValueError, ImportError) as e:  # unknown protocol or driver missing
         raise DataError(f"no fsspec driver for scheme {scheme!r} ({e}); install the matching package") from e
+    raise DataError(
+        f"{scheme}:// is not supported as a dataset location: its fsspec filesystem needs "
+        f"{', '.join(needs)}, and monorl opens a filesystem from its scheme and the environment"
+    )

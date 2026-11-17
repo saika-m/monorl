@@ -7,8 +7,8 @@ contracts between components are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
 ## Setup
 
 ```bash
-make install                # .venv (uv, Python 3.12) with the packages of requirements.lock
-scripts/dev/bootstrap.sh    # the same, plus the example environments and the web build
+make install              # .venv (uv, Python 3.12) with the packages of requirements.lock
+scripts/dev/bootstrap.sh  # the same, plus the example environments and the web build
 ```
 
 Optional toolchains: Go for the Go SDK and its examples, clang++ for the C++ SDK, Node 24 and
@@ -21,11 +21,11 @@ below.
 ## Dependencies
 
 `requirements.lock` pins every package of that environment: monorl's dependencies with the extras
-`dev`, `trl`, `distributed`, `multimodal`, `rewards`, `openenv` and `hermes`, and what builds
-monorl, each at one version with the hashes of its files. It is one file for macOS on Apple
-silicon, Linux and Windows and for Python 3.11 and 3.12, with PyTorch's CPU builds.
-`make install`, CI and the CPU image install from it, from wheels only, and resolve nothing
-themselves, so a release published upstream changes nothing here until a commit changes the lock.
+`dev`, `trl`, `distributed`, `multimodal`, `rewards`, `sinks`, `openenv` and `hermes`, and what
+builds monorl, each at one version with the hashes of its files. It is one file for macOS on Apple
+silicon, Linux and Windows and for Python 3.11 and 3.12, with PyTorch's CPU builds. `make install`,
+CI and the CPU image install from it, from wheels only, and resolve nothing themselves, so a release
+published upstream changes nothing here until a commit changes the lock.
 
 | When | Command |
 |---|---|
@@ -55,10 +55,10 @@ them.
 | Config reference is current | `.venv/bin/python -m monorl.config.reference --check docs/CONFIG.md` |
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: `make install`,
-Python lint and `pytest tests -n 4 -m 'not slow and not network and not gpu'`, the Go and C++ SDK
-builds and tests,
-the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, and builds of the
-`envs` and `cpu` images. A newer push cancels the run of an older one.
+Python lint and `pytest tests -n 4 -m 'not slow and not network and not gpu'`, `go vet` and
+`go test` for the Go SDK, builds of the Go and C++ examples, the web build and lint, the MEP/1
+conformance tests, hadolint over `docker/`, and builds of the `envs` and `cpu` images. A newer
+push cancels the run of an older one.
 
 ## Tests
 
@@ -84,7 +84,9 @@ the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, an
 - **Parallel runs.** CI runs the suite on four pytest-xdist workers, each a process of its own
   that gets the tests in no particular order. A test must pass alone and next to any other: it
   takes its ports from the system (the server binds port 0 and is asked which one it got), and
-  it removes what it registers. Tests that share one resource outside their process carry
+  it removes what it registers. A port that has to be named before the process that binds it
+  exists (`MASTER_PORT` of a `torch.distributed` group) comes from `tests/ports.py`, not from
+  a bind to port 0 that is closed again. Tests that share one resource outside their process carry
   `pytest.mark.xdist_group("<name>")` and stay together on one worker (`--dist loadgroup` in
   `pyproject.toml`): the local Ray of `tests/distributed/test_ray_runtime.py`, the Docker daemon
   of `tests/envs/test_sandbox_docker.py`. CI gives every worker one torch thread
@@ -136,6 +138,7 @@ the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, an
 |---|---|
 | A reward, environment, data source, engine, trainer or backend | the extension points in [`src/monorl/README.md`](src/monorl/README.md) |
 | An adapter for a framework, or a newer pin of one | [`src/monorl/adapters/README.md`](src/monorl/adapters/README.md) |
+| A parameter of a built-in reward or environment | `declare_params` next to the code that reads it ([`src/monorl/core/params.py`](src/monorl/core/params.py)) and its row in [`docs/REWARDS.md`](docs/REWARDS.md) or [`docs/ENVIRONMENTS.md`](docs/ENVIRONMENTS.md); `tests/docs/test_params_tables.py` compares the two |
 | A recipe | [`configs/recipes/README.md`](configs/recipes/README.md) |
 | An environment in Go or C++ | [`docs/ENV_SDK.md`](docs/ENV_SDK.md) |
 | A task directory for sandboxed runs | [`examples/sandbox/README.md`](examples/sandbox/README.md) |

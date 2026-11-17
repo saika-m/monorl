@@ -5,6 +5,8 @@ machine. ``test_sandbox_docker.py`` repeats the essentials against a real daemon
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -632,7 +634,11 @@ PLAIN = "${NOT_SET_ANYWHERE:-plain}"
         ("built", [{"role": "user", "content": "abc"}], None),
         ("prebuilt", [{"role": "user", "content": "abc"}], None),
     ]
-    config = _config(make_config, ["{python}", str(write_agent(tmp_path, TASK_AGENT)), str(reports)])
+    config = _config(
+        make_config,
+        ["{python}", str(write_agent(tmp_path, TASK_AGENT)), str(reports)],
+        host_env=["HOST_FLAVOUR", "NOT_SET_ANYWHERE"],
+    )
 
     built, prebuilt, again = _episodes(config, [*samples, samples[0]])
 
@@ -754,6 +760,271 @@ def test_tasks_need_a_container(make_config: Callable[..., RunConfig], tmp_path:
     with pytest.raises(ConfigError, match="sandbox.backend to 'docker'"):
         _episodes(config, _task_samples(tmp_path / "tasks"))
     assert get_gateway().num_sessions == 0
+
+
+# -- what a task may not do: it is the dataset's, not the run config's ------------------------
+
+
+def _row_samples(tmp_path: Path, *tasks: dict[str, Any]) -> list[Sample]:
+    """Samples of a JSONL dataset whose rows bring ``tasks`` in a ``task`` column."""
+    data = tmp_path / "rows.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps({"id": f"row{i}", "prompt": "abc", "answer": "ABC", "task": t}) + "\n"
+            for i, t in enumerate(tasks)
+        )
+    )
+    return _task_samples(data)
+
+
+def _refused(config: RunConfig, samples: list[Sample], docker: FakeDocker) -> str:
+    """The message of the ``ConfigError`` the samples are refused with, before Docker was asked
+    for anything on their behalf."""
+    with pytest.raises(ConfigError) as refusal:
+        _episodes(config, samples)
+    assert docker.calls("pull", "build", "run", "cp", "exec") == []
+    assert get_gateway().num_sessions == 0
+    return str(refusal.value)
+
+
+def test_a_dataset_row_cannot_reach_for_the_host(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "the-host-secret")
+    private = tmp_path / "home" / ".ssh"
+    private.mkdir(parents=True)
+    (private / "id_ed25519").write_text("a private key")
+    task = {
+        "sandbox": {
+            "image": "attacker/img",
+            "mounts": ["/:/host"],
+            "args": ["--privileged"],
+            "keep_entrypoint": True,
+        },
+        "env": {"K": "${AWS_SECRET_ACCESS_KEY:-none}"},
+        "verifier": {"tests": str(private), "env": {"V": "${HOME}"}},
+    }
+    config = _config(make_config, ["{python}", str(write_agent(tmp_path, AGENT)), str(tmp_path / "report")])
+
+    message = _refused(config, _row_samples(tmp_path, task), docker)
+
+    # The error names the sample and everything the row tried, and not the secret's value.
+    assert message.startswith("sample 'row0': ")
+    for tried in ("['args', 'mounts']", "AWS_SECRET_ACCESS_KEY", "env.K", "HOME", "verifier.tests"):
+        assert tried in message
+    assert "env.params.sandbox" in message and "env.params.host_env" in message
+    assert "the-host-secret" not in message
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("backend", "docker"),
+        ("mounts", ["/:/host"]),
+        ("args", ["--privileged"]),
+        ("network", "host"),
+        ("user", "0"),
+        ("pids_limit", 100000),
+        ("platform", "linux/amd64"),
+        ("python", "/bin/sh"),
+        ("keep_processes", True),
+        ("start_timeout", 3600),
+    ],
+)
+def test_a_task_sets_only_its_own_container(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path, option: str, value: Any
+) -> None:
+    config = _config(make_config, ["{python}", str(write_agent(tmp_path, AGENT)), str(tmp_path / "report")])
+    samples = _row_samples(tmp_path, {"sandbox": {"image": "box", option: value}})
+    message = _refused(config, samples, docker)
+    assert "sample 'row0'" in message and f"['{option}']" in message and "only the run config" in message
+
+
+def test_a_row_may_name_an_image_and_its_limits(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path
+) -> None:
+    report, verifier = tmp_path / "report.json", tmp_path / "verify.py"
+    verifier.write_text(VERIFIER)
+    config = _config(
+        make_config,
+        ["{python}", str(write_agent(tmp_path, AGENT)), str(report)],
+        verifier=["{python}", str(verifier), "{reference_file}", "{stdout_file}"],
+        sandbox={"mounts": [f"{tmp_path}:/opt/agent:ro"], "network": "host", "args": ["--read-only"]},
+    )
+    task = {
+        "sandbox": {
+            "image": "other/img:1",
+            "workdir": "/app",
+            "cpus": 2,
+            "memory": "1g",
+            "keep_entrypoint": True,
+        },
+        "env": {"MODE": "test"},
+        "timeout": 120,
+    }
+    (trajectory,) = _episodes(config, _row_samples(tmp_path, task))
+    assert trajectory.info["sandbox"]["image"] == "other/img:1" and trajectory.info["sandbox"]["cpus"] == 2.0
+    assert trajectory.turns[-1].reward == 1.0  # a row brings no tests: env.params.verifier scores
+    seen = json.loads(report.read_text())
+    assert seen["cwd"].endswith("/app") and seen["env"]["MODE"] == "test"
+    # What reaches beyond the container is still the run config's.
+    (run,) = docker.calls("run")
+    argv = run["argv"]
+    assert "--entrypoint" not in argv and f"{tmp_path}:/opt/agent:ro" in argv
+    assert argv[argv.index("--network") + 1] == "host" and "--read-only" in argv
+
+
+def test_an_image_cannot_be_an_option_of_the_docker_cli(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path
+) -> None:
+    config = _config(make_config, ["{python}", str(write_agent(tmp_path, AGENT)), str(tmp_path / "report")])
+    message = _refused(config, _row_samples(tmp_path, {"sandbox": {"image": "--privileged"}}), docker)
+    assert "sample 'row0'" in message and "image reference" in message
+    with pytest.raises(ConfigError, match="image reference"):
+        make_env(_config(make_config, ["true"], sandbox={"image": "--privileged"}))
+
+
+def test_tasks_read_only_the_host_variables_the_run_config_lists(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("JUDGE_TOKEN", "tok-123")
+    monkeypatch.setenv("OTHER_SECRET", "never-asked-for")
+    monkeypatch.delenv("UNSET_HERE", raising=False)
+    write_task(
+        tmp_path / "tasks" / "judged",
+        """
+[verifier]
+env = { EXPECTED = "ABC", JUDGE = "${JUDGE_TOKEN}" }
+[environment]
+docker_image = "box"
+[environment.env]
+JUDGE_TOKEN = "${JUDGE_TOKEN}"
+RENAMED = "${JUDGE_TOKEN}"
+FALLBACK = "${UNSET_HERE:-fallback}"
+""",
+    )
+    samples = _task_samples(tmp_path / "tasks")
+    command = ["{python}", str(write_agent(tmp_path, AGENT)), str(tmp_path / "report.json")]
+
+    message = _refused(_config(make_config, command), samples, docker)
+    assert "sample 'judged'" in message and "['JUDGE_TOKEN', 'UNSET_HERE']" in message
+    assert "env.params.host_env" in message and "tok-123" not in message
+    # Listing one of them is not listing the other.
+    message = _refused(_config(make_config, command, host_env=["UNSET_HERE"]), samples, docker)
+    assert "['JUDGE_TOKEN']" in message and "verifier.env.JUDGE" in message
+
+    config = _config(make_config, command, host_env=["JUDGE_TOKEN", "UNSET_HERE"])
+    (trajectory,) = _episodes(config, samples)
+    assert trajectory.turns[-1].reward == 1.0
+    seen = json.loads((tmp_path / "report.json").read_text())["env"]
+    assert (seen["JUDGE_TOKEN"], seen["RENAMED"], seen["FALLBACK"]) == ("tok-123", "tok-123", "fallback")
+    assert "OTHER_SECRET" not in seen
+    # A host variable under its own name goes by name: its value is not on the command line.
+    (run,) = docker.calls("run")
+    passed = [run["argv"][i + 1] for i, arg in enumerate(run["argv"]) if arg == "-e"]
+    assert passed == ["JUDGE_TOKEN", "RENAMED=tok-123", "FALLBACK=fallback"]
+    with pytest.raises(ConfigError, match="host_env must be a list"):
+        make_env(_config(make_config, command, host_env="JUDGE_TOKEN"))
+
+
+def test_a_task_does_not_name_variables_of_the_docker_cli_process(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``-e NAME`` takes the value from the CLI's environment: a name a dataset chose must not
+    get there, where the loader and the shell of the host would act on it."""
+    for name in ("LD_PRELOAD", "BASH_ENV"):
+        monkeypatch.delenv(name, raising=False)
+    real = Path(shutil.which("docker") or "")
+    seen_by_cli = tmp_path / "cli-env.txt"
+    shim = tmp_path / "bin" / "docker"
+    shim.parent.mkdir()
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'echo "$1 ${{LD_PRELOAD:-unset}} ${{BASH_ENV:-unset}}" >> "{seen_by_cli}"\n'
+        f'exec "{real}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    write_task(
+        tmp_path / "tasks" / "preload",
+        """
+[verifier]
+env = { EXPECTED = "ABC", BASH_ENV = "/tmp/attacker.sh" }
+[environment]
+docker_image = "box"
+[environment.env]
+LD_PRELOAD = "/tmp/attacker.so"
+""",
+    )
+    report = tmp_path / "report.json"
+    config = _config(make_config, ["{python}", str(write_agent(tmp_path, AGENT)), str(report)])
+
+    (trajectory,) = _episodes(config, _task_samples(tmp_path / "tasks"))
+
+    assert trajectory.turns[-1].reward == 1.0
+    # The container got the variable; no docker process on this machine did.
+    assert json.loads(report.read_text())["env"]["LD_PRELOAD"] == "/tmp/attacker.so"
+    assert {"env": {"BASH_ENV": "/tmp/attacker.sh", "EXPECTED": "ABC"}}.items() <= docker.calls("exec")[
+        -1
+    ].items()
+    invocations = seen_by_cli.read_text().splitlines()
+    assert {"run unset unset", "exec unset unset"} <= set(invocations)
+    assert all(line.endswith(" unset unset") for line in invocations)
+
+
+def test_host_directories_come_from_a_task_directory_only(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "notes.txt").write_text("not for a container")
+    write_task(
+        tmp_path / "tasks" / "real",
+        '[verifier]\nenv = { EXPECTED = "ABC" }\n',
+        dockerfile="FROM box\nWORKDIR /srv\n",
+    )
+    (real,) = _task_samples(tmp_path / "tasks")
+    on_disk = real.metadata["row"]["task"]
+    command = ["{python}", str(write_agent(tmp_path, AGENT)), str(tmp_path / "report.json")]
+    config = _config(make_config, command)
+
+    # A row of another source names a directory of this host as its tests, or as a build context.
+    for task, named in (
+        ({"sandbox": {"image": "box"}, "verifier": {"tests": str(private)}}, "verifier.tests"),
+        ({"sandbox": {"build": str(private)}}, "sandbox.build"),
+        ({"sandbox": {"build": {"context": str(private)}}, "dir": str(private)}, "sandbox.build"),
+    ):
+        message = _refused(config, _row_samples(tmp_path, task), docker)
+        assert "sample 'row0'" in message and named in message and "task directory" in message
+    # It names a task directory that exists here, as that directory's own source would (today's
+    # row is the task exactly as written; tomorrow's brings an image of its own for the tests).
+    # Saying so in the row, also in a column called like the data layer's mark, proves nothing.
+    data = tmp_path / "claims.jsonl"
+    for task, named in (
+        (on_disk, "sandbox.build and verifier.tests"),
+        ({key: value for key, value in on_disk.items() if key != "verifier"}, "sandbox.build"),
+        ({**on_disk, "sandbox": {"image": "box"}}, "verifier.tests"),
+    ):
+        row = {"id": "claim", "prompt": "abc", "task_dir": on_disk["dir"], "task": task}
+        data.write_text(json.dumps(row) + "\n")
+        message = _refused(config, _task_samples(data), docker)
+        assert "sample 'claim'" in message and f"in {named}," in message
+    # Build settings beyond the context are the run config's, also for a task directory.
+    build = {"context": on_disk["sandbox"]["build"]["context"], "args": {"HTTP_PROXY": "http://evil"}}
+    message = _refused(
+        config, _row_samples(tmp_path, {**on_disk, "sandbox": {**on_disk["sandbox"], "build": build}}), docker
+    )
+    assert "sandbox.build option(s) ['args']" in message
+
+    # The task directory itself runs: its tests are copied, from where it is.
+    (trajectory,) = _episodes(config, [real])
+    assert trajectory.turns[-1].reward == 1.0
+    (cp,) = docker.calls("cp")
+    assert cp["argv"][1] == f"{tmp_path / 'tasks' / 'real' / 'tests'}/."
+    # Once the directory changes, what was read from it earlier is no longer the task.
+    (tmp_path / "tasks" / "real" / "task.toml").write_text('[verifier]\nenv = { EXPECTED = "XYZ" }\n')
+    with pytest.raises(ConfigError, match=r"sample 'real'.*differing: \['verifier'\]"):
+        _episodes(config, [real])
 
 
 def test_example_shell_agent_solves_a_task(

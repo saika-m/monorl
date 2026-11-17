@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from monorl.core.errors import ConfigError
 from monorl.core.registry import registry
 from monorl.rewards.reward_model import render_messages
 
@@ -74,5 +75,5 @@ def test_render_messages_uses_chat_template_or_plain_join(tiny_rm):
 
 
 def test_reward_model_requires_model_param():
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "reward_model")({})

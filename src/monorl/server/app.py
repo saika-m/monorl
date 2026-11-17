@@ -21,21 +21,16 @@ from pydantic import ValidationError
 
 from monorl.config.recipes import recipes_dir
 from monorl.core.errors import ConfigError, MonorlError
-from monorl.server.jobs import JobActive, JobManager, JobNotFound, default_home
+from monorl.core.home import monorl_home
+from monorl.server.auth import AccessGuard, allowed_hosts_from_env, resolve_token, write_token
+from monorl.server.jobs import JobActive, JobManager, JobNotFound
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-
-CORS_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-]
 
 
 @dataclass
 class ServerSettings:
-    home: Path = field(default_factory=default_home)
+    home: Path = field(default_factory=monorl_home)
     recipes_dir: Path = field(default_factory=recipes_dir)
     web_dist: Path = field(
         default_factory=lambda: Path(os.environ.get("MONORL_WEB_DIST") or REPO_ROOT / "web" / "dist")
@@ -46,7 +41,13 @@ class ServerSettings:
     envs_sdk: Path = field(
         default_factory=lambda: Path(os.environ.get("MONORL_ENVS_SDK") or REPO_ROOT / "envs" / "sdk")
     )
-    cors_origins: list[str] = field(default_factory=lambda: list(CORS_ORIGINS))
+    # Origins other than the server's own that may call the API from a browser. None by default:
+    # the UI is served by this server, and the Vite dev server proxies /api under the API's origin.
+    cors_origins: list[str] = field(default_factory=list)
+    # Access token (``MONORL_SERVER_TOKEN``, else generated) and the hosts accepted in ``Host``
+    # besides localhost / 127.0.0.1 / [::1] (``MONORL_ALLOWED_HOSTS``); see monorl.server.auth.
+    token: str = field(default_factory=resolve_token)
+    allowed_hosts: list[str] = field(default_factory=allowed_hosts_from_env)
 
 
 def validation_errors(exc: BaseException) -> list[dict[str, Any]]:
@@ -77,13 +78,25 @@ def create_app(settings: ServerSettings | None = None, *, jobs: JobManager | Non
     app = FastAPI(
         title="monorl",
         version=_version(),
-        docs_url="/api/docs",
+        # No Swagger UI / ReDoc pages: they run a script from a CDN in the origin whose session
+        # cookie starts jobs. The schema itself stays available (with the token like every route).
+        docs_url=None,
+        redoc_url=None,
         openapi_url="/api/openapi.json",
         lifespan=_lifespan,
     )
     app.state.settings = settings
     app.state.jobs = jobs or JobManager(settings.home)
+    write_token(settings.home, settings.token)
 
+    # Added first, so it runs inside CORS: a preflight carries no credentials and is answered by
+    # the CORS middleware; every request that reaches a route passes the guard.
+    app.add_middleware(
+        AccessGuard,
+        token=settings.token,
+        allowed_hosts=settings.allowed_hosts,
+        allowed_origins=settings.cors_origins,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

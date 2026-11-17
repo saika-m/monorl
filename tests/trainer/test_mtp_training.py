@@ -20,9 +20,10 @@ from monorl.core.batch import TrainBatch
 from monorl.core.errors import ConfigError
 from monorl.mtp import WIRE_PREFIX, MtpLayers, MtpLoss, checkpoint_key, is_wire_name
 from monorl.trainer.reference import ReferenceTrainer
+from tests.ports import reserved_port
 from tests.rollout.tiny_mtp import build_tiny_mtp, two_layer_mtp
 from tests.trainer.conftest import make_config
-from tests.trainer.test_distributed_trainer import WORLD_SIZE, _free_port, _shard
+from tests.trainer.test_distributed_trainer import WORLD_SIZE, _shard
 
 LORA = pytest.mark.parametrize("lora", [False, True], ids=["full", "lora"])
 PROMPTS = [[1, 5, 9, 17, 33, 21], [1, 40, 41, 42], [1, 7, 7, 300, 12, 90, 2000], [1, 77, 78]]
@@ -166,6 +167,22 @@ def test_the_layers_learn_to_draft_the_policys_continuations(
     assert "loss/mtp_1" not in last  # per-depth losses are for models with several MTP layers
     # a group of their own at the policy's learning rate
     assert [group["lr"] for group in trainer.optimizer.param_groups] == pytest.approx([3e-3, 3e-3])
+
+
+def test_the_layers_train_on_sequences_without_advantage(mtp_dir: Path, batch: TrainBatch) -> None:
+    """The episodes of a group with equal rewards have no advantage and add nothing to the policy
+    loss; the MTP loss reads their response tokens all the same."""
+    silent = batch.slice(0, len(batch))
+    silent.advantages = torch.zeros_like(batch.advantages)
+    trained = []
+    for item in (batch, silent):
+        trainer = _trainer(mtp_dir, mtp={"train": True}, **EXACT)
+        initial = _layer_params(trainer)
+        metrics = trainer.train_step(item)
+        assert metrics["loss/mtp"] > 0 and metrics["tokens/sequences_skipped"] == 0
+        assert _differ(_layer_params(trainer), initial) > 1e-3
+        trained.append(_layer_params(trainer))
+    _assert_same(*trained, rtol=0, atol=0)  # the trunk is detached: the policy loss does not reach them
 
 
 @LORA
@@ -415,7 +432,7 @@ def test_two_rank_step_matches_single_process(mtp_dir: Path, batch: TrainBatch, 
     torch.save(batch, batch_path)
     mp.spawn(
         _rank_worker,
-        args=(_free_port(), str(mtp_dir), str(batch_path), str(tmp_path)),
+        args=(reserved_port(), str(mtp_dir), str(batch_path), str(tmp_path)),
         nprocs=WORLD_SIZE,
         join=True,
     )

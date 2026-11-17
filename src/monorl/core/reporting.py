@@ -17,12 +17,14 @@ The web server and CLI only ever read these files; they never import backend cod
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import sys
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +48,10 @@ _MAX_JSON_DEPTH = 12
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    from monorl.config.loader import mask_secrets  # monorl.config imports this package
+
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, default=str))
+    tmp.write_text(json.dumps(mask_secrets(payload), indent=2, default=str))
     os.replace(tmp, path)
 
 
@@ -138,13 +142,51 @@ class RunReporter:
             for r in rows:
                 f.write(json.dumps(r, default=str) + "\n")
 
+    def drop_rows_after(self, step: int) -> None:
+        """Take ``metrics.jsonl`` and ``trajectories.jsonl`` back to the end of ``step``
+        (:func:`drop_rows`): the rows of later steps go, and so does a last line that a killed
+        process left unfinished. A run calls this before it continues from the checkpoint of
+        ``step`` (0: from the start), since it writes the later steps again and they would be in
+        the files twice. Logs what was removed."""
+
+        def later(row: dict[str, Any]) -> bool:
+            return isinstance(row.get("step"), int) and row["step"] > step
+
+        with self._lock:
+            removed = {
+                name: drop_rows(self.run_dir / name, later) for name in (METRICS_FILE, TRAJECTORIES_FILE)
+            }
+        if any(removed.values()):
+            counts = ", ".join(f"{n} of {name}" for name, n in removed.items())
+            self.log(f"removed the lines after step {step}: {counts}")
+
     # -- log -----------------------------------------------------------------------------
-    def log(self, message: str) -> None:
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+    def log(self, message: str, *, echo: bool = True) -> None:
+        from monorl.config.loader import mask_secrets  # monorl.config imports this package
+
+        # A message that quotes a value of the config (an error of a reward, a URL with its key)
+        # names the variable instead, as config.yaml does.
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {mask_secrets(message)}"
         with self._lock, open(self.run_dir / LOG_FILE, "a") as f:
             f.write(line + "\n")
-        if self._echo:
+        if echo and self._echo:
             print(line, file=sys.stderr, flush=True)
+
+    @contextmanager
+    def capture_logging(self) -> Iterator[None]:
+        """While the block runs, what this process logs under ``monorl`` through :mod:`logging` at
+        WARNING or above is a line of ``run.log``: ``<LEVEL> <logger>: <message>``, with the
+        traceback of the record when it has one. The terminal shows each record once: the line is
+        echoed like any other, unless a handler that was configured elsewhere shows the record
+        already. (With no handler at all, :mod:`logging` prints warnings to stderr itself; the
+        handler of this block takes that place.)"""
+        handler = _RunLogHandler(self)
+        logger = logging.getLogger("monorl")
+        logger.addHandler(handler)
+        try:
+            yield
+        finally:
+            logger.removeHandler(handler)
 
     # -- paths ---------------------------------------------------------------------------
     @property
@@ -157,6 +199,27 @@ class RunReporter:
     @property
     def final_dir(self) -> Path:
         return self.run_dir / FINAL_DIR
+
+
+class _RunLogHandler(logging.Handler):
+    def __init__(self, reporter: RunReporter) -> None:
+        super().__init__(logging.WARNING)
+        self._reporter = reporter
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._reporter.log(self.format(record), echo=not self._handled_elsewhere(record))
+        except Exception:  # noqa: BLE001 - as every logging handler: a log call never raises
+            self.handleError(record)
+
+    def _handled_elsewhere(self, record: logging.LogRecord) -> bool:
+        logger: logging.Logger | None = logging.getLogger(record.name)
+        while logger is not None:
+            if any(h is not self and record.levelno >= h.level for h in logger.handlers):
+                return True
+            logger = logger.parent if logger.propagate else None
+        return False
 
 
 # -- readers used by the server/CLI -------------------------------------------------------
@@ -208,6 +271,51 @@ def iter_trajectories(
                     yield i, json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+
+def drop_rows(path: str | os.PathLike[str], drop: Callable[[dict[str, Any]], bool]) -> int:
+    """Rewrite a JSON-lines file without the rows ``drop`` selects and without a last line that is
+    not a row: what a process that was killed in the middle of a write leaves, and what the next
+    row appended would be glued to. Returns the number of lines removed.
+
+    The file is read line by line and never held whole. Everything before the first change is
+    copied as it is, the result is written next to the file and replaces it in one step, and a
+    file that loses nothing is left alone. A last row that is whole and only lacks its newline
+    gets it."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    tmp = path.with_name(path.name + ".tmp")
+    removed, offset = 0, 0
+    out: Any = None
+    try:
+        with open(path, "rb") as src:
+            for line in src:
+                whole = line.endswith(b"\n")
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    gone = not whole  # an unreadable line elsewhere is not a write that was cut short
+                else:
+                    gone = isinstance(row, dict) and drop(row)
+                if out is None and (gone or not whole):
+                    out = open(tmp, "wb")
+                    with open(path, "rb") as head:
+                        left = offset
+                        while left:
+                            left -= out.write(head.read(min(left, 1 << 20)))
+                if out is not None and not gone:
+                    out.write(line if whole else line + b"\n")
+                removed += gone
+                offset += len(line)
+        if out is not None:
+            out.close()
+            os.replace(tmp, path)
+    finally:
+        if out is not None:
+            out.close()
+            tmp.unlink(missing_ok=True)
+    return removed
 
 
 def list_checkpoints(run_dir: str | os.PathLike[str]) -> list[str]:

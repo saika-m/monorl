@@ -85,16 +85,22 @@ if [[ ${DO_SERVE} -eq 1 ]]; then
     "${PY}" -m monorl.cli serve --host 127.0.0.1 --port "${PORT}" --no-open >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
 
+    # The API needs the token the server writes at start (docs/WEB_UI.md, "Access").
+    TOKEN_FILE="${MONORL_HOME:-${HOME}/.monorl}/server_token"
+    api() {  # api <path>: GET it signed in
+        curl -fsS -H "Authorization: Bearer $(cat "${TOKEN_FILE}" 2>/dev/null)" "${BASE}$1"
+    }
+
     for _ in $(seq 1 60); do
-        if curl -fsS "${BASE}/api/system" >/dev/null 2>&1; then break; fi
+        if api /api/system >/dev/null 2>&1; then break; fi
         kill -0 "${SERVER_PID}" 2>/dev/null || { cat "${SERVER_LOG}"; fail "server exited early"; }
         sleep 0.5
     done
-    curl -fsS "${BASE}/api/system" >/dev/null || { cat "${SERVER_LOG}"; fail "server did not become ready on ${BASE}"; }
+    api /api/system >/dev/null || { cat "${SERVER_LOG}"; fail "server did not become ready on ${BASE}"; }
 
     check() {  # check <path> <python expression over the parsed JSON body>
         local body
-        body="$(curl -fsS "${BASE}$1")" || fail "GET $1 failed"
+        body="$(api "$1")" || fail "GET $1 failed"
         printf '%s' "${body}" | "${PY}" -c "import json,sys; d=json.load(sys.stdin); assert ($2), 'GET $1: unexpected body'; print('GET $1 ok')"
     }
     check /api/system "'python' in d and 'frameworks' in d"

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from monorl.adapters.nemo_rl import register
@@ -20,6 +22,7 @@ from monorl.adapters.nemo_rl.backend import (
     list_checkpoints,
     monorl_src_root,
     nemo_rl_home,
+    resume_step,
 )
 from monorl.adapters.nemo_rl.data import MODULE_NAME
 from monorl.adapters.nemo_rl.entry import HOME_ENV, parse_args, resolve_home
@@ -187,6 +190,57 @@ def test_run_end_to_end_with_fake_checkout(python_launch: RunConfig, fake_home: 
     assert (run_dir / "nemo_rl" / "nemo_rl.yaml").exists()
 
 
+def _stopped_after_step_3(config: RunConfig, run_dir: Path) -> None:
+    """A NeMo-RL run with a checkpoint of step 2 that was killed in the middle of the row of step 4."""
+    result = NemoRLBackend(config).run(config, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert result.state == "succeeded", (run_dir / "run.log").read_text()
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write(json.dumps({"step": 3, "time": 0.0, "phase": "train", "reward/mean": 0.9}) + "\n")
+        f.write('{"step": 4, "time": 0.0, "pha')
+
+
+def test_resume_continues_from_the_checkpoint_and_drops_the_rows_after_it(
+    python_launch: RunConfig, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    _stopped_after_step_3(python_launch, run_dir)
+    assert resume_step(run_dir) == 2
+
+    reporter = RunReporter(run_dir, echo=False)
+    result = NemoRLBackend(python_launch).run(python_launch, run_dir, reporter=reporter, resume=True)
+    assert result.state == "succeeded", (run_dir / "run.log").read_text()
+    assert result.final_step == 4
+    assert [Path(p).name for p in result.checkpoints] == ["step_2", "step_4"]
+    rows = [r for _, r in iter_metrics(run_dir)]
+    assert [r["step"] for r in rows] == [1, 1, 2, 2, 3, 3, 4, 4]  # step 3 as this run wrote it
+    assert rows[4]["reward/mean"] == 0.75
+    assert len((run_dir / "metrics.jsonl").read_text().splitlines()) == 8  # and no unreadable line
+    assert "NeMo-RL continues after step 2" in (run_dir / "run.log").read_text()
+
+
+def test_run_without_resume_refuses_a_directory_nemo_rl_would_continue_in(
+    python_launch: RunConfig, tmp_path: Path
+) -> None:
+    """NeMo-RL has no way to start over next to its checkpoints, so the backend does not launch it."""
+    run_dir = tmp_path / "run"
+    _stopped_after_step_3(python_launch, run_dir)
+    records = (run_dir / "metrics.jsonl").read_bytes()
+    (run_dir / "child_env.json").unlink()
+
+    with pytest.raises(ConfigError, match=r"step_2.*--resume.*another run directory"):
+        NemoRLBackend(python_launch).run(python_launch, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert not (run_dir / "child_env.json").exists()  # the child was not started
+    assert (run_dir / "metrics.jsonl").read_bytes() == records
+
+
+def test_resume_step_is_the_checkpoint_nemo_rl_loads(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    assert resume_step(tmp_path) == 0
+    for name in ("step_2", "step_10", "tmp_step_12", "step_x", "step-30"):
+        (root / name).mkdir(parents=True)
+    assert resume_step(tmp_path) == 10  # by number, and only what finalize_checkpoint renamed
+
+
 def test_run_reports_failure(
     python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -196,6 +250,100 @@ def test_run_reports_failure(
     assert result.state == "failed" and "code 3" in result.error
     assert result.final_step == 2 and read_status(run_dir)["state"] == "failed"
     assert "boom" in (run_dir / "run.log").read_text()
+
+
+class _SignallingReporter(RunReporter):
+    """Raises ``signals``, one after the other, on the thread that writes the child's line ``at``
+    to ``run.log``: the main thread, which copies the child's output while ``run`` waits."""
+
+    def __init__(self, run_dir: Path, *, at: str, signals: list[signal.Signals]) -> None:
+        super().__init__(run_dir, echo=False)
+        self.at, self.signals = at, signals
+
+    def log(self, message: str) -> None:
+        super().log(message)
+        if message == self.at:
+            signals, self.signals = self.signals, []
+            for sig in signals:
+                signal.raise_signal(sig)
+
+
+def test_a_child_that_logs_while_it_shuts_down_is_not_held_up(
+    python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM while NeMo-RL runs. The child gets it and logs more than its pipe holds before it
+    exits: the backend has to go on copying its output. A handler that waits for the child on the
+    main thread reads nothing, the child blocks on its output and is killed after 30 seconds."""
+    monkeypatch.setenv("FAKE_NEMO_RL_SLEEP", "chatty")
+    run_dir = tmp_path / "run"
+    reporter = _SignallingReporter(run_dir, at="sleeping", signals=[signal.SIGTERM])
+    result = NemoRLBackend().run(python_launch, run_dir, reporter=reporter)
+    assert result.state == "cancelled"
+    status = read_status(run_dir)
+    assert status["state"] == "cancelled" and status["returncode"] == 0  # it ended on its own
+    log = (run_dir / "run.log").read_text()
+    assert "shutting down 3999" in log and "shutdown complete" in log
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+def _ended(pid: int) -> bool:
+    """Whether the process ``pid`` has ended; one that was just killed has ten seconds to go."""
+    try:
+        process = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return True
+    return not psutil.wait_procs([process], timeout=10)[1]
+
+
+@pytest.mark.timeout(120)
+def test_a_second_signal_kills_the_child_and_its_process_group(
+    python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that ignores SIGTERM, and so does its worker: the second signal ends the run at
+    once, without the 30 seconds of the grace period, and leaves neither of them."""
+    monkeypatch.setenv("FAKE_NEMO_RL_SLEEP", "stubborn")
+    run_dir = tmp_path / "run"
+    reporter = _SignallingReporter(run_dir, at="sleeping", signals=[signal.SIGINT, signal.SIGINT])
+    try:
+        result = NemoRLBackend().run(python_launch, run_dir, reporter=reporter)
+        worker = int((run_dir / "worker.pid").read_text())
+        assert result.state == "cancelled" and result.error == "interrupted"
+        status = read_status(run_dir)
+        assert status["state"] == "cancelled" and status["returncode"] == -signal.SIGKILL
+        assert _ended(status["child_pid"]) and _ended(worker)
+        assert "received SIGINT again: stopping now" in (run_dir / "run.log").read_text()
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    finally:  # what a run that did not kill it leaves behind
+        for pid in (int(p.read_text()) for p in run_dir.glob("worker.pid")):
+            if psutil.pid_exists(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_a_signal_while_the_run_is_prepared_ends_it_before_the_child_is_started(
+    python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first signal sets the event of the run while the data are exported: the run ends
+    cancelled, and NeMo-RL, which would train to the end, is never started."""
+    from monorl.adapters.nemo_rl import backend as backend_module
+
+    cancel = threading.Event()
+    export = backend_module.export_dataset
+
+    def export_and_signal(*args, **kwargs):
+        try:
+            return export(*args, **kwargs)
+        finally:
+            cancel.set()
+
+    monkeypatch.setattr(backend_module, "export_dataset", export_and_signal)
+    run_dir = tmp_path / "run"
+    reporter = RunReporter(run_dir, echo=False)
+    result = NemoRLBackend().run(python_launch, run_dir, reporter=reporter, cancel=cancel)
+    assert result.state == "cancelled" and result.error is None and result.final_step == 0
+    status = read_status(run_dir)
+    assert status["state"] == "cancelled" and status["message"] == "cancelled before NeMo-RL was started"
+    assert "child_pid" not in status and not (run_dir / "child_env.json").exists()
+    assert "launching" not in (run_dir / "run.log").read_text()
 
 
 def test_cancel_propagates_to_child(

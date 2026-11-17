@@ -68,7 +68,9 @@ Read the file. Key points:
   policy over OpenAI chat completions, OpenAI Responses and Anthropic Messages (streamed or not,
   image inputs included) and records every call. The env factory may return either.
 - `RewardFunction(trajectories) -> list[RewardResult]` (batched).
-- `PipelineBackend.run(config, run_dir, reporter=...) -> RunResult` for trl/verl/nemo_rl.
+- `PipelineBackend.run(config, run_dir, reporter=..., resume=False, cancel=None) -> RunResult`
+  for trl/verl/nemo_rl; `resume` is `--resume`, `cancel` the event that the first SIGINT or
+  SIGTERM sets ([`BACKENDS.md`](BACKENDS.md)).
 - `TrainBatch` (`core/batch.py`): right-padded `[B,T]`, `response_mask` marks loss positions,
   `advantages` per-token, `old_logprobs`/`ref_logprobs` aligned with `input_ids`, optional
   `loss_weights` (per-token weights of the loss mean, set for `algorithm.loss_agg: rollout`).
@@ -311,6 +313,8 @@ The files of a run directory, their row formats and the metrics glossary are in
 [`RUNS.md`](RUNS.md).
 
 ### Server API (FastAPI, `monorl.server.app:create_app`)
+Every route needs the server's access token, a local `Host` and, for a request that changes
+something, the server's own `Origin`: [`WEB_UI.md`](WEB_UI.md#access).
 ```
 GET  /api/system                      doctor report
 GET  /api/config/schema               RunConfig JSON schema

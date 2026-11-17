@@ -1,4 +1,5 @@
-"""``TrainBatch.narrow`` / ``trimmed``: a micro-batch drops the padding it does not need."""
+"""``TrainBatch.narrow`` / ``trimmed``: a micro-batch drops the padding it does not need.
+``TrainBatch.select``: some of the sequences of a batch, with everything that belongs to them."""
 
 from __future__ import annotations
 
@@ -51,3 +52,21 @@ def test_a_micro_batch_is_trimmed_to_its_own_rows() -> None:
     assert batch.slice(0, 1).trimmed().input_ids.shape == (1, 3)
     assert batch.slice(2, 3).trimmed().input_ids.shape == (1, 2)
     assert batch.narrow(8) is batch and batch.narrow(99) is batch
+
+
+def test_select_gathers_everything_of_the_chosen_sequences() -> None:
+    batch = _batch()
+    batch.extra["per_sequence"] = ["first", None, "third"]
+    batch.value_mask = batch.attention_mask.clone()
+    chosen = batch.select(torch.tensor([2, 0]))
+    assert len(chosen) == 2 and chosen.group_ids == ["b", "a"]
+    for name in ("input_ids", "attention_mask", "response_mask", "advantages", "old_logprobs", "value_mask"):
+        assert torch.equal(getattr(chosen, name), getattr(batch, name)[[2, 0]]), name
+    assert torch.equal(chosen.rewards, torch.tensor([3.0, 1.0]))
+    assert chosen.behavior_top_ids.shape == (2, 8, 2) and chosen.ref_logprobs is None
+    assert torch.equal(chosen.extra["mm_token_type_ids"], batch.extra["mm_token_type_ids"][[2, 0]])
+    assert chosen.extra["per_sequence"] == ["third", "first"] and chosen.extra["patch_size"] == 14
+    # a copy: the batch it was taken from is untouched by what is done to it
+    chosen.advantages.zero_()
+    assert batch.advantages.any()
+    assert len(batch.select(torch.tensor([], dtype=torch.long))) == 0

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from monorl.bench.env import EnvBenchmark
@@ -25,11 +26,11 @@ def write_json(result: Any, path: str | Path) -> Path:
 
 def _notes(console: Console, notes: list[str]) -> None:
     for n in notes:
-        console.print(f"  [cyan]•[/cyan] {n}")
+        console.print(f"  [cyan]•[/cyan] {escape(n)}")
 
 
 def render_rollout(bench: RolloutBenchmark, console: Console) -> None:
-    table = Table(title=f"rollout throughput — {bench.backend} / {bench.model}")
+    table = Table(title=f"rollout throughput — {escape(bench.backend)} / {escape(bench.model)}")
     for col in (
         "batch",
         "calls",
@@ -70,7 +71,7 @@ def render_rollout(bench: RolloutBenchmark, console: Console) -> None:
 
 def render_env(bench: EnvBenchmark, console: Console) -> None:
     spec = bench.spec
-    table = Table(title=f"env throughput — {bench.target.transport} {bench.target.label}")
+    table = Table(title=f"env throughput — {bench.target.transport} {escape(bench.target.label)}")
     for col in (
         "par",
         "procs",
@@ -115,7 +116,7 @@ def render_sync(bench: SyncBenchmark, console: Console) -> None:
         table.add_column(col, justify="right", no_wrap=True)
     for r in bench.results:
         table.add_row(
-            r.strategy,
+            escape(r.strategy),
             str(r.repeats),
             fmt_bytes(r.bytes) if r.bytes else "-",
             fmt_seconds(r.seconds.p50_s) if r.repeats else "-",
@@ -133,7 +134,7 @@ def render_sync(bench: SyncBenchmark, console: Console) -> None:
 def render_plan(report: PlanReport, console: Console) -> None:
     plan = report.plan
     cluster = report.cluster
-    table = Table(title=f"placement plan — {report.config_summary['model']}")
+    table = Table(title=f"placement plan — {escape(str(report.config_summary['model']))}")
     table.add_column("setting")
     table.add_column("value")
     rows = [
@@ -164,7 +165,7 @@ def render_plan(report: PlanReport, console: Console) -> None:
             ("trainer footprint", fmt_bytes(est["trainer_bytes"])),
         ]
     for k, v in rows:
-        table.add_row(k, v)
+        table.add_row(k, escape(v))
     console.print(table)
     if report.estimate:
         e = report.estimate

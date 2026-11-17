@@ -32,6 +32,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -201,6 +202,15 @@ inline Error invalid_request(const std::string& msg) { return Error("invalid_req
 inline Error unknown_episode(const std::string& id) { return Error("unknown_episode", "no such episode: \"" + id + "\"", 404); }
 inline Error env_error(const std::string& msg) { return Error("env_error", msg, 500); }
 
+namespace detail {
+
+/// The text of a response or of a quoted log field. Messages can carry bytes of the request
+/// (a path, a method, a header value) and of the environment, and those need not be UTF-8:
+/// such a byte is written as U+FFFD, where a plain dump() would throw.
+inline std::string wire(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
+
+}  // namespace detail
+
 // ---------------------------------------------------------------- Env interface ------------
 
 /// Implement this once; the server guarantees calls for one episode never overlap, but
@@ -292,6 +302,9 @@ public:
         } catch (const std::exception& e) {
             status = 500;
             return env_error(e.what()).envelope();
+        } catch (...) {  // an Env may throw anything; handle is noexcept
+            status = 500;
+            return env_error("the environment threw an exception that is not a std::exception").envelope();
         }
     }
 
@@ -462,12 +475,14 @@ inline void serve_stdio(Env& env, std::istream& in = std::cin, std::ostream& out
         json body = json::parse(line, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             resp = invalid_request("invalid JSON request").envelope();
+        } else if (body.contains("op") && !body.at("op").is_string()) {
+            resp = invalid_request("op must be a string").envelope();
         } else {
             std::string op = body.value("op", "");
             int status = 0;
             resp = handler.handle(op, body, status);
         }
-        out << resp.dump() << '\n' << std::flush;
+        out << detail::wire(resp) << '\n' << std::flush;
     }
     handler.close_all();
 }
@@ -634,10 +649,12 @@ inline const char* reason(int status) {
     switch (status) {
         case 200: return "OK";
         case 400: return "Bad Request";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
         case 500: return "Internal Server Error";
         default: return "Error";
     }
@@ -654,6 +671,32 @@ inline std::string response(int status, const std::string& body, bool keep_alive
     return o.str();
 }
 
+/// The http transport is for environment clients, not for browsers: a page open in a browser
+/// on the machine of the server can send requests to it. Returns the error for a request a page
+/// can send, nullopt for any other. Browsers add Origin to every request a page sends to another
+/// site and to every POST, also to its own site; the body types a page can send to another site
+/// without asking first are text/plain and the two form types, never application/json.
+inline std::optional<Error> refusal(const HttpRequest& req) {
+    if (req.headers.count("origin")) {
+        return Error("forbidden",
+                     "request refused: it carries an Origin header, which browsers add to the requests of web "
+                     "pages; an environment server answers environment clients only. Send the request without "
+                     "Origin (monorl's clients and curl send none)",
+                     403);
+    }
+    if (req.method == "POST") {
+        auto it = req.headers.find("content-type");
+        std::string content_type = it == req.headers.end() ? "" : it->second;
+        if (lower(trim(content_type.substr(0, content_type.find(';')))) != "application/json") {
+            return Error("unsupported_media_type",
+                         "request refused: the body of a POST must be sent with Content-Type: application/json, got " +
+                             wire(json(content_type.substr(0, 80))),
+                         415);
+        }
+    }
+    return std::nullopt;
+}
+
 inline void handle_connection(int fd, Handler& handler) {
     Conn c(fd);
     for (;;) {
@@ -662,7 +705,7 @@ inline void handle_connection(int fd, Handler& handler) {
         std::string err_msg;
         if (!read_request(c, req, err_status, err_msg)) {
             if (err_status) {
-                c.write_all(response(err_status, invalid_request(err_msg).envelope().dump() + "\n", false));
+                c.write_all(response(err_status, wire(invalid_request(err_msg).envelope()) + "\n", false));
             }
             return;
         }
@@ -672,7 +715,11 @@ inline void handle_connection(int fd, Handler& handler) {
         int status = 200;
         json resp;
         std::string extra;
-        if (op == "spec" || op == "health") {
+        if (auto refused = refusal(req)) {
+            status = refused->status();
+            resp = refused->envelope();
+            std::cerr << "[mep] " << wire(json(req.method + " " + req.path)) << ": " << refused->what() << std::endl;
+        } else if (op == "spec" || op == "health") {
             if (req.method != "GET" && req.method != "POST") {
                 status = 405;
                 resp = Error("method_not_allowed", "use GET or POST for /" + op, 405).envelope();
@@ -698,7 +745,7 @@ inline void handle_connection(int fd, Handler& handler) {
             status = 404;
             resp = Error("not_found", "no route for " + req.method + " " + req.path, 404).envelope();
         }
-        if (!c.write_all(response(status, resp.dump() + "\n", req.keep_alive, extra))) return;
+        if (!c.write_all(response(status, wire(resp) + "\n", req.keep_alive, extra))) return;
         if (!req.keep_alive) return;
     }
 }
@@ -799,10 +846,25 @@ public:
             ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
             active_.fetch_add(1);
-            std::thread([this, fd] {
-                detail::handle_connection(fd, handler_);
+            try {
+                // Nothing may leave the thread: an exception that did would end the process and
+                // with it every episode. handle_connection closes fd when it is unwound.
+                std::thread([this, fd] {
+                    try {
+                        detail::handle_connection(fd, handler_);
+                    } catch (const std::exception& e) {
+                        std::cerr << "[mep] connection closed after an error: "
+                                  << detail::wire(json(std::string(e.what()))) << std::endl;
+                    } catch (...) {
+                        std::cerr << "[mep] connection closed after an error" << std::endl;
+                    }
+                    active_.fetch_sub(1);
+                }).detach();
+            } catch (const std::system_error& e) {  // no thread to be had: drop this connection
+                std::cerr << "[mep] connection refused, cannot start a thread: " << e.what() << std::endl;
+                ::close(fd);
                 active_.fetch_sub(1);
-            }).detach();
+            }
         }
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (active_.load() > 0 && std::chrono::steady_clock::now() < deadline) {

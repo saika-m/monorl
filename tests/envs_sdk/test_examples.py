@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 from collections import deque
 from collections.abc import Callable
 from typing import Any
 
+import httpx
 import pytest
 
 from monorl.envs import protocol
@@ -235,7 +237,7 @@ def test_http_spec_health_and_statuses(http_server, example: Example) -> None:
     assert spec.protocol == protocol.PROTOCOL_VERSION and spec.name == example.name
     assert client.health()["ok"] is True
     h = client.http
-    assert h.post("/spec").status_code == 200
+    assert h.post("/spec", json={}).status_code == 200
     r = h.get("/reset")
     assert r.status_code == 405 and r.json()["error"]["type"] == "method_not_allowed"
     r = h.get("/nope")
@@ -249,6 +251,102 @@ def test_http_spec_health_and_statuses(http_server, example: Example) -> None:
     r = h.post("/close", json={"episode_id": "ghost"})
     assert r.status_code == 200 and r.json() == {}
     assert r.headers["content-type"].startswith("application/json")
+
+
+def test_http_refuses_what_a_web_page_can_send(http_server, example: Example) -> None:
+    """A page in a browser on the server's machine can POST text/plain and form bodies to it, and
+    its requests carry Origin. None of them reaches the environment; an environment client's do."""
+    client, _ = http_server
+    h = client.http
+    reset = json.dumps(protocol.reset_request("page", make_sample("p", "What is 2+2?", "4"), seed=1))
+    step = json.dumps(protocol.step_request("page", completion("4")))
+    close = json.dumps(protocol.close_request("page"))
+    as_json = {"content-type": "application/json"}
+    evil = {"origin": "http://evil.example"}
+
+    def refused(r: httpx.Response, status: int, etype: str) -> None:
+        sent = {k: v for k, v in r.request.headers.items() if k in ("content-type", "origin")}
+        assert r.status_code == status, f"{r.request.method} {r.request.url.path} {sent}: {r.text}"
+        error = r.json()["error"]
+        assert error["type"] == etype and error["message"], (sent, error)
+
+    for content_type in (
+        "text/plain",
+        "text/plain;charset=UTF-8",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data; boundary=x",
+        "text/plain; application/json",
+    ):
+        for op, body in (("reset", reset), ("step", step), ("close", close)):
+            headers = {"content-type": content_type}
+            refused(h.post(f"/{op}", content=body, headers=headers), 415, "unsupported_media_type")
+            refused(h.post(f"/{op}", content=body, headers=headers | evil), 403, "forbidden")
+    refused(h.post("/reset", content=reset), 415, "unsupported_media_type")  # no Content-Type at all
+    for origin in ("http://evil.example", "null", client.base_url):
+        for op, body in (("reset", reset), ("step", step), ("close", close)):
+            refused(h.post(f"/{op}", content=body, headers=as_json | {"origin": origin}), 403, "forbidden")
+    refused(h.get("/spec", headers=evil), 403, "forbidden")
+    refused(h.get("/health", headers=evil), 403, "forbidden")
+
+    # None of the resets above opened the episode ...
+    r = h.post("/step", content=step, headers=as_json)
+    assert r.status_code == 404 and r.json()["error"]["type"] == "unknown_episode"
+    # ... and the server answers a client: with parameters after the media type, in any case,
+    # and under a name in Host (docker compose addresses a replica as http://env-wordle:8080).
+    r = h.post("/reset", content=reset, headers={"content-type": "application/json; charset=utf-8"})
+    assert r.status_code == 200 and r.json()["messages"], r.text
+    assert h.get("/health", headers={"host": "env-wordle:8080"}).json() == {"ok": True}
+    # A refused step or close leaves the episode as it is: the next step is answered.
+    refused(
+        h.post("/step", content=step, headers={"content-type": "text/plain"}), 415, "unsupported_media_type"
+    )
+    refused(h.post("/close", content=close, headers=as_json | evil), 403, "forbidden")
+    r = h.post("/step", content=step, headers={"content-type": "Application/JSON"})
+    assert r.status_code == 200 and "reward" in r.json(), r.text
+
+
+def _raw_http(base_url: str, request: bytes) -> tuple[int, str]:
+    """Sends ``request`` as it is on a connection of its own; the status and the body of the answer."""
+    url = httpx.URL(base_url)
+    with socket.create_connection((url.host, url.port), timeout=30) as sock:
+        sock.sendall(request)
+        answer = b""
+        while chunk := sock.recv(65536):
+            answer += chunk
+    head, _, body = answer.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1."), f"no http response to {request[:40]!r}: {answer[:200]!r}"
+    return int(head.split()[1]), body.decode("utf-8")  # the body of an answer is UTF-8 whatever was sent
+
+
+def test_http_request_bytes_that_are_not_utf8(http_server, example: Example) -> None:
+    """A request line, header or body with bytes that are not UTF-8 gets an error response, and
+    the server goes on serving: echoing such a path in the 404 used to end the C++ server."""
+    client, proc = http_server
+    body = b'{"episode_id":"\xff\xfe"}'
+    post = b"POST /reset HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+    requests = [
+        b"GET /\xff\xfe HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"G\xffT /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"G\xffT /reset HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        post + b"Content-Type: text/\xff\r\nContent-Length: 2\r\n\r\n{}",
+        post + b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body),
+        post + b"Content-Type: application/json\r\nContent-Length: \xff\r\n\r\n",
+    ]
+    for request in requests:
+        status, text = _raw_http(client.base_url, request)
+        assert 400 <= status < 500, (request, status, text)
+        if text.lstrip().startswith("{"):
+            assert json.loads(text)["error"]["type"], (request, text)
+        assert proc.poll() is None, f"the server exited after {request!r}"
+    assert client.health()["ok"] is True
+    SCENARIOS[example.name](client, "after-raw")
+
+
+def test_stdio_op_that_is_not_a_string(stdio: StdioClient, example: Example) -> None:
+    """``{"op": 5}`` is answered with an error envelope and the next request is served."""
+    assert stdio.raw('{"op": 5}')["error"]["type"] in ("invalid_request", "unknown_op")
+    assert stdio.health()["ok"] is True
+    SCENARIOS[example.name](stdio, "after-op")
 
 
 def test_http_episode(http_server, example: Example) -> None:

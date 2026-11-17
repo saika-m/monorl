@@ -1,4 +1,4 @@
-"""``python -m monorl.server [--host H] [--port P] [--open]``."""
+"""``python -m monorl.server [--host H] [--port P] [--open] [--token T] [--allowed-host NAME]``."""
 
 from __future__ import annotations
 
@@ -15,15 +15,31 @@ def main(argv: list[str] | None = None) -> None:
         "--open", action="store_true", help="Open the UI in a browser once the server starts."
     )
     parser.add_argument("--log-level", default="info")
+    parser.add_argument("--token", help="Access token (default: MONORL_SERVER_TOKEN, else a new random one).")
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        help="Accept this name in the Host header besides localhost, 127.0.0.1 and [::1].",
+    )
     args = parser.parse_args(argv)
 
     import uvicorn
 
+    from monorl.core.errors import ConfigError
+    from monorl.server import auth
     from monorl.server.app import create_app
 
+    try:
+        token = auth.configure(args.host, args.token, args.allowed_host)
+    except ConfigError as e:
+        parser.error(str(e))
     app = create_app()
+    for line in auth.startup_lines(args.host, args.port, token):
+        print(line, flush=True)
     if args.open:
-        threading.Timer(1.0, webbrowser.open, args=(f"http://{args.host}:{args.port}/",)).start()
+        url = auth.signin_url(args.host, args.port, token)
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 

@@ -8,16 +8,32 @@ otherwise via ``params["scope"] = "all"`` (``response_text`` across turns).
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import Params, checked_params
 from monorl.core.types import Message, Trajectory, message_text
 
 ResponseScope = str  # "last" | "all"
 
 
-def reward_name(params: dict[str, Any], default: str) -> str:
+def reward_params(reward_type: str, params: Mapping[str, Any]) -> Params:
+    """``params`` of the built-in ``reward_type`` for reading; a key it does not declare
+    (``declare_params`` next to its class) is a :class:`ConfigError`."""
+    return checked_params("reward", reward_type, params)
+
+
+def reward_name(params: Mapping[str, Any], default: str) -> str:
     return str(params.get("name") or default)
+
+
+def response_scope(params: Mapping[str, Any], reward_type: str) -> ResponseScope:
+    """``params.scope`` (default ``last``), refused when the reward is built if it is neither."""
+    scope = str(params.get("scope", "last"))
+    if scope not in ("last", "all"):
+        raise ConfigError(f"{reward_type}: params.scope must be 'last' or 'all', got {scope!r}")
+    return scope
 
 
 def response_text(trajectory: Trajectory, scope: ResponseScope = "last") -> str:

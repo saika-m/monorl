@@ -3,10 +3,12 @@ from __future__ import annotations
 import pytest
 
 from monorl.config.schema import RewardSpec
+from monorl.core.errors import ConfigError
 from monorl.core.interfaces import RewardFunction
 from monorl.core.registry import registry
+from monorl.core.types import RewardResult
 from monorl.orchestrator.metrics import reward_metrics
-from monorl.rewards import build_reward
+from monorl.rewards import CompositeReward, build_reward
 from monorl.rewards.base import extract_boxed, extract_code_block, extract_last_number
 
 # -- extraction helpers --------------------------------------------------------------------
@@ -60,9 +62,9 @@ def test_exact_match_scope_all_and_reference_key(traj):
 
 
 def test_exact_match_rejects_bad_params():
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "exact_match")({"extract": "magic"})
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "exact_match")({"normalize": ["unicode"]})
 
 
@@ -87,7 +89,7 @@ def test_format_flags_and_fullmatch(traj):
     fn = registry.get("reward", "format")({"pattern": r"yes", "flags": ["IGNORECASE"], "fullmatch": True})
     assert fn([traj("YES")])[0].score == 1.0
     assert fn([traj("yes!")])[0].score == 0.0
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "format")({})
 
 
@@ -105,7 +107,7 @@ def test_length_reward_band_and_penalty(traj):
     )
     assert chars([traj("abcdef")])[0].score == pytest.approx(-0.3)
     assert chars([traj("abcdef")])[0].info["length"] == 6
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "length")({"min_tokens": 5, "max_tokens": 2})
 
 
@@ -219,6 +221,72 @@ def test_nested_composite_members_at_depth_two_and_next_to_a_colliding_name(traj
         [res] = build_reward(specs)([traj("4", "4")])
         assert res.score == 2.0
         assert res.breakdown == expected
+
+
+class Checked:
+    """A reward function that reports more than its score: whether it could check the response."""
+
+    def __init__(self, name: str = "checked") -> None:
+        self.name = name
+
+    def __call__(self, trajectories):
+        out = []
+        for t in trajectories:
+            score = float("4" in t.last_response_text)
+            breakdown = {self.name: score}
+            if "?" in t.last_response_text:  # reported for some responses only
+                breakdown["unsure"] = 1.0
+            out.append(RewardResult(score=score, breakdown=breakdown))
+        return out
+
+
+def test_what_a_reward_function_reports_besides_its_score_is_listed_under_its_key(traj):
+    members = [("exact_match", 1.0, registry.get("reward", "exact_match")({})), ("check", 2.0, Checked())]
+    trajectories = [traj("4", "4"), traj("4?", "4"), traj("5?", "4"), traj("5", "4")]
+    results = CompositeReward(members)(trajectories)
+    # the totals are what they are without the extra entry, and the score under the function's own
+    # name is not listed a second time
+    assert [r.score for r in results] == [3.0, 3.0, 0.0, 0.0]
+    assert [r.breakdown for r in results] == [
+        {"exact_match": 1.0, "check": 1.0},
+        {"exact_match": 1.0, "check": 1.0, "check/unsure": 1.0},
+        {"exact_match": 0.0, "check": 0.0, "check/unsure": 1.0},
+        {"exact_match": 0.0, "check": 0.0},
+    ]
+
+    for t, res in zip(trajectories, results, strict=True):
+        t.reward, t.reward_breakdown = res.score, res.breakdown
+    metrics = reward_metrics(trajectories)
+    assert metrics["reward/mean"] == 1.5 and metrics["reward/check"] == 0.5
+    assert metrics["reward/check/unsure"] == 0.5  # two of four, though two rows do not have it
+
+
+def test_an_extra_entry_gives_way_to_a_member_of_that_name_and_nests_like_a_member(traj):
+    # ``check/unsure`` is taken by a member, at the top and inside a composite, listed before or
+    # after the function that reports ``unsure``
+    taken = ("check/unsure", 0.0, registry.get("reward", "format")({"patterns": ["never"]}))
+    for members in ([("check", 1.0, Checked()), taken], [taken, ("check", 1.0, Checked())]):
+        expected = {"check": 1.0, "check/unsure#2": 1.0, "check/unsure": 0.0}
+        [res] = CompositeReward(members)([traj("4?")])
+        assert res.score == 1.0 and res.breakdown == expected
+        [res] = CompositeReward([("outer", 1.0, CompositeReward(members))])([traj("4?")])
+        assert res.score == 1.0
+        assert res.breakdown == {"outer": 1.0, **{f"outer/{k}": v for k, v in expected.items()}}
+
+    # a composite called like the function and a member called like the entry: two members never
+    # share a key, so neither do their entries
+    inner = CompositeReward([("unsure", 1.0, registry.get("reward", "format")({"patterns": ["never"]}))])
+    specs = [("check", 1.0, inner), ("check#2", 1.0, Checked())]
+    [res] = CompositeReward(specs)([traj("4?")])
+    assert res.breakdown == {"check": 0.0, "check/unsure": 0.0, "check#2": 1.0, "check#2/unsure": 1.0}
+
+
+def test_a_callable_without_a_name_is_still_a_member(traj):
+    def plain(trajectories):
+        return [RewardResult(score=1.0, breakdown={"part": 0.5}) for _ in trajectories]
+
+    [res] = CompositeReward([("plain", 2.0, plain)])([traj("4")])
+    assert res.score == 2.0 and res.breakdown == {"plain": 1.0, "plain/part": 0.5}
 
 
 def test_rewards_reject_non_trajectories():

@@ -14,7 +14,18 @@ from monorl.orchestrator.batching import build_train_batch
 from monorl.rollout.hf_engine import HFRolloutEngine
 from monorl.trainer.reference import ReferenceTrainer
 from tests.rollout.tiny_vlm import image_chat
-from tests.trainer.conftest import SGD, assert_same_update, exported, make_config, reinforce_loss
+from tests.trainer.conftest import (
+    SGD,
+    assert_same_update,
+    bitwise_equal,
+    every_sequence_loss,
+    exported,
+    forward_passes,
+    make_batch,
+    make_config,
+    reinforce_loss,
+    trainer_state,
+)
 
 TEXT_CHAT = [{"role": "user", "content": "Say hello."}]
 
@@ -110,6 +121,58 @@ def test_logprobs_and_a_step_with_images_are_those_of_the_logits_at_every_positi
     for key, value in metrics_a.items():
         assert value == pytest.approx(metrics_b[key], rel=1e-4, abs=1e-6), key
     assert_same_update(initial, weights_a, weights_b)
+
+
+def test_sequences_with_images_are_computed_also_without_advantage(
+    tiny_vlm_dir: Path, vlm_batch: TrainBatch
+) -> None:
+    """Only the sequences with an image reach the vision tower. When they have no advantage its
+    gradient is zero, which is not no gradient: the optimizer decays those weights, so a batch with
+    media is computed whole."""
+    batch = vlm_batch.slice(0, len(vlm_batch))
+    batch.advantages = vlm_batch.advantages.clone()
+    batch.advantages[:4] = 0.0  # the four sequences with an image; the two of the text prompt keep theirs
+    config = make_config(tiny_vlm_dir, micro_batch_size=2, max_seq_len=128, weight_decay=0.1)
+    states = []
+    for loss_fn in (None, every_sequence_loss):
+        trainer = ReferenceTrainer(config, loss_fn=loss_fn)
+        initial = trainer_state(trainer)
+        with forward_passes(trainer) as passes:
+            metrics = trainer.train_step(batch)
+        assert [rows for rows, _ in passes] == [2, 2, 2] and metrics["tokens/sequences_skipped"] == 0
+        states.append(trainer_state(trainer))
+    assert bitwise_equal(*states)
+    trained = [name for name, p in trainer.model.named_parameters() if p.requires_grad]
+    vision = [i for i, name in enumerate(trained) if ".visual." in name]
+    assert any(not torch.equal(states[0][f"weight.{i}"], initial[f"weight.{i}"]) for i in vision)
+
+
+def test_text_sequences_without_advantage_leave_the_vision_tower_without_a_gradient(
+    tiny_vlm_dir: Path, vlm_engine: HFRolloutEngine
+) -> None:
+    """A text sequence does not reach the vision tower, computed or not: when none of a text batch
+    has an advantage, the language model's weights decay and the tower's are not stepped at all."""
+    batch = make_batch(vlm_engine.tokenizer, batch_size=4)
+    batch.advantages = torch.zeros_like(batch.advantages)
+    config = make_config(tiny_vlm_dir, micro_batch_size=2, max_seq_len=128, weight_decay=0.1)
+    states = []
+    for loss_fn in (None, every_sequence_loss):
+        trainer = ReferenceTrainer(config, loss_fn=loss_fn)
+        initial = trainer_state(trainer)
+        with forward_passes(trainer) as passes:
+            for _ in range(2):  # the second step has the momentum of the first to apply
+                metrics = trainer.train_step(batch)
+        assert len(passes) == (0 if loss_fn is None else 4)
+        assert metrics["tokens/sequences_skipped"] == (4 if loss_fn is None else 0)
+        states.append(trainer_state(trainer))
+    assert bitwise_equal(*states)
+    trained = [name for name, p in trainer.model.named_parameters() if p.requires_grad]
+    moved = {
+        name
+        for i, name in enumerate(trained)
+        if not torch.equal(states[0][f"weight.{i}"], initial[f"weight.{i}"])
+    }
+    assert moved and not any(".visual." in name for name in moved)
 
 
 def test_lora_train_step_decreases_loss(tiny_vlm_dir: Path, vlm_batch: TrainBatch) -> None:

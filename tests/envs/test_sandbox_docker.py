@@ -301,7 +301,12 @@ def test_task_directories_in_real_containers(
         )
     write_agent(shared["agent"], TASK_AGENT)
     samples = list(open_source(DataConfig(uri=str(tmp_path / "tasks"), shuffle=False)))
-    config = _config(make_config, ["{python}", "/agent/agent.py"], sandbox={"mounts": shared["mounts"]})
+    config = _config(
+        make_config,
+        ["{python}", "/agent/agent.py"],
+        sandbox={"mounts": shared["mounts"]},
+        host_env=["HOST_FLAVOUR"],
+    )
 
     right, wrong = _episodes(config, samples)
 

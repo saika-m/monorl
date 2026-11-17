@@ -347,11 +347,16 @@ env:
 | `command` | Required. The agent: an argv list, or a string that is split like a shell would split it (no shell runs it). It starts in the episode's fresh working directory, so name a script by absolute path or put it in `workdir.template`. |
 | `timeout` | Seconds the agent may run (default 600). |
 | `env` | Extra environment variables (values may use placeholders). |
+| `host_env` | Names of variables of monorl's own environment that a task of the dataset may read with `${VAR}` (default: none; [`SANDBOX.md`](SANDBOX.md), "What a task may set"). |
 | `verifier` | Optional command run in the working directory after the agent ended. Reward = the last line of its stdout if that is a number, else `1.0` for exit status 0 and `0.0` otherwise. |
 | `verifier_timeout` | Seconds (default 60); a verifier that takes longer scores 0. |
 | `workdir` | `root`: directory the per-episode directories are created under (default: system temp dir). `template`: directory copied into every fresh working directory. |
 | `model` | Model name the agent is told (default `model.name_or_path`). |
 | `gateway` | `bind`: address the gateway listens on, `port` (default: any free one), `host`: the name the agent reaches this machine under (§1, Reachability). The defaults follow where the agent runs: loopback for processes on this host. |
+| `sandbox` | Where the agent and the verifier run: `{backend: local}` (default, processes on this host) or `{backend: docker, ...}` (a container per episode); the options are in [`SANDBOX.md`](SANDBOX.md). |
+| `fetch_images` | Whether the gateway downloads images an agent sends as `http(s)` URLs. Default: `true` for local processes, `false` in a container ([`SANDBOX.md`](SANDBOX.md), section 2). |
+
+Any other key is refused when the config is validated, with the key it resembles.
 
 Placeholders in `command`, `env` values and `verifier`: `{task_file}`, `{workdir}`,
 `{base_url}`, `{anthropic_base_url}`, `{api_key}`, `{model}`, `{python}` (the interpreter running

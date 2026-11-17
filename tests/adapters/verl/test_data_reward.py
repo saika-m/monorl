@@ -18,6 +18,7 @@ from monorl.adapters.verl.data import (
     write_parquet,
 )
 from monorl.adapters.verl.reward import RewardBridge, trajectory_from_verl, write_reward_module
+from monorl.core.errors import ConfigError
 from monorl.core.types import Sample
 
 
@@ -123,6 +124,41 @@ def test_generated_reward_module(make_config, tmp_path: Path):
     assert "reward/len" in hit
     assert miss["score"] == pytest.approx(0.0)
     assert module._bridge is not None  # built once and cached
+
+
+def test_generated_reward_module_reads_a_secret_from_the_environment(
+    make_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``monorl_reward.py`` stays in the run directory: a param that the config read from a variable
+    named like a secret is written as ``${NAME}`` and resolved where verl imports the module."""
+    from monorl.config import loader
+
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("LENGTH_NAME_TOKEN", "len-0123456789")
+    rewards = loader.interpolate_env(
+        [{"type": "length", "params": {"name": "${LENGTH_NAME_TOKEN}", "unit": "words"}}]
+    )
+    cfg = make_config(rewards=rewards)
+    assert cfg.rewards[0].params["name"] == "len-0123456789"
+
+    path = write_reward_module(cfg, tmp_path, config_path=None)
+    assert "len-0123456789" not in path.read_text()
+    module = _load_module(path)
+    assert module.REWARD_SPECS[0]["params"] == {"name": "${LENGTH_NAME_TOKEN}", "unit": "words"}
+    score = module.compute_score(
+        data_source="monorl", solution_str="four", ground_truth="4", extra_info={"reference_encoding": "text"}
+    )
+    assert "reward/len-0123456789" in score
+
+    monkeypatch.delenv("LENGTH_NAME_TOKEN")
+    module._bridge = None
+    with pytest.raises(ConfigError, match="environment variable LENGTH_NAME_TOKEN is not set"):
+        module.compute_score(
+            data_source="monorl",
+            solution_str="four",
+            ground_truth="4",
+            extra_info={"reference_encoding": "text"},
+        )
 
 
 def test_reward_bridge_with_run_config(make_config, tmp_path: Path):

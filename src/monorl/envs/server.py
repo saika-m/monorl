@@ -3,6 +3,9 @@
 ``serve(env_factory, transport="stdio")`` reads one JSON request per line on stdin and writes one
 JSON response per line on stdout (logging goes to stderr). ``transport="http"`` serves the same
 operations with FastAPI/uvicorn in-process (``POST /<op>``, ``GET /spec``, ``GET /health``).
+The http transport is for environment clients, not for browsers: it refuses a request whose
+``Host`` header is a name the server was not given (:func:`allowed_host_names`), a request with
+an ``Origin`` header, and a ``POST`` whose body is not declared ``application/json``.
 Used by ``monorl env serve`` and by the remote-env tests. :class:`MEPServer` holds the episode
 table and is transport-agnostic; :func:`start_http_server` runs the http transport in a daemon
 thread for tests and embedding.
@@ -10,17 +13,21 @@ thread for tests and embedding.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from monorl.core.interfaces import Environment
 from monorl.core.types import Completion
@@ -29,6 +36,10 @@ from monorl.envs.protocol import OPS, EnvSpec, ProtocolError, decode_sample
 log = logging.getLogger("monorl.envs.server")
 
 _FINISH_REASONS = {"stop", "length", "tool_call", "error"}
+
+ANY_HOST = "*"
+"""In ``allowed_hosts``: answer to every ``Host`` name (the ``Origin`` and content type checks stay)."""
+_HOST_NAME = re.compile(r"[a-z0-9]([a-z0-9._-]*[a-z0-9])?")  # a DNS name or an IPv4 address
 
 
 class MEPServer:
@@ -176,8 +187,129 @@ def serve_stdio(server: MEPServer, stdin: Any = None, stdout: Any = None) -> Non
 # -- http -------------------------------------------------------------------------------------
 
 
-def create_app(server: MEPServer) -> FastAPI:
+def _ipv6(address: str) -> str | None:
+    try:
+        return f"[{ipaddress.IPv6Address(address).compressed}]"
+    except ValueError:
+        return None
+
+
+def _host_name(host: str) -> str | None:
+    """The name in a ``Host`` header or an ``allowed_hosts`` entry: lower case, without the port,
+    an IPv6 address compressed and in brackets. ``None`` when it is not ``name``, ``name:port``,
+    ``[v6]`` or ``[v6]:port`` (an entry may also be a bare IPv6 address)."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        address, bracket, port = host[1:].partition("]")
+        name = _ipv6(address)
+        if not bracket or (port and not port.startswith(":")):
+            return None
+        port = port[1:]
+    elif host.count(":") > 1:
+        name, port = _ipv6(host), ""
+    else:
+        name, _, port = host.partition(":")
+        if not _HOST_NAME.fullmatch(name):
+            return None
+    if port and not port.isdigit():
+        return None
+    return name
+
+
+def _is_address(name: str) -> bool:
+    """Whether ``name`` (from :func:`_host_name`) is an IP address and not a DNS name."""
+    if name.startswith("["):
+        return True
+    try:
+        ipaddress.IPv4Address(name)
+    except ValueError:
+        return False
+    return True
+
+
+def allowed_host_names(allowed_hosts: Iterable[str] = ()) -> frozenset[str]:
+    """The DNS names an http server answers to in a ``Host`` header: ``localhost`` and the
+    entries of ``allowed_hosts`` (a port in an entry is ignored; ``"*"`` stands for every name).
+    A ``Host`` that is an IP address is always answered and needs no entry: the check is there
+    for the page whose domain was pointed at this server after it loaded (DNS rebinding), and
+    such a page's requests carry the domain. ``ValueError`` for an entry that is not a host name."""
+    names = {"localhost"}
+    for entry in allowed_hosts:
+        if entry == ANY_HOST:
+            names.add(ANY_HOST)
+            continue
+        name = _host_name(str(entry))
+        if name is None:
+            raise ValueError(
+                f"allowed host {entry!r} is not a host name; give the name clients put in the "
+                f"environment's url (for http://env-1:8080 that is env-1), or {ANY_HOST!r} for any"
+            )
+        names.add(name)
+    return frozenset(names)
+
+
+class _RequestGuard:
+    """ASGI middleware in front of every route: answers 403 to a request that names another
+    host (a page whose domain was re-pointed at this server) or carries ``Origin`` (a page of
+    another site), and 415 to a ``POST`` that is not ``application/json`` (the body types a page
+    can send across sites without asking first are ``text/plain`` and the two form types)."""
+
+    def __init__(self, app: ASGIApp, allowed: frozenset[str]) -> None:
+        self.app = app
+        self.allowed = allowed
+
+    def refusal(self, method: str, headers: Headers) -> tuple[int, str, str] | None:
+        """``(status, error type, message)`` for a request that is refused, else ``None``."""
+        if ANY_HOST not in self.allowed:
+            hosts = headers.getlist("host")
+            name = _host_name(hosts[0]) if len(hosts) == 1 else None
+            if name is None or not (name in self.allowed or _is_address(name)):
+                shown = ", ".join(repr(h[:80]) for h in hosts) or "none"
+                hint = f"--allowed-host {name}" if name else "--allowed-host NAME"
+                return (
+                    403,
+                    "forbidden",
+                    f"request refused: its Host header ({shown}) is not a name of this environment "
+                    f"server ({', '.join(sorted(self.allowed))}, or its IP address). If clients reach "
+                    f"the server under that name, start it with `monorl env serve ... {hint}` "
+                    "(allowed_hosts= of monorl.envs.server.serve)",
+                )
+        if headers.get("origin") is not None:
+            return (
+                403,
+                "forbidden",
+                "request refused: it carries an Origin header, which browsers add to the requests "
+                "of web pages; an environment server answers environment clients only. Send the "
+                "request without Origin (monorl's clients and curl send none)",
+            )
+        if method == "POST":
+            content_type = headers.get("content-type", "")
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                return (
+                    415,
+                    "unsupported_media_type",
+                    f"request refused: the body of a POST must be sent with Content-Type: "
+                    f"application/json, got {content_type[:80]!r}",
+                )
+        return None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            refusal = self.refusal(scope["method"], Headers(scope=scope))
+            if refusal is not None:
+                status, etype, message = refusal
+                log.warning("%s %s: %s", scope["method"], scope["path"], message)
+                response = JSONResponse(ProtocolError(etype, message).to_dict(), status_code=status)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def create_app(server: MEPServer, *, allowed_hosts: Iterable[str] = ()) -> FastAPI:
+    """The http transport of ``server``. It answers requests whose ``Host`` is an IP address,
+    ``localhost`` or one of ``allowed_hosts`` (:func:`allowed_host_names`)."""
     app = FastAPI(title=f"monorl MEP/1: {server.spec.name}")
+    app.add_middleware(_RequestGuard, allowed=allowed_host_names(allowed_hosts))
 
     def _respond(payload: dict[str, Any]) -> JSONResponse:
         if "error" in payload:
@@ -215,12 +347,16 @@ def create_app(server: MEPServer) -> FastAPI:
 class HttpServerHandle:
     """A uvicorn server running in a daemon thread (tests / embedding)."""
 
-    def __init__(self, server: MEPServer, host: str, port: int) -> None:
+    def __init__(self, server: MEPServer, host: str, port: int, allowed_hosts: Iterable[str] = ()) -> None:
         import uvicorn
 
         self.mep = server
         self._config = uvicorn.Config(
-            create_app(server), host=host, port=port, log_level="warning", lifespan="off"
+            create_app(server, allowed_hosts=allowed_hosts),
+            host=host,
+            port=port,
+            log_level="warning",
+            lifespan="off",
         )
         self._server = uvicorn.Server(self._config)
         self._thread = threading.Thread(target=self._server.run, name="monorl-mep-http", daemon=True)
@@ -252,8 +388,10 @@ class HttpServerHandle:
         self.mep.close_all()
 
 
-def start_http_server(server: MEPServer, host: str = "127.0.0.1", port: int = 0) -> HttpServerHandle:
-    return HttpServerHandle(server, host, port).start()
+def start_http_server(
+    server: MEPServer, host: str = "127.0.0.1", port: int = 0, allowed_hosts: Iterable[str] = ()
+) -> HttpServerHandle:
+    return HttpServerHandle(server, host, port, allowed_hosts).start()
 
 
 def serve(
@@ -264,8 +402,14 @@ def serve(
     port: int = 8000,
     name: str | None = None,
     parallel_episodes: int = 8,
+    allowed_hosts: Iterable[str] = (),
 ) -> None:
-    """Serve ``env_factory`` (a fresh Environment per episode) until EOF / shutdown."""
+    """Serve ``env_factory`` (a fresh Environment per episode) until EOF / shutdown.
+
+    Over http the server answers requests whose ``Host`` header is an IP address, ``localhost``
+    or an entry of ``allowed_hosts``: list there the DNS names other machines use for the server
+    (``"*"`` accepts every name)."""
+    allowed = allowed_host_names(allowed_hosts)  # a bad entry fails before the environment is built
     server = MEPServer(env_factory, name=name, parallel_episodes=parallel_episodes)
     if transport == "stdio":
         logging.basicConfig(stream=sys.stderr, level=logging.INFO)
@@ -278,9 +422,18 @@ def serve(
     elif transport == "http":
         import uvicorn
 
-        uvicorn.run(create_app(server), host=host, port=port, log_level="info")
+        uvicorn.run(create_app(server, allowed_hosts=allowed), host=host, port=port, log_level="info")
     else:
         raise ValueError(f"unknown transport {transport!r}; expected 'stdio' or 'http'")
 
 
-__all__ = ["HttpServerHandle", "MEPServer", "create_app", "serve", "serve_stdio", "start_http_server"]
+__all__ = [
+    "ANY_HOST",
+    "HttpServerHandle",
+    "MEPServer",
+    "allowed_host_names",
+    "create_app",
+    "serve",
+    "serve_stdio",
+    "start_http_server",
+]

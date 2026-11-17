@@ -1,5 +1,5 @@
-"""``web/mock/config_schema.json``, which the mock of the API serves to the web UI in development,
-has the fields and the field descriptions of the config schema."""
+"""``web/mock/config_schema.json`` and ``web/mock/pipeline_schema.json``, which the mock of the API
+serves to the web UI in development, have the fields and the field descriptions of the schemas."""
 
 from __future__ import annotations
 
@@ -8,10 +8,19 @@ from pathlib import Path
 
 import pytest
 
+from monorl.config.pipeline import PipelineConfig
 from monorl.config.schema import RunConfig
-from monorl.config.schema_json import REGENERATE_COMMAND, field_descriptions, main, stale_fields
+from monorl.config.schema_json import (
+    REGENERATE_COMMAND,
+    REGENERATE_PIPELINE_COMMAND,
+    field_descriptions,
+    main,
+    stale_fields,
+)
 
-MOCK_SCHEMA = Path(__file__).resolve().parents[2] / "web" / "mock" / "config_schema.json"
+MOCK = Path(__file__).resolve().parents[2] / "web" / "mock"
+MOCK_SCHEMA = MOCK / "config_schema.json"
+MOCK_PIPELINE_SCHEMA = MOCK / "pipeline_schema.json"
 
 
 def test_the_checked_in_mock_schema_has_every_field_and_description() -> None:
@@ -53,3 +62,29 @@ def test_check_reports_a_stale_copy_and_write_repairs_it(
     assert main(["--write", str(copy)]) == 0
     assert main(["--check", str(copy)]) == 0
     assert json.loads(copy.read_text(encoding="utf-8")) == RunConfig.json_schema()
+
+
+def test_the_checked_in_pipeline_schema_has_every_stage_field_and_description(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stale = stale_fields(MOCK_PIPELINE_SCHEMA, pipeline=True)
+    assert not stale, f"{MOCK_PIPELINE_SCHEMA} is out of date for {stale}; run: {REGENERATE_PIPELINE_COMMAND}"
+    # what the stage editors of the UI look up: $defs.<Stage>.properties.<field>.description
+    schema = json.loads(MOCK_PIPELINE_SCHEMA.read_text(encoding="utf-8"))
+    described = field_descriptions(schema)
+    assert {"TrainStage.overrides", "RejectionSampleStage.min_reward", "EvalStage.num_samples"} <= set(
+        described
+    )
+    wanted = PipelineConfig.json_schema()["$defs"]["EvalStage"]["properties"]["num_samples"]["description"]
+    assert described["EvalStage.num_samples"] == wanted
+
+    del schema["$defs"]["EvalStage"]["properties"]["num_samples"]["description"]
+    copy = tmp_path / "pipeline_schema.json"
+    copy.write_text(json.dumps(schema), encoding="utf-8")
+    assert main(["--pipeline", "--check", str(copy)]) == 1
+    assert REGENERATE_PIPELINE_COMMAND in capsys.readouterr().err
+    # the run config's schema is another document: its file does not pass for the pipeline's
+    assert main(["--pipeline", "--check", str(MOCK_SCHEMA)]) == 1
+    capsys.readouterr()
+    assert main(["--pipeline", "--write", str(copy)]) == 0
+    assert json.loads(copy.read_text(encoding="utf-8")) == PipelineConfig.json_schema()

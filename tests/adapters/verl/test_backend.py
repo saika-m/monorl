@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
+import psutil
 import pytest
+import yaml
 
 from monorl.adapters.verl import backend as backend_module
 from monorl.adapters.verl.backend import (
@@ -17,34 +22,52 @@ from monorl.adapters.verl.backend import (
     final_model_path,
     latest_step,
     link_checkpoints,
+    resume_step,
 )
+from monorl.config.schema import RunConfig
 from monorl.core.errors import BackendUnavailable
 from monorl.core.registry import registry
-from monorl.core.reporting import RunReporter, list_checkpoints, read_status
+from monorl.core.reporting import RunReporter, iter_metrics, list_checkpoints, read_status
 
 _FAKE_ENTRY = """
-import json, os, signal, sys, time
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 
 run_dir = Path(os.environ["MONORL_RUN_DIR"])
 mode = os.environ.get("FAKE_ENTRY_MODE", "ok")
+overrides = dict(arg.split("=", 1) for arg in sys.argv[1:])
+# verl/trainer/ppo/ray_trainer.py _load_checkpoint: "disable" loads nothing; "auto" continues after
+# the step of latest_checkpointed_iteration.txt when its global_step_<n> exists, else from scratch.
+tracker = run_dir / "checkpoints" / "latest_checkpointed_iteration.txt"
+start = 0
+if overrides["trainer.resume_mode"] == "auto" and tracker.exists():
+    start = int(tracker.read_text())
+    if not (run_dir / "checkpoints" / f"global_step_{start}").exists():
+        start = 0
 print("fake verl entry argv:", sys.argv[1:], flush=True)
 print("RAY_ADDRESS=", os.environ.get("RAY_ADDRESS"), flush=True)
 if mode == "fail":
     print("boom", file=sys.stderr, flush=True)
     sys.exit(3)
+if mode == "stubborn":
+    # a driver that SIGTERM does not end, with a worker in a session of its own
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True)
+    (run_dir / "worker.pid").write_text(str(worker.pid))
 with open(run_dir / "metrics.jsonl", "a") as f:
-    for step in (1, 2):
+    for step in (start + 1, start + 2):
         f.write(json.dumps({"step": step, "time": 0.0, "phase": "train", "reward/mean": 0.25 * step, "actor/lr": 1e-6}) + "\\n")
         f.flush()
         if mode == "hang":
             time.sleep(0.2)
-ckpt = run_dir / "checkpoints" / "global_step_2" / "actor" / "huggingface"
-ckpt.mkdir(parents=True)
-(run_dir / "checkpoints" / "latest_checkpointed_iteration.txt").write_text("2")
+ckpt = run_dir / "checkpoints" / f"global_step_{start + 2}" / "actor" / "huggingface"
+ckpt.mkdir(parents=True, exist_ok=True)
+tracker.write_text(str(start + 2))
 if mode == "hang":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     time.sleep(60)
+if mode == "stubborn":
+    time.sleep(600)
 print("done", flush=True)
 """
 
@@ -103,6 +126,38 @@ def test_prepare_stages_run_dir(make_config, tmp_path: Path):
     assert "actor_rollout_ref.rollout.multi_turn.enable=true" in overrides
 
 
+def test_prepare_leaves_a_secret_of_a_reward_in_no_file_of_the_run_directory(
+    base_config: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``api_key: ${OPENAI_API_KEY}`` in the ``extra_body`` of ``llm_judge``: no file that ``prepare`` stages
+    holds the value, and the reward module names the variable for verl's workers to resolve."""
+    from monorl.config import loader
+
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-verl-0123456789abcdef")
+    params = {"model": "judge-model", "extra_body": {"api_key": "${OPENAI_API_KEY}"}}
+    base_config["rewards"] = [{"type": "llm_judge", "params": params}]
+    source = tmp_path / "user-config.yaml"
+    source.write_text(yaml.safe_dump(base_config))
+    cfg = RunConfig.from_yaml(source)
+    assert cfg.rewards[0].params["extra_body"]["api_key"] == "sk-verl-0123456789abcdef"
+
+    run_dir = tmp_path / "run"
+    VerlBackend(cfg).prepare(cfg, run_dir)
+    files = sorted(p for p in run_dir.rglob("*") if p.is_file())
+    assert [p.name for p in files] == [
+        "config.yaml",
+        "train.parquet",
+        "monorl_reward.py",
+        "verl_config.yaml",
+        "verl_overrides.txt",
+    ]
+    holding = [p.name for p in files if b"sk-verl-0123456789abcdef" in p.read_bytes()]
+    assert holding == []
+    assert "'api_key': '${OPENAI_API_KEY}'" in (run_dir / "monorl_reward.py").read_text()
+    assert RunConfig.from_yaml(run_dir / "config.yaml") == cfg
+
+
 def test_run_requires_verl_unless_custom_python(make_config, tmp_path: Path):
     if backend_module.is_available():
         pytest.skip("verl importable")
@@ -130,6 +185,66 @@ def test_run_succeeds_and_collects_checkpoints(make_config, tmp_path: Path, fake
     assert (run_dir / "checkpoints" / "step-2").resolve() == (
         run_dir / "checkpoints" / "global_step_2"
     ).resolve()
+
+
+def _steps(run_dir: Path) -> list[int]:
+    return [row["step"] for _, row in iter_metrics(run_dir)]
+
+
+def _stopped_after_step_3(make_config, run_dir: Path):
+    """A verl run with a checkpoint of step 2 that was stopped after it wrote the row of step 3."""
+    cfg = make_config()
+    assert _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False)).state == "succeeded"
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write(json.dumps({"step": 3, "time": 0.0, "phase": "train", "reward/mean": 0.9}) + "\n")
+    return cfg
+
+
+def test_resume_continues_from_the_checkpoint_and_drops_the_rows_after_it(
+    make_config, tmp_path: Path, fake_entry: Path
+):
+    run_dir = tmp_path / "run"
+    cfg = _stopped_after_step_3(make_config, run_dir)
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write('{"step": 4, "time": 0.0, "pha')  # killed in the middle of the row of step 4
+    assert resume_step(run_dir) == 2
+
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False), resume=True)
+    assert result.state == "succeeded", result.error
+    assert result.final_step == 4
+    log = (run_dir / "run.log").read_text()
+    assert "'trainer.resume_mode=auto'" in log.rsplit("fake verl entry argv:", 1)[1]
+    assert "continues after step 2" in log
+    rows = [row for _, row in iter_metrics(run_dir)]
+    assert [row["step"] for row in rows] == [1, 2, 3, 4]  # step 3 once, and no unreadable line
+    assert rows[2]["reward/mean"] == 0.75  # the row of this run, not the one of the killed run
+    assert len((run_dir / "metrics.jsonl").read_text().splitlines()) == 4
+    assert [Path(p).name for p in result.checkpoints] == ["global_step_2", "global_step_4"]
+
+
+def test_run_without_resume_starts_over_in_a_used_directory(make_config, tmp_path: Path, fake_entry: Path):
+    run_dir = tmp_path / "run"
+    cfg = _stopped_after_step_3(make_config, run_dir)
+    rows_before = _steps(run_dir)
+
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert result.state == "succeeded", result.error
+    log = (run_dir / "run.log").read_text()
+    assert "'trainer.resume_mode=disable'" in log.rsplit("fake verl entry argv:", 1)[1]
+    assert result.final_step == 2  # trained steps 1 and 2 again instead of continuing at step 3
+    assert _steps(run_dir)[len(rows_before) :] == [1, 2]
+
+
+def test_resume_step_follows_verls_marker(tmp_path: Path):
+    root = tmp_path / "checkpoints"
+    (root / "global_step_4").mkdir(parents=True)
+    assert resume_step(tmp_path) == 0  # verl resumes from the marker, not from the directories
+    (root / "latest_checkpointed_iteration.txt").write_text("6")
+    assert resume_step(tmp_path) == 0  # global_step_6 is not there: verl trains from scratch
+    (root / "latest_checkpointed_iteration.txt").write_text("4")
+    assert resume_step(tmp_path) == 4
+    (root / "latest_checkpointed_iteration.txt").write_text("four")
+    assert resume_step(tmp_path) is None
 
 
 def test_run_failure_reports_exit_code(
@@ -169,6 +284,109 @@ def test_cancel_propagates_sigterm(
     assert result.final_step == 2
     assert read_status(run_dir)["state"] == "cancelled"
     assert "cancel requested" in (run_dir / "run.log").read_text()
+
+
+@pytest.fixture
+def signals_in_a_status_write(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
+    """``send(*signals)``: the main thread gets them, one after the other, in the middle of the
+    first write of ``status.json`` that reports a step of the driver. That write is
+    ``RunReporter.set_status`` in the backend's wait loop, which holds the reporter's lock."""
+    from monorl.core import reporting
+
+    write, pending = reporting._atomic_write_json, []
+
+    def write_and_signal(path: Path, payload: dict) -> None:
+        write(path, payload)
+        if pending and payload["state"] == "running" and payload["step"] >= 1:
+            signals = list(pending)
+            pending.clear()
+            for sig in signals:
+                signal.raise_signal(sig)
+
+    monkeypatch.setattr(reporting, "_atomic_write_json", write_and_signal)
+    return pending.extend
+
+
+@pytest.mark.timeout(60)
+def test_a_signal_during_a_write_of_the_reporter_cancels_instead_of_hanging(
+    make_config, tmp_path: Path, fake_entry: Path, monkeypatch: pytest.MonkeyPatch, signals_in_a_status_write
+):
+    """The handler runs on the main thread, here while that thread holds the reporter's lock: a
+    handler that logged would wait for the lock for ever (the timeout ends the test then)."""
+    monkeypatch.setenv("FAKE_ENTRY_MODE", "hang")
+    cfg = make_config()
+    run_dir = tmp_path / "run"
+    signals_in_a_status_write([signal.SIGTERM])
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert result.state == "cancelled" and result.error is None
+    assert read_status(run_dir)["state"] == "cancelled"
+    assert "cancel requested: sent SIGTERM to verl driver" in (run_dir / "run.log").read_text()
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+def _ended(pid: int) -> bool:
+    """Whether the process ``pid`` has ended; one that was just killed has ten seconds to go."""
+    try:
+        process = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return True
+    return not psutil.wait_procs([process], timeout=10)[1]
+
+
+@pytest.mark.timeout(60)
+def test_a_second_signal_kills_the_driver_and_what_it_started(
+    make_config, tmp_path: Path, fake_entry: Path, monkeypatch: pytest.MonkeyPatch, signals_in_a_status_write
+):
+    """A driver that ignores SIGTERM, with a worker in another session: no signal to a process
+    group reaches both. The second signal ends the run at once, without the grace period (ten
+    minutes here, against the timeout of the test), and leaves neither of them."""
+    monkeypatch.setenv("FAKE_ENTRY_MODE", "stubborn")
+    cfg = make_config()
+    run_dir = tmp_path / "run"
+    backend = _backend(cfg)
+    backend.grace_seconds = 600.0
+    signals_in_a_status_write([signal.SIGINT, signal.SIGINT])
+    try:
+        result = backend.run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False))
+        worker = int((run_dir / "worker.pid").read_text())
+        assert result.state == "cancelled" and result.error == "interrupted"
+        status = read_status(run_dir)
+        assert status["state"] == "cancelled"
+        assert _ended(status["child_pid"]) and _ended(worker)
+        assert "received SIGINT again: stopping now" in (run_dir / "run.log").read_text()
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    finally:  # what a run that did not kill them leaves behind
+        leftovers = [int(p.read_text()) for p in run_dir.glob("worker.pid")]
+        leftovers.append((read_status(run_dir) or {}).get("child_pid"))
+        for pid in leftovers:
+            if pid and psutil.pid_exists(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_a_signal_while_the_run_is_prepared_ends_it_before_the_driver_is_started(
+    make_config, tmp_path: Path, fake_entry: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The first signal sets the event of the run while the data are exported: the run ends
+    cancelled, and the driver, which would train to the end, is never started."""
+    cancel = threading.Event()
+    export = backend_module.export_datasets
+
+    def export_and_signal(*args, **kwargs):
+        try:
+            return export(*args, **kwargs)
+        finally:
+            cancel.set()
+
+    monkeypatch.setattr(backend_module, "export_datasets", export_and_signal)
+    cfg = make_config()
+    run_dir = tmp_path / "run"
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False), cancel=cancel)
+    assert result.state == "cancelled" and result.error is None and result.final_step == 0
+    status = read_status(run_dir)
+    assert status["state"] == "cancelled" and status["message"] == "cancelled before verl was started"
+    assert "child_pid" not in status and not (run_dir / "metrics.jsonl").exists()
+    log = (run_dir / "run.log").read_text()
+    assert "launching" not in log and "fake verl entry" not in log
 
 
 def test_checkpoint_helpers(tmp_path: Path):

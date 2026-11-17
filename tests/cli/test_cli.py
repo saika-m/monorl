@@ -211,6 +211,36 @@ def test_recipes_dir_env_override(runner: CliRunner, tmp_path: Path, monkeypatch
 RECIPE_BODY = "model: {name_or_path: x}\ndata: {uri: y}\nrewards: [{type: exact_match}]\n"
 
 
+def test_recipes_show_json_names_the_variable_of_a_secret(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--json`` prints the loaded config; what it read from ``${JUDGE_API_KEY}`` stays out of a
+    terminal or a CI log, as it stays out of ``config.yaml``."""
+    from monorl.config import loader
+
+    body = RECIPE_BODY.replace("{type: exact_match}", "{type: my_judge, params: {k: '${JUDGE_API_KEY}'}}")
+    (tmp_path / "judged.yaml").write_text("# Judged.\n" + body)
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("MONORL_RECIPES_DIR", str(tmp_path))
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-cli-0123456789abcdef")
+    result = runner.invoke(app, ["recipes", "show", "judged", "--json"])
+    assert result.exit_code == 0, result.output
+    assert "sk-cli-0123456789abcdef" not in result.output
+    assert json.loads(result.output)["config"]["rewards"][0]["params"] == {"k": "${JUDGE_API_KEY}"}
+
+
+def test_recipes_list_shows_a_description_with_brackets_as_written(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "tags.yaml").write_text(
+        "# Prompts in the [INST] ... [/INST] format, [bold] kept.\n" + RECIPE_BODY
+    )
+    monkeypatch.setenv("MONORL_RECIPES_DIR", str(tmp_path))
+    result = runner.invoke(app, ["recipes", "list"], env={"COLUMNS": "1000"})
+    assert result.exit_code == 0, result.output
+    assert "Prompts in the [INST] ... [/INST] format, [bold] kept." in result.output
+
+
 def test_yml_recipe_is_listed_and_shown(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -333,6 +363,143 @@ def test_train_rejects_invalid_config(runner: CliRunner, tmp_path: Path) -> None
     result = runner.invoke(app, ["train", "--config", str(tmp_path / "missing.yaml")])
     assert result.exit_code == 1
     assert "not found" in result.output
+
+
+def test_train_names_the_file_and_the_key_of_an_invalid_config(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
+) -> None:
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "--config",
+            str(cfg_path),
+            "--set",
+            "trainer.max_stps=1",
+            "--set",
+            "rollout.group_size=two",
+        ],
+        env={"COLUMNS": "1000"},
+    )
+    assert result.exit_code == 1
+    assert [line.strip() for line in result.output.strip().splitlines()] == [
+        f"error: {cfg_path}: invalid RunConfig, 2 problems:",
+        "rollout.group_size: Input should be a valid integer, unable to parse string as an integer (got 'two')",
+        "trainer.max_stps: unknown key; did you mean max_steps?",
+    ]
+
+
+def test_train_refuses_a_misspelt_reward_or_environment_parameter_before_it_starts_a_run(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monorl.orchestrator
+
+    started: list[RunConfig] = []
+    monkeypatch.setattr(monorl.orchestrator, "run", lambda config, *a, **kw: started.append(config))
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "--config",
+            str(cfg_path),
+            "--set",
+            "rewards=[{type: exact_match, params: {extrct: boxed}}]",
+            "--set",
+            "env={type: tool_calling, params: {max_turn: 3}}",
+        ],
+        env={"COLUMNS": "1000"},
+    )
+    assert result.exit_code == 1 and started == []
+    head, reward, env = (line.strip() for line in result.output.strip().splitlines())
+    assert head == f"error: {cfg_path}: invalid RunConfig, 2 problems:"
+    assert reward.startswith(
+        "rewards.0.params.extrct: unknown key; did you mean extract? The exact_match reward takes: name, extract, "
+    )
+    assert env.startswith(
+        "env.params.max_turn: unknown key; did you mean max_turns? The tool_calling environment takes: tools, "
+    )
+
+
+def test_train_given_a_recipe_name_says_where_the_recipe_is(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["train", "--config", "grpo_gsm8k_smollm_cpu"], env={"COLUMNS": "1000"})
+    assert result.exit_code == 1
+    path = recipes_dir() / "grpo_gsm8k_smollm_cpu.yaml"
+    assert "config file not found: grpo_gsm8k_smollm_cpu" in result.output
+    assert f"--config {path}" in result.output
+    result = runner.invoke(app, ["train", "--config", "no_such_recipe"], env={"COLUMNS": "1000"})
+    assert result.output.strip() == "error: config file not found: no_such_recipe"
+
+
+def test_train_reports_a_mistake_in_the_config_once_and_without_a_traceback(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
+) -> None:
+    """A run that fails because its config has to change says what, in the log and at the end of
+    the command: there is no traceback to point to."""
+    run_config_dict["data"]["prompt_field"] = "no_such_column"
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    run_dir = tmp_path / "rd"
+    result = runner.invoke(
+        app, ["train", "--config", str(cfg_path), "--run-dir", str(run_dir)], env={"COLUMNS": "1000"}
+    )
+    assert result.exit_code == 1
+    message = "DataError: column 'no_such_column' not found; available: ['answer', 'prompt']"
+    summary = result.output.partition("state: failed")[2].strip().splitlines()
+    assert summary == ["final step: 0", message]
+    log = (run_dir / "run.log").read_text()
+    assert log.splitlines()[-1].endswith(f"[failed] {message}") and "Traceback" not in log
+
+
+def test_train_reports_the_error_of_a_failed_run_without_repeating_its_traceback(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
+) -> None:
+    """A run that fails with anything else reports its message followed by the traceback, which
+    the run log has shown and keeps: the command ends with the message and where the traceback is."""
+    from monorl.core.registry import registry
+
+    def broken(params: dict[str, Any], **_: Any) -> Any:
+        raise RuntimeError("the reward cannot start")
+
+    registry.register("reward", "cli_test_broken", broken)
+    run_config_dict["rewards"] = [{"type": "cli_test_broken"}]
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    run_dir = tmp_path / "rd"
+    try:
+        result = runner.invoke(
+            app, ["train", "--config", str(cfg_path), "--run-dir", str(run_dir)], env={"COLUMNS": "1000"}
+        )
+    finally:
+        registry._items["reward"].pop("cli_test_broken")
+    assert result.exit_code == 1
+    summary = result.output.partition("state: failed")[2].strip().splitlines()
+    assert summary == [
+        "final step: 0",
+        f"RuntimeError: the reward cannot start (traceback in {run_dir.resolve() / 'run.log'})",
+    ]
+    assert "Traceback (most recent call last)" in (run_dir / "run.log").read_text()
+
+
+@pytest.mark.parametrize("command", ["train", "pipeline"])
+def test_a_run_directory_that_cannot_be_created_is_an_error_not_a_traceback(
+    runner: CliRunner, tmp_path: Path, command: str
+) -> None:
+    base = {"model": {"name_or_path": "x"}, "data": {"uri": "d.jsonl"}, "rewards": [{"type": "exact_match"}]}
+    payload = base if command == "train" else {"base": base, "stages": [{"type": "train", "name": "a"}]}
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(payload))
+    (tmp_path / "taken").write_text("a file where the run directory's parent would be")
+    result = runner.invoke(
+        app, [command, "--config", str(cfg_path), "--run-dir", str(tmp_path / "taken" / "rd")]
+    )
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    flat = " ".join(result.output.split())
+    kind = "run" if command == "train" else "pipeline"
+    assert flat.startswith(f"error: cannot write the {kind} directory: ") and "Traceback" not in flat
 
 
 # -- env check ----------------------------------------------------------------------------
@@ -591,7 +758,10 @@ def test_patches_list_and_status(runner: CliRunner, monkeypatch: pytest.MonkeyPa
     assert result.exit_code == 0 and "patches: trl" in result.output and "patches: vllm" not in result.output
 
     result = runner.invoke(app, ["patches", "status", "nothing"])
-    assert result.exit_code == 0 and "no patches registered" in result.output
+    assert result.exit_code == 1
+    message = " ".join(result.output.split())
+    assert "no patches are registered for 'nothing'; frameworks with patches: trl, vllm" in message
+    assert runner.invoke(app, ["patches", "status", "nothing", "--json"]).exit_code == 1
 
 
 def test_patches_apply_reports(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -650,6 +820,23 @@ def test_data_inspect_reports_a_missing_path_without_a_traceback(runner: CliRunn
     assert "Traceback" not in result.output
 
 
+def test_data_inspect_shows_bracketed_text_as_it_is(runner: CliRunner, tmp_path: Path) -> None:
+    """Rows and messages are text, not console markup: ``[/INST]`` is no closing tag (it used to
+    end the command with a MarkupError) and ``[bold]`` no style (it used to vanish)."""
+    f = tmp_path / "d[v1].jsonl"
+    f.write_text(json.dumps({"prompt": "[INST] What is [bold]2+2[/bold]? [/INST]", "answer": "[4]"}) + "\n")
+    result = runner.invoke(app, ["data", "inspect", str(f)], env={"COLUMNS": "1000"})
+    assert result.exit_code == 0, result.output
+    lines = [" ".join(line.split()) for line in result.output.splitlines()]
+    assert lines[0] == str(f)
+    assert "│ [INST] What is [bold]2+2[/bold]? [/INST] │ [4] │" in lines
+    assert f"sample {f}#0 reference='[4]'" in lines
+
+    result = runner.invoke(app, ["data", "inspect", str(tmp_path / "[x-z]*.jsonl")], env={"COLUMNS": "1000"})
+    assert result.exit_code == 1
+    assert result.output.strip() == f"error: glob '{tmp_path}/[x-z]*.jsonl' matched no supported data files"
+
+
 def test_data_inspect_reads_the_data_source_of_a_provider(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -693,3 +880,33 @@ def test_data_inspect_renders_media_parts_as_markers(runner: CliRunner, tmp_path
     assert [" ".join(line.split()) for line in sample_lines] == [
         f"[user] <image: {tmp_path / 'red.png'}> What colour?"
     ]
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1"])
+def test_env_check_refuses_a_timeout_that_is_not_positive(runner: CliRunner, timeout: str) -> None:
+    result = runner.invoke(app, ["env", "check", "--url", "http://127.0.0.1:9", "--timeout", timeout])
+    assert result.exit_code == 2, result.output
+    assert f"--timeout must be greater than 0 seconds, got {float(timeout)}" in result.output
+
+
+def test_env_serve_param_without_a_value_is_named_as_written(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["env", "serve", "single_turn", "-p", "max_turns"])
+    assert result.exit_code == 2, result.output
+    assert "--param must look like key=value, got 'max_turns'" in result.output
+    assert "params." not in result.output
+
+
+def test_env_serve_refuses_a_param_the_type_does_not_take(runner: CliRunner) -> None:
+    result = runner.invoke(
+        app,
+        ["env", "serve", "tool_calling", "-p", "tools=[calculator]", "-p", "max_turn=3"],
+        env={"COLUMNS": "1000"},
+    )
+    assert result.exit_code == 1, result.output
+    assert "env.params.max_turn: unknown key; did you mean max_turns?" in result.output
+
+
+def test_version_is_the_installed_distributions(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.output == f"monorl {importlib.metadata.version('monorl')}\n"

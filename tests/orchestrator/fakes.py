@@ -8,6 +8,7 @@ orchestrator's lazy sibling-package lookups at the fake data/reward/advantage/ba
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -363,6 +364,22 @@ class ExactReward:
         return out
 
 
+class WarningReward(ExactReward):
+    """Scores like ``test_exact`` and, as ``llm_judge`` does for the judgments that failed, logs
+    one warning per call: from a thread of its own, which has ended when the call returns."""
+
+    name = "test_warning"
+    log = logging.getLogger("monorl.rewards.test_warning")
+
+    def __call__(self, trajectories: Sequence[Trajectory]) -> list[RewardResult]:
+        warn = threading.Thread(
+            target=self.log.warning, args=("reward test_warning: %d scored", len(trajectories))
+        )
+        warn.start()
+        warn.join()
+        return super().__call__(trajectories)
+
+
 class CompositeReward:
     name = "composite"
 
@@ -557,6 +574,7 @@ def install_fakes(monkeypatch: Any = None) -> None:
     registry.register("trainer", "fake", FakeTrainer, overwrite=True)
     registry.register("env", "fake_multi", FakeMultiTurnEnv, overwrite=True)
     registry.register("reward", "test_exact", lambda params, **kw: ExactReward(params), overwrite=True)
+    registry.register("reward", "test_warning", lambda params, **kw: WarningReward(params), overwrite=True)
     routes = {
         "_resolve_open_source": lambda: fake_open_source,
         "_resolve_build_reward": lambda: fake_build_reward,

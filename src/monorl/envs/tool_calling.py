@@ -13,8 +13,9 @@ assistant answers without tool calls or the turn budget is exhausted. Malformed 
 cost ``invalid_call_penalty`` once per turn. Final-answer scoring is left to reward functions
 (the final assistant message is the last ``assistant`` turn of the trajectory).
 
-Built-in tools: ``calculator`` (safe AST arithmetic), ``python_exec`` (isolated subprocess with a
-timeout) and ``lookup`` (in-memory corpus from ``params["corpus"]``). User tools register with
+Built-in tools: ``calculator`` (safe AST arithmetic), ``python_exec`` (a subprocess with a
+directory of its own, a timeout and a memory limit; not a security boundary, see
+:func:`python_exec`) and ``lookup`` (in-memory corpus from ``params["corpus"]``). User tools register with
 :func:`tool`; list the modules that define them in ``params["tool_modules"]`` so they are imported.
 
 Python-level interface used by other backends (verl/nemo bridges)::
@@ -32,6 +33,7 @@ import math
 import operator
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,7 +42,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import checked_params, declare_params
 from monorl.core.types import Completion, Message, Sample, StepResult, ToolCall, message_text
+from monorl.rewards.code_exec import Sandbox
 
 ToolFn = Callable[..., Any]
 
@@ -185,24 +190,64 @@ def calculator(expression: str) -> str:
     return str(value)
 
 
-def python_exec(code: str, *, timeout_s: float = 5.0, max_output_chars: int = 4000) -> str:
-    """Run ``code`` in a fresh isolated interpreter (``-I``) with a wall-clock timeout."""
-    env = {"PATH": os.environ.get("PATH", ""), "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"}
+def python_exec(
+    code: str, *, timeout_s: float = 5.0, memory_mb: int = 512, max_output_chars: int = 4000
+) -> str:
+    """Run ``code`` in a fresh interpreter (``-I``) and return what it printed.
+
+    The program gets a new directory as working directory, ``HOME`` and ``TMPDIR``, deleted when
+    the call returns, and a process group of its own, killed when the program ends or after
+    ``timeout_s`` seconds of wall-clock time. It is also killed when the resident memory of the
+    program and the processes it started exceeds ``memory_mb`` (``0``: no limit); the watchdog of
+    the ``code_exec`` reward does both, by polling, so an allocation can pass the limit for the
+    length of a poll.
+
+    None of this confines the code: it runs on this machine as the user who runs the
+    environment, with that user's files (by absolute path), the network and the installed
+    packages, and a program that starts a session of its own leaves the process group. Give the
+    tool to a policy only where that user may run what the policy writes.
+    """
+    watchdog = Sandbox(timeout_s=timeout_s, memory_mb=memory_mb)
+    workdir = tempfile.mkdtemp(prefix="monorl-python-exec-")
     try:
-        proc = subprocess.run(
-            [sys.executable, "-I", "-c", str(code)],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            env=env,
-            cwd=tempfile.gettempdir(),
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired:
-        return f"error: execution timed out after {timeout_s}s"
-    out = proc.stdout
-    if proc.stderr:
-        out += ("\n" if out else "") + "stderr:\n" + proc.stderr
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": workdir,
+            "TMPDIR": workdir,
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        # Output goes to files, not pipes: a process the program left behind cannot hold the call
+        # open. They are not in the working directory, where the program could replace them.
+        with tempfile.TemporaryFile() as fout, tempfile.TemporaryFile() as ferr:
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-c", str(code)],
+                cwd=workdir,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=fout,
+                stderr=ferr,
+                start_new_session=True,
+            )
+            try:
+                status = watchdog._wait(proc)
+            finally:
+                # Also after a normal exit: what the program started and did not wait for is still
+                # in its process group (whose id is not given to another process while a member lives).
+                watchdog._kill(proc)
+            if status == "timeout":
+                return f"error: execution timed out after {timeout_s}s"
+            if status == "memory":
+                return f"error: execution used more than the memory limit of {memory_mb} MB"
+            # At most 4 bytes per character: a file longer than this makes a result that is cut below.
+            fout.seek(0)
+            ferr.seek(0)
+            out = fout.read(4 * max_output_chars + 4).decode("utf-8", errors="replace")
+            err = ferr.read(4 * max_output_chars + 4).decode("utf-8", errors="replace")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    if err:
+        out += ("\n" if out else "") + "stderr:\n" + err
     if proc.returncode != 0:
         out += ("\n" if out else "") + f"exit code: {proc.returncode}"
     out = out or "(no output)"
@@ -225,6 +270,7 @@ def lookup(query: str, corpus: Mapping[str, str], *, max_results: int = 3) -> st
 
 def builtin_tools(params: Mapping[str, Any]) -> dict[str, Tool]:
     timeout_s = float(params.get("python_timeout_s", 5.0))
+    memory_mb = int(params.get("python_memory_mb", 512))
     max_out = int(params.get("max_tool_output_chars", 4000))
     corpus = {str(k): str(v) for k, v in dict(params.get("corpus") or {}).items()}
     return {
@@ -243,7 +289,12 @@ def builtin_tools(params: Mapping[str, Any]) -> dict[str, Tool]:
         ),
         "python_exec": Tool(
             name="python_exec",
-            description="Execute a Python snippet in an isolated interpreter and return its stdout/stderr.",
+            # What the policy reads: what a call does and that nothing is kept between calls. Who
+            # the code runs as is for whoever configures the tool (the docstring of python_exec).
+            description=(
+                "Execute a Python snippet in a fresh interpreter and return its stdout/stderr. Nothing "
+                "is kept between calls: each call starts in an empty directory that is deleted afterwards."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -251,7 +302,9 @@ def builtin_tools(params: Mapping[str, Any]) -> dict[str, Tool]:
                 },
                 "required": ["code"],
             },
-            fn=lambda code: python_exec(code, timeout_s=timeout_s, max_output_chars=max_out),
+            fn=lambda code: python_exec(
+                code, timeout_s=timeout_s, memory_mb=memory_mb, max_output_chars=max_out
+            ),
             max_output_chars=max_out,
         ),
         "lookup": Tool(
@@ -269,9 +322,14 @@ def builtin_tools(params: Mapping[str, Any]) -> dict[str, Tool]:
 
 
 def load_tools(params: Mapping[str, Any]) -> list[Tool]:
-    """Resolve ``params["tools"]`` (names; default: all built-ins) against built-ins + registered tools."""
+    """Resolve ``params["tools"]`` (names; default: all built-ins) against built-ins + registered
+    tools. A module of ``params["tool_modules"]`` that cannot be imported and a name that is no
+    tool are a :class:`ConfigError`."""
     for mod in params.get("tool_modules") or []:
-        importlib.import_module(mod)
+        try:
+            importlib.import_module(mod)
+        except ImportError as e:
+            raise ConfigError(f"env.params.tool_modules: cannot import {mod!r}: {e}") from e
     available = {**builtin_tools(params), **_REGISTRY}
     names = params.get("tools")
     if names is None:
@@ -279,7 +337,10 @@ def load_tools(params: Mapping[str, Any]) -> list[Tool]:
     out: list[Tool] = []
     for name in names:
         if name not in available:
-            raise KeyError(f"unknown tool {name!r}; available: {sorted(available)}")
+            raise ConfigError(
+                f"env.params.tools: unknown tool {name!r}; available: {sorted(available)} "
+                "(a tool of your own is found once its module is listed in env.params.tool_modules)"
+            )
         out.append(available[name])
     return out
 
@@ -465,9 +526,29 @@ class ToolCallingEnv:
         self._sample = None
 
 
+declare_params(
+    "env",
+    "tool_calling",
+    "tools",
+    "tool_modules",
+    "system_prompt",
+    "invalid_call_penalty",
+    "max_calls_per_turn",
+    "max_turns",  # read by the registered factory (monorl.envs) when env.max_turns is not set
+    "python_timeout_s",
+    "python_memory_mb",
+    "max_tool_output_chars",
+    "corpus",
+    "lookup_max_results",
+)
+
+
 def make_tool_calling_env(
     params: Mapping[str, Any], *, max_turns: int, system_prompt: str | None = None
 ) -> ToolCallingEnv:
+    """The environment of ``env.params``; a key that ``tool_calling`` does not take is a
+    :class:`ConfigError`."""
+    params = checked_params("env", "tool_calling", params, where="env.params")
     return ToolCallingEnv(
         tools=load_tools(params),
         max_turns=max_turns,

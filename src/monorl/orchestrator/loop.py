@@ -25,7 +25,7 @@ import torch
 
 from monorl.core.errors import ConfigError, DataError, EnvironmentError_
 from monorl.core.registry import registry
-from monorl.core.reporting import list_checkpoints
+from monorl.core.reporting import TRAJECTORIES_FILE, drop_rows, iter_metrics, list_checkpoints
 from monorl.core.types import (
     RewardResult,
     RunResult,
@@ -63,11 +63,22 @@ _END = object()
 
 class ComponentLoop:
     def __init__(
-        self, config: RunConfig, reporter: RunReporter, *, cancel: threading.Event, resume: bool
+        self,
+        config: RunConfig,
+        reporter: RunReporter,
+        *,
+        cancel: threading.Event,
+        resume: bool,
+        interrupt: threading.Event | None = None,
     ) -> None:
+        """``cancel`` is set by the first signal: the loop stops after the step in progress.
+        ``interrupt`` is set by the second, which also raises ``KeyboardInterrupt`` on the main
+        thread: the episodes that other threads run for the loop abort instead of being waited
+        for (:func:`~monorl.core.signals.signal_guard`)."""
         self.config = config
         self.reporter = reporter
         self.cancel = cancel
+        self.interrupt = interrupt
         self.resume = resume
         self.policy_version = 0
         self.engine_lock = threading.Lock()
@@ -96,7 +107,8 @@ class ComponentLoop:
             final_path: str | None = None
             if cancelled:
                 if last_step > self._last_checkpoint_step and last_step > 0:
-                    self._save_checkpoint(last_step)
+                    self._write_checkpoint(last_step)
+                    self._commit_checkpoint(last_step)
                 state = "cancelled"
             else:
                 reporter.log(f"exporting final policy to {reporter.final_dir}")
@@ -208,7 +220,17 @@ class ComponentLoop:
     def _teardown(self) -> None:
         if self._sinks is not None:
             self._sinks.close()
-        for engine in getattr(self, "engines", []):
+        engines = getattr(self, "engines", [])
+        for engine in engines:
+            # A call that is still generating has lost its caller (to an interrupt or a failure),
+            # and shutdown() would wait for it to end.
+            cancel = getattr(engine, "cancel", None)
+            if cancel is not None:
+                try:
+                    cancel()
+                except Exception:  # noqa: BLE001 - best-effort teardown
+                    pass
+        for engine in engines:
             shutdown = getattr(engine, "shutdown", None)
             if shutdown is not None:
                 try:
@@ -221,11 +243,9 @@ class ComponentLoop:
     def _maybe_resume(self) -> int:
         if not self.resume:
             return 0
-        checkpoints = [p for p in list_checkpoints(self.reporter.run_dir) if _checkpoint_complete(Path(p))]
-        if not checkpoints:
-            self.reporter.log("resume requested but no complete checkpoint exists; starting from step 0")
+        latest = resume_checkpoint(self.reporter)
+        if latest is None:
             return 0
-        latest = Path(checkpoints[-1])
         step = int(latest.name.removeprefix("step-"))
         self.trainer.load_checkpoint(latest)
         self._last_checkpoint_step = step
@@ -246,6 +266,8 @@ class ComponentLoop:
             self.reporter.log(
                 f"the run will not continue exactly as the one it resumes: {'; '.join(inexact)}"
             )
+        if evaluation_due(self.config, step) and evaluation_interrupted(self.reporter, step):
+            self._evaluate(step)
         return step
 
     # -- main loop ------------------------------------------------------------------------
@@ -262,11 +284,14 @@ class ComponentLoop:
             step = item.step
             t_step = time.perf_counter()
             metrics = self._train_on(item)
-            if step % config.trainer.save_every == 0:
-                self._save_checkpoint(step)
+            save = step % config.trainer.save_every == 0
+            if save:
+                self._write_checkpoint(step)
             metrics["time/step"] = time.perf_counter() - t_step
             self._report(step, metrics, item.trajectories)
-            if config.trainer.eval_every and step % config.trainer.eval_every == 0 and config.data.eval_uri:
+            if save:  # after the rows of the step: a checkpoint never lacks them
+                self._commit_checkpoint(step)
+            if evaluation_due(config, step):
                 self._evaluate(step)
             last_step, last_metrics = step, metrics
             if self.cancel.is_set():
@@ -282,7 +307,7 @@ class ComponentLoop:
             for step in steps:
                 if self.cancel.is_set():
                     return
-                yield self._rollout_step(step)
+                yield self._rollout_step(step, abort=self.interrupt)
             return
 
         # The producer may hold at most ``ahead + 1`` generated-but-untrained steps: the one the
@@ -697,7 +722,8 @@ class ComponentLoop:
             and not ro.extra.get("repetition_penalty")
         )
 
-    def _save_checkpoint(self, step: int) -> None:
+    def _write_checkpoint(self, step: int) -> None:
+        """Write the checkpoint of ``step`` as ``step-N.tmp``; :meth:`_commit_checkpoint` renames it."""
         path = self.reporter.checkpoint_path(step)
         tmp = path.with_name(path.name + ".tmp")
         if tmp.exists():
@@ -705,11 +731,10 @@ class ComponentLoop:
         tmp.mkdir(parents=True)
         self.trainer.save_checkpoint(tmp)
         save_loop_state(tmp, {"policy_version": self.policy_version})
-        if path.exists():
-            shutil.rmtree(path)
-        os.replace(tmp, path)  # a crash mid-save leaves only step-N.tmp, never a half-written step-N
+
+    def _commit_checkpoint(self, step: int) -> None:
+        commit_checkpoint(self.reporter, step)
         self._last_checkpoint_step = step
-        self.reporter.log(f"saved checkpoint {path}")
 
     def _report(self, step: int, metrics: dict[str, float], trajectories: Sequence[Trajectory]) -> None:
         config = self.config
@@ -770,7 +795,9 @@ class ComponentLoop:
                 )
                 for i, s in enumerate(self._eval_samples)
             ]
-            trajectories, failed = self._run_specs(specs, self.eval_sampling, what=f"eval step {step}")
+            trajectories, failed = self._run_specs(
+                specs, self.eval_sampling, abort=self.interrupt, what=f"eval step {step}"
+            )
             speculation = self._speculation_metrics()
         self._score(trajectories)
         log_cfg = config.logging
@@ -779,11 +806,12 @@ class ComponentLoop:
         if config.env.max_failed_frac > 0:
             metrics["eval/failed_frac"] = failed / len(specs)
         metrics["eval/time"] = time.perf_counter() - t0
+        # The metrics row last: a resume takes it as the sign that the step was evaluated.
+        if log_cfg.save_trajectories and log_cfg.trajectories_per_step > 0:
+            self._log_trajectories(step, trajectories, phase="eval")
         self.reporter.log_metrics(step, metrics, phase="eval")
         if self._sinks is not None:
             self._sinks.log(step, metrics, phase="eval")
-        if log_cfg.save_trajectories and log_cfg.trajectories_per_step > 0:
-            self._log_trajectories(step, trajectories, phase="eval")
         self.reporter.log(f"eval step {step}: reward_mean={metrics['eval/reward_mean']:.4f}")
 
 
@@ -814,6 +842,61 @@ def _checkpoint_complete(path: Path) -> bool:
     """Checkpoints are written to ``step-N.tmp`` and renamed, so any non-empty ``step-N`` is complete
     (a crash mid-save leaves only the ``.tmp`` directory, which ``list_checkpoints`` ignores)."""
     return path.is_dir() and any(path.iterdir())
+
+
+def commit_checkpoint(reporter: RunReporter, step: int) -> None:
+    """Give ``step-N.tmp`` its name. The loops do this once the rows of step ``N`` are in
+    ``metrics.jsonl`` and ``trajectories.jsonl``, so a run that dies in between has no checkpoint
+    of the step and runs it again, and a checkpoint that exists has the rows of its step."""
+    path = reporter.checkpoint_path(step)
+    if path.exists():
+        shutil.rmtree(path)
+    # a crash mid-save leaves only step-N.tmp, never a half-written step-N
+    os.replace(path.with_name(path.name + ".tmp"), path)
+    reporter.log(f"saved checkpoint {path}")
+
+
+# -- resume --------------------------------------------------------------------------------------
+
+
+def resume_checkpoint(reporter: RunReporter) -> Path | None:
+    """The checkpoint a resume continues from: the newest complete one of the run directory, or
+    ``None`` (logged) when there is none and the run starts at step 0. What the run being resumed
+    left of the steps after it is removed, because this run writes it again: their rows of
+    ``metrics.jsonl`` and ``trajectories.jsonl``, a last line the process did not finish
+    (:meth:`~monorl.core.reporting.RunReporter.drop_rows_after`), and checkpoints that were never renamed
+    (``step-N.tmp``)."""
+    checkpoints = [Path(p) for p in list_checkpoints(reporter.run_dir) if _checkpoint_complete(Path(p))]
+    latest = checkpoints[-1] if checkpoints else None
+    if latest is None:
+        reporter.log("resume requested but no complete checkpoint exists; starting from step 0")
+    step = int(latest.name.removeprefix("step-")) if latest is not None else 0
+    for unfinished in reporter.checkpoint_root.glob("step-*.tmp"):
+        shutil.rmtree(unfinished)
+        reporter.log(f"removed {unfinished}, a checkpoint the run being resumed did not finish")
+    reporter.drop_rows_after(step)
+    return latest
+
+
+def evaluation_due(config: RunConfig, step: int) -> bool:
+    return bool(config.trainer.eval_every and step % config.trainer.eval_every == 0 and config.data.eval_uri)
+
+
+def evaluation_interrupted(reporter: RunReporter, step: int) -> bool:
+    """Whether the run being resumed stopped before it had evaluated ``step``, the step of its last
+    checkpoint: a checkpoint is written before its step is evaluated, and an evaluation writes its
+    metrics row last. The trajectory rows such an evaluation left are removed and the caller
+    evaluates the step again, from the weights and the generators of the checkpoint."""
+    if any(
+        row.get("step") == step and row.get("phase") == "eval" for _, row in iter_metrics(reporter.run_dir)
+    ):
+        return False
+    drop_rows(
+        reporter.run_dir / TRAJECTORIES_FILE,
+        lambda row: row.get("step") == step and row.get("phase") == "eval",
+    )
+    reporter.log(f"the run being resumed did not finish the evaluation of step {step}; evaluating it again")
+    return True
 
 
 # -- what a loop adds to a checkpoint ----------------------------------------------------------

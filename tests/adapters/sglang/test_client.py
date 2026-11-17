@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import multiprocessing
 import pickle
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -488,3 +492,133 @@ def test_mtp_weights_are_not_sent_to_a_server_that_does_not_draft(server, run_co
     c.update_weights([MTP_STREAM[1]])  # nothing for this server: no session, no cache flush
     c.shutdown()
     assert len(server.requests) == n
+
+
+# -- shutdown, and a fork of the process ----------------------------------------------------------
+
+
+def _in_thread(fn: Callable[..., Any], *args: Any) -> Future[Any]:
+    """``fn(*args)`` on a daemon thread: a call that never returns fails its test by the timeout
+    of ``result`` and does not keep the test process alive."""
+    outcome: Future[Any] = Future()
+
+    def run() -> None:
+        try:
+            outcome.set_result(fn(*args))
+        except BaseException as e:  # noqa: BLE001 - handed to the test
+            outcome.set_exception(e)
+
+    threading.Thread(target=run, daemon=True).start()
+    return outcome
+
+
+def _in_fork(fn: Callable[[], Any]) -> str:
+    """What ``fn()`` does in a fork of this process: ``"returned"``, or the error it raises as
+    ``"<type>: <message>"``. A child that has not answered after 5 s fails the test."""
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+
+    def report() -> None:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 - reported to the parent
+            sender.send(f"{type(e).__name__}: {e}")
+        else:
+            sender.send("returned")
+
+    child = context.Process(target=report, daemon=True)
+    child.start()
+    try:
+        assert receiver.poll(5), "the call hangs in the forked process"
+        return receiver.recv()
+    finally:
+        child.kill()
+        child.join(5)
+
+
+def test_shutdown_ends_the_generate_calls_in_flight(loopback, server):
+    web, client = loopback
+    web.stall = True  # the server holds the requests: long generations
+    running = [_in_thread(client.generate, [[1, 2]], SamplingParams(n=1)) for _ in range(2)]
+    assert [web.stalled.get(timeout=5) for _ in running] == ["/generate"] * 2
+    _in_thread(client.shutdown).result(timeout=5)
+    for call in running:
+        with pytest.raises(GenerationCancelled):
+            call.result(timeout=5)
+    # the server saw both clients leave
+    assert [web.disconnects.get(timeout=5) for _ in running] == ["/generate"] * 2
+    assert client._http.is_closed and not client._loop_thread.is_alive()
+
+    # afterwards every call fails before it does anything, and shutting down again is harmless
+    web.stall = False
+    weights = iter([("w", torch.zeros(1))])
+    for call in (
+        lambda: client.generate([[1, 2, 3]], SamplingParams(n=2)),
+        lambda: client.update_weights(weights),
+        lambda: client.load_weights_from_path("/ckpt"),
+        client.server_info,
+    ):
+        with pytest.raises(RuntimeError, match=f"client for {web.url} was shut down"):
+            _in_thread(call).result(timeout=5)
+    assert server.paths() == [] and next(weights)[0] == "w"
+    _in_thread(client.shutdown).result(timeout=5)
+
+
+def test_shutdown_ends_a_request_that_is_no_generation(loopback):
+    web, client = loopback
+    web.stall = True
+    loading = _in_thread(client.load_weights_from_path, "/ckpt")
+    assert web.stalled.get(timeout=5) == "/update_weights_from_disk"
+    _in_thread(client.shutdown).result(timeout=5)
+    with pytest.raises(RuntimeError, match="was shut down"):
+        loading.result(timeout=5)
+
+
+class BusyServer(httpx.AsyncBaseTransport):
+    """Answers nothing; ``waiting`` is set once a request is waiting for its answer."""
+
+    def __init__(self) -> None:
+        self.waiting = threading.Event()
+        self.paths: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.paths.append(request.url.path)
+        self.waiting.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def test_shutdown_ends_a_generate_call_that_is_asking_how_the_server_drafts(run_config_dict):
+    busy = BusyServer()
+    cfg = make_config(run_config_dict, mtp=MTP_ROLLOUT, extra={"mode": "server", "url": "http://s"})
+    client = SGLangServerClient(cfg, transport=busy)
+    running = _in_thread(client.generate, [[1]], SamplingParams(n=1))
+    assert busy.waiting.wait(5) and busy.paths == ["/get_server_info"]
+    _in_thread(client.shutdown).result(timeout=5)
+    with pytest.raises(GenerationCancelled):
+        running.result(timeout=5)
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="needs os.fork")
+def test_a_client_in_a_forked_process_fails_at_once(loopback, server):
+    """The thread that runs a client's requests exists in the process that built it only."""
+    web, client = loopback
+    generate = lambda: client.generate([[1, 2, 3]], SamplingParams(n=2))  # noqa: E731
+    assert len(generate()[0]) == 2
+    for call in (generate, lambda: client.load_weights_from_path("/ckpt"), client.server_info):
+        outcome = _in_fork(call)
+        assert outcome.startswith("RuntimeError: ") and "fork" in outcome and "process" in outcome
+    # a child that cleans up closes nothing of the parent's
+    assert _in_fork(client.shutdown) == "returned"
+    assert server.paths() == ["/generate"]
+    assert len(generate()[0]) == 2
+
+    # A fork taken while a call is in flight copies the lock that call holds, and nothing in the
+    # child releases it: the child is told before it waits for the lock.
+    web.stall = True
+    loading = _in_thread(client.load_weights_from_path, "/ckpt")
+    assert web.stalled.get(timeout=5) == "/update_weights_from_disk"
+    assert "fork" in _in_fork(lambda: client.load_weights_from_path("/ckpt"))
+    _in_thread(client.shutdown).result(timeout=5)
+    with pytest.raises(RuntimeError, match="was shut down"):
+        loading.result(timeout=5)

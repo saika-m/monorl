@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import pickle
+import random
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from transformers import AutoModelForCausalLM
@@ -179,6 +183,55 @@ def test_truncates_to_max_seq_len(tiny_model_dir: Path, tokenizer) -> None:
     lp = trainer.compute_logprobs(batch)
     assert lp.shape == (len(batch), 16)
     trainer.train_step(batch)
+
+
+def _draws() -> tuple[float, float, float]:
+    """One number from each global generator a checkpoint carries."""
+    return random.random(), float(np.random.random()), float(torch.rand(1))
+
+
+def test_checkpoint_restores_the_random_generators(tiny_model_dir: Path, tmp_path: Path) -> None:
+    trainer = ReferenceTrainer(make_config(tiny_model_dir), loss_fn=reinforce_loss)
+    trainer.save_checkpoint(tmp_path / "ckpt")
+    expected = _draws()
+    assert _draws() != expected  # the generators have moved on
+    trainer.load_checkpoint(tmp_path / "ckpt")
+    assert _draws() == expected
+
+
+def test_a_checkpoint_with_numpy_state_as_an_array_still_loads(tiny_model_dir: Path, tmp_path: Path) -> None:
+    """What ``trainer_state.pt`` held before NumPy's state was stored as a tensor."""
+    trainer = ReferenceTrainer(make_config(tiny_model_dir), loss_fn=reinforce_loss)
+    ckpt = tmp_path / "ckpt"
+    trainer.save_checkpoint(ckpt)
+    state = torch.load(ckpt / "trainer_state.pt", weights_only=True)
+    state["rng"]["numpy"] = np.random.get_state()
+    torch.save(state, ckpt / "trainer_state.pt")
+    expected = _draws()
+    trainer.load_checkpoint(ckpt)
+    assert _draws() == expected
+
+
+class _RunsOnLoad:
+    """An object whose pickle calls ``os.mkdir`` when it is loaded."""
+
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        return os.mkdir, (str(self.marker),)
+
+
+def test_load_checkpoint_runs_nothing_from_the_state_file(tiny_model_dir: Path, tmp_path: Path) -> None:
+    trainer = ReferenceTrainer(make_config(tiny_model_dir), loss_fn=reinforce_loss)
+    ckpt = tmp_path / "ckpt"
+    trainer.save_checkpoint(ckpt)
+    state = torch.load(ckpt / "trainer_state.pt", weights_only=True)
+    marker = tmp_path / "ran"
+    torch.save({**state, "extra": _RunsOnLoad(marker)}, ckpt / "trainer_state.pt")
+    with pytest.raises(pickle.UnpicklingError):
+        trainer.load_checkpoint(ckpt)
+    assert not marker.exists()
 
 
 @LORA

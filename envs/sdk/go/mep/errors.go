@@ -15,6 +15,9 @@ const (
 	ErrTypeNotFound       = "not_found"
 	ErrTypeMethod         = "method_not_allowed"
 	ErrTypeEnv            = "env_error"
+	// The two refusals of the http transport (403 and 415), see NewHTTPHandler.
+	ErrTypeForbidden            = "forbidden"
+	ErrTypeUnsupportedMediaType = "unsupported_media_type"
 )
 
 // Error is a protocol error. It encodes as {"error": {"type", "message"}}.

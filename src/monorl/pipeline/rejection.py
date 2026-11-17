@@ -30,6 +30,7 @@ from monorl.core.types import Message, RewardResult, Sample, SamplingParams, Tra
 from monorl.orchestrator import loop as _loop
 from monorl.orchestrator.episodes import EpisodeAborted, EpisodeFailure, EpisodeSpec, run_episodes
 from monorl.orchestrator.metrics import eval_metrics, reward_metrics
+from monorl.orchestrator.sinks import MetricSinks
 from monorl.pipeline.stages import DATASET_FILE
 
 ROW_SOURCE_SAMPLED = "sampled"
@@ -458,8 +459,8 @@ def run_rejection_sampling(
 ) -> RejectionOutcome:
     """Sample ``num_samples`` episodes per prompt, keep the ones passing the filters, append
     ``mix`` datasets and write ``dataset.jsonl`` (chat rows, one per conversation of an accepted
-    episode). Writes ``status.json``, ``metrics.jsonl`` (one row per prompt chunk) and
-    ``trajectories.jsonl`` in ``run_dir``."""
+    episode). Writes ``status.json``, ``metrics.jsonl`` (one row per prompt chunk, also sent to the
+    configured metric sinks) and ``trajectories.jsonl`` in ``run_dir``."""
     reporter = RunReporter(run_dir)
     config.to_yaml(reporter.run_dir / CONFIG_FILE)
     target = Path(output) if output is not None else reporter.run_dir / DATASET_FILE
@@ -467,6 +468,7 @@ def run_rejection_sampling(
     outcome = RejectionOutcome(dataset=str(target))
     reporter.set_status("running", "loading policy", step=0)
     sampler = PolicySampler(config, reward_specs=None)
+    sinks = MetricSinks(config, reporter.run_dir, reporter)
     try:
         data_cfg = stage.data or config.data
         samples = sampler.load_samples(data_cfg, limit=stage.max_prompts)
@@ -522,6 +524,7 @@ def run_rejection_sampling(
                     "time/rollout": time.perf_counter() - t0,
                 }
                 reporter.log_metrics(step, metrics, phase="rejection")
+                sinks.log(step, metrics)
                 _log_trajectories(reporter, config, step, trajectories, phase="rejection")
                 reporter.log(
                     f"chunk {step}/{len(chunks)}: accepted {len(kept)}/{len(trajectories)} "
@@ -544,18 +547,16 @@ def run_rejection_sampling(
                 f"rejection sampling accepted 0 of {outcome.sampled} completions and no mix datasets were given; "
                 f"lower min_reward or raise num_samples"
             )
-        reporter.log_metrics(
-            outcome.steps,
-            {
-                "rs/total_sampled": float(outcome.sampled),
-                "rs/total_accepted": float(outcome.accepted),
-                "rs/total_accept_rate": outcome.accepted / outcome.sampled if outcome.sampled else 0.0,
-                "rs/mixed": float(outcome.mixed),
-                "rs/rows": float(outcome.rows),
-                "rs/failed_episodes": float(sampler.failed),
-            },
-            phase="summary",
-        )
+        summary = {
+            "rs/total_sampled": float(outcome.sampled),
+            "rs/total_accepted": float(outcome.accepted),
+            "rs/total_accept_rate": outcome.accepted / outcome.sampled if outcome.sampled else 0.0,
+            "rs/mixed": float(outcome.mixed),
+            "rs/rows": float(outcome.rows),
+            "rs/failed_episodes": float(sampler.failed),
+        }
+        reporter.log_metrics(outcome.steps, summary, phase="summary")
+        sinks.log(outcome.steps, summary)
         reporter.set_status(
             "succeeded",
             f"accepted {outcome.accepted}/{outcome.sampled} completions (+{outcome.mixed} mixed) -> {target}",
@@ -567,6 +568,7 @@ def run_rejection_sampling(
         reporter.set_status(state, f"{type(e).__name__}: {e}", step=outcome.steps)
         raise
     finally:
+        sinks.close()
         sampler.shutdown()
 
 
@@ -625,6 +627,7 @@ def run_eval(
     outcome = EvalOutcome()
     reporter.set_status("running", "loading policy", step=0)
     sampler = PolicySampler(config)
+    sinks = MetricSinks(config, reporter.run_dir, reporter)
     try:
         data_cfg = eval_data_config(stage, config)
         samples = sampler.load_samples(data_cfg, limit=stage.max_prompts)
@@ -655,6 +658,7 @@ def run_eval(
             _log_trajectories(reporter, config, step, trajectories, phase="eval")
             chunk_mean = reward_metrics(trajectories)["reward/mean"]
             reporter.log_metrics(step, {"eval/chunk_reward_mean": chunk_mean}, phase="eval")
+            sinks.log(step, {"eval/chunk_reward_mean": chunk_mean}, phase="eval")
         if outcome.cancelled:
             reporter.set_status("cancelled", f"cancelled after chunk {outcome.steps}", step=outcome.steps)
             return outcome
@@ -665,6 +669,7 @@ def run_eval(
         outcome.metrics = metrics
         outcome.num_samples = len(scored)
         reporter.log_metrics(outcome.steps, metrics, phase="eval")
+        sinks.log(outcome.steps, metrics, phase="eval")
         reporter.set_status(
             "succeeded", f"eval reward_mean={metrics['eval/reward_mean']:.4f}", step=outcome.steps
         )
@@ -674,6 +679,7 @@ def run_eval(
         reporter.set_status(state, f"{type(e).__name__}: {e}", step=outcome.steps)
         raise
     finally:
+        sinks.close()
         sampler.shutdown()
 
 

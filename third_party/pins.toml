@@ -62,7 +62,7 @@ git = "https://github.com/unslothai/unsloth"
 tag = "v0.1.913-beta"
 commit = "fe982adaf29a5260d45bfff2ef1ff7323c2e77d6"
 adapter = "monorl.adapters.unsloth"
-notes = "GitHub tags use a beta counter; v0.1.913-beta is the release that published 2026.10.11 to PyPI. CUDA only. Pin conflict: 2026.10.11 declares trl<=1.15.0 and transformers<=5.17.0 while monorl's environment uses trl 1.17.1 / transformers 5.22, so Unsloth needs its own venv; `python -m monorl.adapters.unsloth.preload monorl.cli train ...` imports unsloth before trl/transformers and `reconcile_trl_patches()` re-applies monorl's trl patches after Unsloth's."
+notes = "GitHub tags use a beta counter; v0.1.913-beta is the release that published 2026.10.11 to PyPI. CUDA only. Pin conflict: 2026.10.11 declares trl<=1.15.0 and transformers<=5.17.0 while monorl's environment uses trl 1.17.1 / transformers 5.23, so Unsloth needs its own venv; `python -m monorl.adapters.unsloth.preload monorl.cli train ...` imports unsloth before trl/transformers and `reconcile_trl_patches()` re-applies monorl's trl patches after Unsloth's."
 
 [openenv]
 pypi = "openenv-core"

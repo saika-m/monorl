@@ -19,6 +19,7 @@ from typing import Any
 
 from monorl.config.pipeline import EvalStage, PipelineConfig, RejectionSampleStage, TrainStage
 from monorl.core.errors import ConfigError, MonorlError
+from monorl.core.home import run_root
 from monorl.core.registry import ensure_providers
 from monorl.core.reporting import RunReporter
 from monorl.core.signals import signal_guard
@@ -59,7 +60,7 @@ def resolve_pipeline_run_dir(config: PipelineConfig, run_dir: Path | None = None
     name = config.name or default_pipeline_name(config)
     if run_dir is not None:
         return name, Path(run_dir).expanduser()
-    return name, Path(config.base.logging.run_root).expanduser() / name
+    return name, run_root(config.base.logging.run_root) / name
 
 
 def run_pipeline(
@@ -90,7 +91,7 @@ def run_pipeline(
         )
         try:
             validate_stage_configs(config, stages_root)
-        except (ConfigError, ValueError, TypeError) as e:
+        except ConfigError as e:
             return runner.finish("failed", f"invalid stage configuration: {e}")
         try:
             runner.run_all()
@@ -104,8 +105,8 @@ def run_pipeline(
             reporter.log(tb)
             runner.mark_active("failed", f"{type(e).__name__}: {e}")
             return runner.finish("failed", f"{type(e).__name__}: {e}")
-    if cancel.is_set():
-        return runner.finish("cancelled", None)
+    # Every stage succeeded. A signal that came in the last step of the last stage found nothing
+    # left to cancel, in the stage and in the pipeline alike.
     return runner.finish("succeeded", None)
 
 
@@ -267,8 +268,11 @@ class _StageRunner:
             previous_dataset=self.previous_dataset,
         )
         stage_dir = Path(record.run_dir)
-        resume_stage = self.resume and (stage_dir / "checkpoints").is_dir()
-        result = run_training(run_config, stage_dir, resume=resume_stage)
+        # Also without a checkpoint: the stage starts over then, and so must its record files.
+        resume_stage = self.resume and stage_dir.is_dir()
+        # The stage handles signals itself while it runs; with the pipeline's event it also tells
+        # the pipeline, which stops before the next stage whatever state this one ends in.
+        result = run_training(run_config, stage_dir, resume=resume_stage, cancel=self.cancel)
         record.step = int(result.final_step)
         record.summary = {k: float(v) for k, v in result.metrics.items() if isinstance(v, (int, float))}
         record.state = result.state
@@ -283,14 +287,16 @@ class _StageRunner:
         run_config = build_sampling_config(self.config, index, previous_model=self.previous_model)
         output = Path(stage.output).expanduser() if stage.output else None
         try:
-            outcome = run_rejection_sampling(
-                stage,
-                run_config,
-                run_dir=Path(record.run_dir),
-                cancel=self.cancel,
-                output=output,
-                known_data=known_data_configs(self.config),
-            )
+            # The stage's own reporter is made in the call; this one writes to the same run.log.
+            with RunReporter(record.run_dir).capture_logging():
+                outcome = run_rejection_sampling(
+                    stage,
+                    run_config,
+                    run_dir=Path(record.run_dir),
+                    cancel=self.cancel,
+                    output=output,
+                    known_data=known_data_configs(self.config),
+                )
         except KeyboardInterrupt:
             record.state, record.error, record.finished_at = "cancelled", "interrupted", time.time()
             return
@@ -310,7 +316,8 @@ class _StageRunner:
     def _eval(self, index: int, stage: EvalStage, record: StageRecord) -> None:
         run_config = build_sampling_config(self.config, index, previous_model=self.previous_model)
         try:
-            outcome = run_eval(stage, run_config, run_dir=Path(record.run_dir), cancel=self.cancel)
+            with RunReporter(record.run_dir).capture_logging():
+                outcome = run_eval(stage, run_config, run_dir=Path(record.run_dir), cancel=self.cancel)
         except KeyboardInterrupt:
             record.state, record.error, record.finished_at = "cancelled", "interrupted", time.time()
             return

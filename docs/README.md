@@ -10,7 +10,7 @@ The documents here go one level down: one per section of the run config, one per
 |---|---|
 | `model`, `rollout.backend`, `trainer.backend` | [`BACKENDS.md`](BACKENDS.md): engines, trainers, pipeline backends, their options and limits |
 | `model.mtp` | [`MTP.md`](MTP.md): drafting with, training and exporting multi-token prediction layers |
-| `data` | [`DATA.md`](DATA.md): URIs, S3 credentials, formats, field mapping |
+| `data` | [`DATA.md`](DATA.md): URIs, S3 credentials, formats, field mapping, writing a data source |
 | `algorithm` | [`ALGORITHMS.md`](ALGORITHMS.md): what each algorithm computes and what every option does |
 | `algorithm.credit_assignment`, `ppo` | [`CREDIT_ASSIGNMENT.md`](CREDIT_ASSIGNMENT.md): per-turn returns and the value baseline |
 | `algorithm.off_policy`, `rollout.async_steps_ahead` | [`OFF_POLICY.md`](OFF_POLICY.md): corrections for stale rollouts |

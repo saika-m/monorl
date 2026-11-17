@@ -616,10 +616,61 @@ def _held_candidate_generator(layers: MtpLayers, generation_config: Any, logits_
             self.logits_processor = logits_processor
             self.is_main_model_prefill = True
             self._drafted = 0
+            self._max_length = generation_config.max_length
 
-        def get_candidates(self, input_ids: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-            candidates, logits = super().get_candidates(input_ids, *args, **kwargs)
+        def get_candidates(
+            self,
+            input_ids: torch.Tensor,
+            model_kwargs: dict[str, Any],
+            model_outputs: Any,
+            is_first_iteration: bool,
+            n_last_matches: int,
+            **kwargs: Any,
+        ) -> Any:
+            if self._max_length - input_ids.shape[1] <= 1:
+                # Only the policy's next token can be emitted. Drafting (and verifying) a
+                # continuation here adds work but cannot save a policy forward pass.
+                self._drafted = 0
+                return input_ids, None
+            depth = self.num_mtp_layers
+            if (
+                not is_first_iteration
+                and not self.is_main_model_prefill
+                and n_last_matches < depth - 1
+                and self.full_seq_last_hidden_states.shape[1] < depth
+            ):
+                # Upstream corrects the drafter's cache after this rejection by reading the D
+                # positions before the newly verified ones, and slices the tokens and the hidden
+                # states by that count each. Before its first draft the sequence held fewer than
+                # D positions (a prompt shorter than the MTP depth): the two slices come out with
+                # different lengths and the layers fail on them. Every earlier hidden state is
+                # still held here, so the layers read the whole sequence again, as they read a
+                # prompt: the cache and the draft of a correction that starts at the first
+                # position.
+                verified = layers.last_hidden_states(model_outputs)[:, : n_last_matches + 1]
+                verified = verified.to(self.device)
+                history = torch.cat([self.full_seq_last_hidden_states, verified], dim=1)
+                model_outputs = types.SimpleNamespace(hidden_states=(history,))
+                self.mtp_cache = MtpCache(config=layers.main_model.config.get_mtp_config())
+                self.mtp_cache.activate_past_recording()
+                self.is_main_model_prefill = True
+            candidates, logits = super().get_candidates(
+                input_ids,
+                model_kwargs=model_kwargs,
+                model_outputs=model_outputs,
+                is_first_iteration=is_first_iteration,
+                n_last_matches=n_last_matches,
+                **kwargs,
+            )
             self._drafted = candidates.shape[1] - input_ids.shape[1]
+            if self.num_mtp_layers > 1 and hasattr(self, "full_seq_last_hidden_states"):
+                # On rejection, upstream appends the newly verified states and reads only
+                # those plus the preceding D states, where D is the MTP depth. Retain that
+                # suffix, not an ever-growing history. Clone so the view releases its backing
+                # allocation rather than keeping the whole prompt/continuation alive.
+                self.full_seq_last_hidden_states = self.full_seq_last_hidden_states[
+                    :, -self.num_mtp_layers :
+                ].clone()
             return candidates, logits
 
         def update_candidate_strategy(

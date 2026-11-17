@@ -121,8 +121,12 @@ def registered_frameworks() -> list[str]:
 def get_patchsets(framework: str) -> list[PatchSet]:
     with _lock:
         sets = _registry.get(framework)
+        known = sorted(_registry)
     if not sets:
-        raise PatchError(f"no patchset registered for framework {framework!r}")
+        raise PatchError(
+            f"no patchset registered for framework {framework!r}; "
+            f"frameworks with patches: {', '.join(known) or '(none)'}"
+        )
     return list(sets)
 
 

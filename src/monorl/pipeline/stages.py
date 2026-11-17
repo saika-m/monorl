@@ -22,8 +22,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from monorl.config.loader import mask_secrets
 from monorl.config.pipeline import PipelineConfig, RejectionSampleStage, TrainStage
 from monorl.config.schema import DataConfig, RunConfig
+from monorl.core.errors import ConfigError
 from monorl.core.reporting import FINAL_DIR
 
 PIPELINE_CONFIG_FILE = "pipeline.yaml"
@@ -110,7 +112,7 @@ class Manifest:
         self.updated_at = time.time()
         path = Path(self.run_dir) / MANIFEST_FILE
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2, default=str))
+        tmp.write_text(json.dumps(mask_secrets(self.to_dict()), indent=2, default=str))
         os.replace(tmp, path)
 
     @classmethod
@@ -277,14 +279,20 @@ def known_data_configs(config: PipelineConfig) -> list[DataConfig]:
 
 def validate_stage_configs(config: PipelineConfig, stages_root: Path) -> None:
     """Build every stage config once with placeholder hand-offs so override typos fail before any
-    stage runs. Raises :class:`monorl.core.errors.ConfigError` / ``ValueError``."""
+    stage runs. Raises :class:`monorl.core.errors.ConfigError` that names the first stage whose
+    config is invalid, followed by what its ``RunConfig`` (the base with the stage's overrides)
+    is told (:func:`monorl.config.schema.validation_message`)."""
     for i, stage in enumerate(config.stages):
-        if isinstance(stage, TrainStage):
-            build_train_config(
-                config, i, stages_root=stages_root, previous_model=None, previous_dataset="<previous>"
-            )
-        else:
-            build_sampling_config(config, i, previous_model=None)
+        try:
+            if isinstance(stage, TrainStage):
+                build_train_config(
+                    config, i, stages_root=stages_root, previous_model=None, previous_dataset="<previous>"
+                )
+            else:
+                build_sampling_config(config, i, previous_model=None)
+        except (ConfigError, ValueError, TypeError) as e:
+            where = f"stage {i + 1}/{len(config.stages)} {stage.name!r} ({stage.type})"
+            raise ConfigError(f"{where}, the base with the stage's overrides: {e}") from e
 
 
 __all__ = [

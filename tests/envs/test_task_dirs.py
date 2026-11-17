@@ -139,6 +139,9 @@ def test_a_task_directory_or_a_glob_selects_tasks(tmp_path: Path) -> None:
     assert [s.id for s in _rows(tmp_path / "tasks")] == ["alpha-1", "alpha-2", "beta"]
     assert [s.id for s in _rows(tmp_path / "tasks" / "beta")] == ["beta"]
     assert [s.id for s in _rows(f"{tmp_path}/tasks/alpha-*")] == ["alpha-1", "alpha-2"]
+    # a directory that exists is itself, also with glob characters in its name
+    write_task(tmp_path / "tasks[v1]" / "gamma", '[environment]\ndocker_image = "box"\n')
+    assert [s.id for s in _rows(tmp_path / "tasks[v1]")] == ["gamma"]
     limited = list(open_source(DataConfig(uri=str(tmp_path / "tasks"), limit=2, shuffle=True), seed=3))
     assert len(limited) == 2 and {s.id for s in limited} <= {"alpha-1", "alpha-2", "beta"}
     preview = preview_uri(str(tmp_path / "tasks"))

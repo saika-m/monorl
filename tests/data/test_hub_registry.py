@@ -20,6 +20,18 @@ def test_builtin_registry_resolves_data_sources() -> None:
     assert registry.contains("data_source", "s3")
 
 
+@pytest.mark.parametrize("streaming", [True, False])
+def test_a_hub_that_cannot_be_reached_is_a_data_error(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    """``load_dataset`` raises ``ConnectionError`` without a connection (here: offline mode, so that
+    nothing is sent). It names the dataset like the other reasons a Hub dataset does not load."""
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", True)
+    uri = "hf://monorl-tests/not-in-any-cache"
+    with pytest.raises(DataError, match=f"cannot load '{uri}'.*Couldn't reach"):
+        open_source(DataConfig(uri=uri, streaming=streaming))
+
+
 @pytest.mark.network
 def test_hf_streaming_open_source() -> None:
     cfg = DataConfig(

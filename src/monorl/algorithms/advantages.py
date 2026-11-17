@@ -1,4 +1,4 @@
-"""Sequence-level advantage estimators and reward shaping (pure torch, no model code).
+"""Sequence-level advantage estimators (pure torch, no model code).
 
 ``compute_advantages`` dispatches on ``AlgorithmConfig.name``:
 
@@ -23,7 +23,6 @@ from collections.abc import Sequence
 import torch
 
 from monorl.config.schema import AlgorithmConfig
-from monorl.core.types import FinishReason
 
 EPS = 1e-6
 
@@ -89,46 +88,3 @@ def compute_advantages(
     if algorithm.advantage_std_norm:
         adv = adv / (std + EPS)
     return adv
-
-
-def dynamic_sampling_mask(rewards: torch.Tensor, group_ids: Sequence[str]) -> torch.Tensor:
-    """DAPO dynamic sampling: boolean ``[B]`` keeping only members of groups whose rewards are
-    not all identical (zero-variance groups carry no learning signal)."""
-    if rewards.ndim != 1:
-        raise ValueError(f"rewards must be [B], got shape {tuple(rewards.shape)}")
-    if rewards.numel() == 0:
-        return torch.zeros(0, dtype=torch.bool, device=rewards.device)
-    rewards = rewards.detach().to(torch.float32)
-    idx, n_groups = _group_index(group_ids, rewards.device)
-    gmax = torch.full((n_groups,), float("-inf"), device=rewards.device).scatter_reduce(
-        0, idx, rewards, "amax"
-    )
-    gmin = torch.full((n_groups,), float("inf"), device=rewards.device).scatter_reduce(
-        0, idx, rewards, "amin"
-    )
-    return (gmax - gmin)[idx] > 0
-
-
-def apply_overlong_penalty(
-    rewards: torch.Tensor, finish_reasons: Sequence[FinishReason], penalty: float
-) -> torch.Tensor:
-    """Subtract ``penalty`` from the reward of every completion that was cut off by the token
-    limit (``finish_reason == "length"``). Returns a new tensor."""
-    if len(finish_reasons) != rewards.shape[0]:
-        raise ValueError(f"{len(finish_reasons)} finish_reasons for {rewards.shape[0]} rewards")
-    if penalty == 0.0:
-        return rewards.clone()
-    truncated = torch.tensor(
-        [fr == "length" for fr in finish_reasons], dtype=rewards.dtype, device=rewards.device
-    )
-    return rewards - penalty * truncated
-
-
-def discount_turn_rewards(turn_rewards: Sequence[float], gamma: float) -> float:
-    """Discounted return of a multi-turn episode: ``sum_t gamma**t * r_t`` (turn 0 undiscounted)."""
-    total = 0.0
-    weight = 1.0
-    for r in turn_rewards:
-        total += weight * float(r)
-        weight *= gamma
-    return total

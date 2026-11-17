@@ -240,4 +240,4 @@ export const PRESETS: Preset[] = [
   },
 ];
 
-export const REWARD_TYPES_FALLBACK = ["exact_match", "format", "regex", "math_verify", "code_exec", "length", "llm_judge", "reward_model", "composite"];
+export const REWARD_TYPES_FALLBACK = ["exact_match", "format", "math_verify", "code_exec", "length", "llm_judge", "reward_model", "composite"];

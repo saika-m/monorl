@@ -245,17 +245,40 @@ sampled episodes to `trajectories.jsonl` (phase `rejection` / `eval`, at most
 `dataset.jsonl`; a stage whose outputs are gone is re-run) and resumes the first unfinished train
 stage from its latest checkpoint. The stage list (names and types) must match the manifest.
 
-SIGTERM/SIGINT cancel the pipeline: a train stage finishes its current step, checkpoints and reports
-`cancelled` (the orchestrator's own handling); a sampling stage aborts its episodes, does not start
-the next prompt chunk and discards its partial dataset. Generation in flight is aborted, not
-finished: the episodes stop waiting for it at once, and an engine implementing `cancel()` (`hf`,
-`vllm` and `sglang` all do) stops generating within one step. An engine without `cancel()` still completes the batch
-it is running before the stage shuts it down, with the results dropped. An environment step in
-flight finishes before its episode aborts. The stage and the pipeline end in state `cancelled`
-(`final_model_path` is only set for a succeeded pipeline); later stages stay `pending`. A second
-signal interrupts immediately.
+SIGTERM/SIGINT cancel the pipeline: a train stage finishes its current step, checkpoints and
+reports `cancelled` (the orchestrator's own handling, [RUNS.md](RUNS.md#cancelling)); a sampling
+stage aborts its episodes, does not start the next prompt chunk and discards its partial dataset.
+Generation in flight is aborted, not finished: the episodes stop waiting for it at once, and an
+engine implementing `cancel()` (`hf`, `vllm` and `sglang` all do) stops generating within one
+step. An engine without `cancel()` still completes the batch it is running before the stage shuts
+it down, with the results dropped. An environment step in flight finishes before its episode
+aborts. The stage and the pipeline end in state `cancelled` (`final_model_path` is only set for a
+succeeded pipeline); later stages stay `pending`. A second signal interrupts immediately.
+
+A signal stops what is left to stop. A train stage that was in its last step ends `succeeded`,
+and the pipeline ends `cancelled` before the next stage (`cancelled after K of N stages`). When
+that stage was the last one, or the signal came after the last chunk of a final sampling stage,
+every stage has succeeded and so has the pipeline: `finished N stages`, exit code 0,
+`final_model_path` set.
+
+A real run of the second case: a pipeline of one GRPO stage of two steps (the base of
+`configs/recipes/r1_sft_grpo_loop_cpu.yaml` with LoRA, `data.limit: 8` and
+`rollout.max_new_tokens: 32`), SIGTERM when step 1 was logged. Exit code 0:
+
+```text
+2026-11-17 03:16:00 received SIGTERM: finishing the current step, then stopping
+2026-11-17 03:16:26 [running] step 2/2 reward=0.0000 loss=0.0000
+2026-11-17 03:16:26 saved checkpoint .../stages/00-grpo/checkpoints/step-2
+2026-11-17 03:16:26 exporting final policy to .../stages/00-grpo/final
+2026-11-17 03:16:29 [succeeded] finished 2 steps
+2026-11-17 03:16:31 [running] stage 1/1 grpo done
+2026-11-17 03:16:31 [succeeded] finished 1 stages
+```
 
 ## API and UI
+
+The routes need the server's access token, like every route of the API
+([`WEB_UI.md`](WEB_UI.md#access)).
 
 - `POST /api/jobs {pipeline: PipelineConfig}` (or a bare `{base, stages}` dict) → job
   `kind: "pipeline"`, `config` = the PipelineConfig; the server spawns

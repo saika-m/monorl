@@ -36,7 +36,9 @@ non-streaming ``/generate`` waits, ``TokenizerManager._stream_one_response``
 output — and calls ``abort_request(rid)`` for every request of the batch. The requests therefore
 run as tasks of an ``httpx.AsyncClient`` on a private event-loop thread: cancelling a task closes
 its connection, which a thread blocked in a synchronous ``httpx.Client`` call could not be made
-to do. (``POST /abort_request`` exists too, but takes one request id per call.)
+to do. (``POST /abort_request`` exists too, but takes one request id per call.) ``shutdown()``
+drops every request in flight the same way before it stops that thread, which exists only in the
+process that built the client.
 """
 
 from __future__ import annotations
@@ -83,6 +85,13 @@ DEFAULT_TIMEOUT = 600.0
 _T = TypeVar("_T")
 
 
+class _ClientClosed(RuntimeError):
+    """A request was made after ``shutdown()``, or ``shutdown()`` dropped it."""
+
+    def __init__(self, url: str) -> None:
+        super().__init__(f"the sglang server client for {url} was shut down")
+
+
 class _GenerateCall:
     """One ``generate`` call that has not returned yet; fields are guarded by the client's
     ``_calls_lock``."""
@@ -101,6 +110,10 @@ class SGLangServerClient:
 
     ``cancel()`` disconnects the ``/generate`` requests in flight, which makes the server abort
     their generation; the interrupted ``generate`` calls raise :class:`GenerationCancelled`.
+    ``shutdown()`` does the same and ends every other request in flight too; calls made after it
+    raise ``RuntimeError``. So does every call in a process forked from the one that built the
+    client, where the thread that runs the requests does not exist: a process builds its own
+    client.
     """
 
     def __init__(
@@ -125,6 +138,7 @@ class SGLangServerClient:
             target=self._loop.run_forever, name=f"monorl-sglang-client-{replica}", daemon=True
         )
         self._loop_thread.start()
+        self._pid = os.getpid()  # the only process the loop thread runs in
         self._lock = threading.Lock()
         self._calls: set[_GenerateCall] = set()
         self._calls_lock = threading.Lock()
@@ -132,7 +146,7 @@ class SGLangServerClient:
         self._speculation = SpeculationCounter() if drafts_with_mtp(config) else None
         self._drafting_checked = False
         self._asleep = False
-        self._closed = False
+        self._closed = False  # guarded by _calls_lock: no request is scheduled once it is set
 
     # -- RolloutEngine --------------------------------------------------------------------
     @property
@@ -152,6 +166,7 @@ class SGLangServerClient:
     ) -> list[list[Completion]]:
         if not prompts:
             return []
+        self._check_usable()
         call = _GenerateCall()
         with self._calls_lock:
             self._calls.add(call)
@@ -171,6 +186,10 @@ class SGLangServerClient:
             if image_data is not None:
                 body["image_data"] = image_data
             response = self._post("/generate", call=call, json=body)
+        except _ClientClosed:
+            if call.cancelled:  # shutdown() while this call was in flight
+                raise GenerationCancelled("generation cancelled") from None
+            raise
         finally:
             with self._calls_lock:
                 self._calls.discard(call)
@@ -201,6 +220,7 @@ class SGLangServerClient:
         """Push ``weights`` in one weight-update session covering the policy and the drafter, so
         both change together. MTP weights of the stream reach the drafter under their checkpoint
         keys; without drafting they are left out."""
+        self._check_usable()
         with self._lock:
             updated = 0
             routed = route_weights(weights, drafting=self._speculation is not None)
@@ -234,6 +254,7 @@ class SGLangServerClient:
         log.debug("sglang server %s: updated %d tensors", self._url, updated)
 
     def load_weights_from_path(self, path: str | os.PathLike[str]) -> None:
+        self._check_usable()
         with self._lock:
             body = {"model_path": os.fspath(path), "load_format": None}
             self._check(self._post("/update_weights_from_disk", json=body), "update_weights_from_disk")
@@ -242,6 +263,7 @@ class SGLangServerClient:
     def sleep(self) -> None:
         if not self.config.rollout.enable_sleep_mode:
             return
+        self._check_usable()
         with self._lock:
             if self._asleep:
                 return
@@ -251,6 +273,7 @@ class SGLangServerClient:
     def wake_up(self) -> None:
         if not self.config.rollout.enable_sleep_mode:
             return
+        self._check_usable()
         with self._lock:
             if not self._asleep:
                 return
@@ -258,16 +281,47 @@ class SGLangServerClient:
             self._asleep = False
 
     def shutdown(self) -> None:
-        with self._lock:
+        """Close the connections and stop the event-loop thread. The requests in flight are
+        dropped first: their ``generate`` calls raise :class:`GenerationCancelled` as after
+        :meth:`cancel`, other calls ``RuntimeError``, as does every call made afterwards.
+        Repeated calls are harmless. In a forked process there is nothing to close: connections
+        and thread belong to the process that built the client."""
+        if os.getpid() != self._pid:
+            return
+        with self._calls_lock:
             if self._closed:
                 return
             self._closed = True
-            self._send(self._http.aclose()).result()
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._loop_thread.join()
-            self._loop.close()
+            for call in self._calls:
+                call.cancelled = True
+        asyncio.run_coroutine_threadsafe(self._close(), self._loop).result()
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._loop_thread.join()
+        self._loop.close()
 
     # -- internals ----------------------------------------------------------------------
+    def _check_usable(self) -> None:
+        """Raise unless this process can run requests: the event-loop thread is not copied into
+        a forked process, and :meth:`shutdown` stops it. A call waiting for a request there
+        would wait forever. Public methods check before they take a lock, which a fork may have
+        copied while another thread held it."""
+        if os.getpid() != self._pid:
+            raise RuntimeError(
+                f"the sglang server client for {self._url} was built in process {self._pid} and is used in "
+                f"process {os.getpid()}, a fork of it, where the thread that runs its requests does not "
+                "exist; build the client in the process that uses it"
+            )
+        if self._closed:
+            raise _ClientClosed(self._url)
+
+    async def _close(self) -> None:
+        """On the event loop: drop every request in flight, then close the connections."""
+        requests = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in requests:
+            task.cancel()
+        await asyncio.gather(*requests, return_exceptions=True)
+        await self._http.aclose()
+
     def _load_processor(self) -> Any | None:
         if not self._processor_loaded:
             from monorl.rollout.media import load_processor
@@ -277,7 +331,12 @@ class SGLangServerClient:
         return self._processor
 
     def server_info(self) -> dict[str, Any]:
-        response = self._send(self._http.get("/get_server_info")).result()
+        with self._calls_lock:
+            request = self._send(self._http.get("/get_server_info"))
+        try:
+            response = request.result()
+        except concurrent.futures.CancelledError:  # shutdown() dropped the request
+            raise _ClientClosed(self._url) from None
         response.raise_for_status()
         return response.json()
 
@@ -307,7 +366,14 @@ class SGLangServerClient:
             )
 
     def _send(self, coro: Coroutine[Any, Any, _T]) -> concurrent.futures.Future[_T]:
-        """Run an ``httpx.AsyncClient`` coroutine on the client's event-loop thread."""
+        """Run an ``httpx.AsyncClient`` coroutine on the client's event-loop thread. The caller
+        holds ``_calls_lock``, under which :meth:`shutdown` closes the client: a request is
+        refused here, or it is on the loop before ``shutdown()`` drops the requests there."""
+        try:
+            self._check_usable()
+        except RuntimeError:
+            coro.close()
+            raise
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def _post(self, path: str, *, call: _GenerateCall | None = None, **kwargs: Any) -> httpx.Response:
@@ -321,7 +387,9 @@ class SGLangServerClient:
                 call.request = request
         try:
             return request.result()
-        except concurrent.futures.CancelledError:  # only cancel() cancels a request
+        except concurrent.futures.CancelledError:
+            if call is None:  # cancel() cancels the requests of generate calls, shutdown() all
+                raise _ClientClosed(self._url) from None
             raise GenerationCancelled("generation cancelled") from None
         except BaseException:
             request.cancel()  # interrupted while waiting (KeyboardInterrupt): drop the request too

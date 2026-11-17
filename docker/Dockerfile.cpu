@@ -2,8 +2,9 @@
 # monorl CPU image: web UI + API server, reference trainer, transformers rollout, TRL backend.
 # No CUDA. Build from the repo root:
 #   docker build -f docker/Dockerfile.cpu -t monorl:cpu .
-# Run:
-#   docker run --rm -p 8000:8000 -v ~/.monorl:/root/.monorl monorl:cpu
+# Run (published on the loopback interface only; the container prints the URL that signs a browser
+# in, see docker/README.md):
+#   docker run --rm -p 127.0.0.1:8000:8000 -v ~/.monorl:/root/.monorl monorl:cpu
 ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=24
 ARG UV_VERSION=0.11.16
@@ -78,8 +79,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 VOLUME ["/root/.monorl", "/root/.cache/huggingface"]
 EXPOSE 8000
+# The API needs the token that the server writes to $MONORL_HOME/server_token when it starts.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8000/api/system"]
+    CMD ["sh", "-c", "curl -fsS -o /dev/null -H \"Authorization: Bearer $(cat $MONORL_HOME/server_token)\" http://127.0.0.1:8000/api/system"]
 
+# 0.0.0.0 is the container's own interface: which host interface reaches it is decided by the port
+# publishing (`-p 127.0.0.1:8000:8000`). `monorl serve` prints the sign-in URL at start.
 ENTRYPOINT ["monorl", "serve", "--host", "0.0.0.0", "--no-open"]
 CMD ["--port", "8000"]

@@ -65,6 +65,16 @@ Per engine:
   takes one sequence per call, so the engine decodes its rows one after another: this engine is
   for checking behaviour, not for throughput. It drafts one token per MTP layer
   (`num_speculative_tokens` must be unset or that number) and text prompts only.
+  When one output token remains the engine does not draft: the policy computes that token
+  anyway, so a draft could not save a forward pass. With more than one MTP layer it keeps the
+  policy's last hidden states for the last `D` positions only (`D`: the number of MTP layers),
+  which is as far back as transformers reads when it corrects the drafter's cache after a
+  rejected draft; transformers itself keeps them for the whole sequence and copies them at every
+  draft. The bound is on that buffer, not on the key-value caches of policy and drafter.
+  A prompt of fewer than `D` tokens has no `D` positions to read back at its first draft, and
+  transformers fails there with a tensor size error when fewer than `D - 1` tokens of that
+  draft are accepted. The engine then lets the layers read the whole sequence again, as they
+  read a prompt, and goes on drafting.
 - **vLLM.** `speculative_config = {"method": "mtp", "num_speculative_tokens": N or 1}`; keys in
   `rollout.extra.engine_kwargs.speculative_config` are laid over it. A `rejection_sample_method`
   other than `standard` is rejected (the lossy ones sample from another distribution than the
@@ -155,6 +165,19 @@ transformers, vLLM and SGLang all load MTP layers from those keys:
   into the embedding module the layers share with the policy; monorl puts the policy's values
   back.
 
+For vLLM tensor updates, a target and drafter on the same worker device share the policy's staged
+weight stream. A policy tensor that is not on that device yet is moved there once and borrowed by
+both loaders, while MTP-only tensors go only to the drafter. A drafter on another device gets
+copies of its own; tensors that are on the device already still need no copy.
+
+The staged policy buffers remain live until both loaders consume them, within the current RPC
+payload, and are not cached across updates. A payload carries at most `rollout.extra.chunk_bytes`
+of tensors in process (512 MiB by default) and `rollout.extra.weight_request_bytes` of them in
+server mode (64 MiB by default), unless a single tensor is larger. Reuse can increase transient
+memory during target loading compared with streaming and re-copying, so this is not a promise of
+lower peak device memory. Loaders must treat borrowed weight inputs as read-only, as the existing
+on-device input path already requires.
+
 transformers 5.22 can load MTP layers but not write them: `MtpModel` is not saved with the
 model, and reverting its key renamings produces invalid keys. monorl records, when it loads the
 layers, which checkpoint key each parameter came from, lets transformers undo the tensor
@@ -173,9 +196,9 @@ random too, so the first rollouts accept no draft (`mtp/accept_length` 1.0). Eac
 the layer on the batch, weight sync pushes it to the engine, and the next rollouts are drafted
 by the trained layer: `loss/mtp` falls while `mtp/accuracy`, `mtp/accept_rate` and
 `mtp/accept_length` rise. `final/` loads with its MTP layer in transformers. One run of the
-recipe (16 steps, seed 42): `loss/mtp` 38.1 → 16.2, `mtp/accuracy` 0 → 0.27, `mtp/accept_rate`
-0 → 0.17 on the sampled rollouts and 0.41 in the greedy evaluation after step 16
-(`eval/mtp/accept_length` 1.38). With `model.mtp.train: false` the same recipe drafts with the
+recipe (16 steps, seed 42): `loss/mtp` 39.2 to 9.5, `mtp/accuracy` 0 to 0.51, `mtp/accept_rate`
+0 to 0.35 on the sampled rollouts and 0.75 in the greedy evaluation after step 16
+(`eval/mtp/accept_length` 1.6). With `model.mtp.train: false` the same recipe drafts with the
 untouched layer: over 8 steps `mtp/accept_rate` stayed 0 in every step and in the evaluation, and
 `final/` held the layer as the checkpoint had it.
 

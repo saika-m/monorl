@@ -35,7 +35,8 @@ import typing
 from collections.abc import Mapping
 from typing import Any, Protocol
 
-from monorl.core.errors import BackendUnavailable, EnvironmentError_
+from monorl.core.errors import BackendUnavailable, ConfigError, EnvironmentError_
+from monorl.core.params import checked_params, declare_params
 from monorl.core.types import Completion, Message, Sample, StepResult
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
@@ -55,7 +56,9 @@ def _require_openenv() -> Any:
 def _import_dotted(path: str) -> Any:
     module_name, _, attr = path.rpartition(".")
     if not module_name:
-        raise ValueError(f"expected a dotted path 'module.Attr', got {path!r}")
+        raise ConfigError(
+            f"env.params.env_class and env.params.action_class take a dotted path 'module.Attr', got {path!r}"
+        )
     return getattr(importlib.import_module(module_name), attr)
 
 
@@ -83,7 +86,7 @@ class InProcessBackend:
         if explicit:
             cls = _import_dotted(explicit)
             if not (inspect.isclass(cls) and issubclass(cls, base_action)):
-                raise ValueError(f"{explicit} is not an openenv Action subclass")
+                raise ConfigError(f"{explicit} is not an openenv Action subclass")
             return cls
         try:
             hints = typing.get_type_hints(env_class.step)
@@ -97,7 +100,7 @@ class InProcessBackend:
                 for arg in typing.get_args(base):
                     if inspect.isclass(arg) and issubclass(arg, base_action) and arg is not base_action:
                         return arg
-        raise ValueError(
+        raise ConfigError(
             f"cannot infer the Action class of {env_class.__name__}; set env.params.action_class"
         )
 
@@ -209,6 +212,28 @@ class ClientBackend:
         self._connected = False
 
 
+declare_params(
+    "env",
+    "openenv",
+    "env_class",
+    "env_kwargs",
+    "action_class",
+    "url",
+    "image",
+    "env_vars",
+    "port",
+    "timeout_s",
+    "action_mode",
+    "action_field",
+    "observation_template",
+    "observation_to_text",
+    "system_prompt",
+    "invalid_action_penalty",
+    "reset_kwargs",
+    "seed",
+)
+
+
 def backend_from_params(params: Mapping[str, Any]) -> Backend:
     timeout_s = float(params.get("timeout_s", 60.0))
     if params.get("env_class"):
@@ -222,7 +247,7 @@ def backend_from_params(params: Mapping[str, Any]) -> Backend:
             env_vars=params.get("env_vars"),
             port=params.get("port"),
         )
-    raise ValueError("env 'openenv' needs one of params.url, params.env_class or params.image")
+    raise ConfigError("env 'openenv' needs one of params.url, params.env_class or params.image")
 
 
 class _Missing(dict):
@@ -273,7 +298,7 @@ class OpenEnvEnv:
         seed: int | None = None,
     ) -> None:
         if action_mode not in ("text", "json"):
-            raise ValueError(f"action_mode must be 'text' or 'json', got {action_mode!r}")
+            raise ConfigError(f"env.params.action_mode must be 'text' or 'json', got {action_mode!r}")
         self.backend = backend
         self.max_turns = max(1, int(max_turns))
         self.action_mode = action_mode
@@ -346,6 +371,9 @@ class OpenEnvEnv:
 def make_openenv_env(
     params: Mapping[str, Any], *, max_turns: int, system_prompt: str | None = None, seed: int | None = None
 ) -> OpenEnvEnv:
+    """The environment of ``env.params``; a key that ``openenv`` does not take is a
+    :class:`ConfigError`."""
+    params = checked_params("env", "openenv", params, where="env.params")
     return OpenEnvEnv(
         backend_from_params(params),
         max_turns=max_turns,

@@ -15,11 +15,27 @@ Factory kwargs: ``model=``/``tokenizer=`` inject preloaded objects (tests build 
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import declare_params
 from monorl.core.types import Message, RewardResult, Trajectory, message_text
-from monorl.rewards.base import check_trajectories, conversation, reward_name
+from monorl.rewards.base import check_trajectories, conversation, reward_name, reward_params
+
+declare_params(
+    "reward",
+    "reward_model",
+    "name",
+    "model",
+    "trust_remote_code",
+    "device",
+    "dtype",
+    "batch_size",
+    "max_length",
+    "label_index",
+    "normalize",
+)
 
 _DTYPES = {
     "float32": "float32",
@@ -40,7 +56,8 @@ def render_messages(tokenizer: Any, messages: list[Message]) -> str:
 
 
 class RewardModelReward:
-    def __init__(self, params: dict[str, Any], *, model: Any = None, tokenizer: Any = None) -> None:
+    def __init__(self, params: Mapping[str, Any], *, model: Any = None, tokenizer: Any = None) -> None:
+        params = reward_params("reward_model", params)
         import torch
 
         self.name = reward_name(params, "reward_model")
@@ -50,16 +67,20 @@ class RewardModelReward:
         self.label_index = int(params.get("label_index", 0))
         self.normalize = str(params.get("normalize", "none"))
         if self.normalize not in ("none", "sigmoid"):
-            raise ValueError("reward_model: normalize must be 'none' or 'sigmoid'")
+            raise ConfigError(
+                f"reward_model: params.normalize must be 'none' or 'sigmoid', got {self.normalize!r}"
+            )
         dtype_name = _DTYPES.get(str(params.get("dtype", "float32")))
         if dtype_name is None:
-            raise ValueError(f"reward_model: unknown dtype {params.get('dtype')!r}")
+            raise ConfigError(
+                f"reward_model: params.dtype must be one of {sorted(_DTYPES)}, got {params.get('dtype')!r}"
+            )
         dtype = getattr(torch, dtype_name)
 
         if model is None or tokenizer is None:
             model_id = params.get("model")
             if not model_id:
-                raise ValueError("reward_model needs params.model (HF id or path)")
+                raise ConfigError("reward_model needs params.model (HF id or path)")
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
             trust = bool(params.get("trust_remote_code", False))
@@ -108,6 +129,6 @@ class RewardModelReward:
 
 
 def make_reward_model(
-    params: dict[str, Any], *, model: Any = None, tokenizer: Any = None, **_: Any
+    params: Mapping[str, Any], *, model: Any = None, tokenizer: Any = None, **_: Any
 ) -> RewardModelReward:
     return RewardModelReward(params, model=model, tokenizer=tokenizer)

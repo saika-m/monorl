@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -101,6 +102,20 @@ def test_glob(tmp_path: Path) -> None:
     assert len(_open(tmp_path / "train-*.jsonl")) == 8
 
 
+def test_a_path_that_exists_is_not_read_as_a_glob(tmp_path: Path) -> None:
+    """``[``, ``?`` and ``*`` are glob syntax only in a path that names nothing: ``runs[v1]`` as a
+    pattern matches ``runsv`` and ``runs1``, never the directory of that name."""
+    d = tmp_path / "runs[v1]"
+    d.mkdir()
+    write_jsonl(d / "train.jsonl", QA_ROWS[:4])
+    write_jsonl(d / "test.jsonl", QA_ROWS[4:6])
+    assert [s.id for s in _open(d / "train.jsonl")] == [f"{d / 'train.jsonl'}#{i}" for i in range(4)]
+    assert len(_open(d)) == 6
+    assert len(_open(tmp_path / "runs[[]v1]" / "t*.jsonl")) == 6, "in a pattern the bracket is escaped"
+    with pytest.raises(DataError, match="matched no supported data files"):
+        _open(d / "t*.jsonl")
+
+
 def test_directory_prefers_data_format_over_metadata_json(tmp_path: Path) -> None:
     d = tmp_path / "saved"
     d.mkdir()
@@ -115,14 +130,34 @@ def test_file_uri_scheme(qa_jsonl: Path) -> None:
 
 
 def test_missing_and_unsupported(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError) as missing:  # which a run reports as a mistake in its config
         _open(tmp_path / "nope.jsonl")
+    assert isinstance(missing.value, DataError) and str(tmp_path / "nope.jsonl") in str(missing.value)
     (tmp_path / "x.txt").write_text("hello")
     with pytest.raises(DataError):
         _open(tmp_path / "x.txt")
     (tmp_path / "bad.jsonl").write_text('{"question": "a", "answer": "b"}\n{not json\n')
     with pytest.raises(DataError, match="invalid JSON"):
         _open(tmp_path / "bad.jsonl")
+
+
+def test_a_file_without_rows_says_so(tmp_path: Path) -> None:
+    """Not "could not infer dataset format from columns []; set data.format": no format has rows."""
+    for name, text in (("empty.jsonl", ""), ("blank.jsonl", "\n\n"), ("array.json", "[]")):
+        path = tmp_path / name
+        path.write_text(text)
+        with pytest.raises(DataError, match=re.escape(f"{path} has no rows")):
+            _open(path)
+    # rows without a text column are a different problem, and are still reported with their columns
+    (tmp_path / "numbers.jsonl").write_text('{"a": 1}\n')
+    with pytest.raises(DataError, match=re.escape("could not infer dataset format from columns ['a']")):
+        _open(tmp_path / "numbers.jsonl")
+
+
+def test_a_filesystem_that_needs_more_than_its_scheme_is_refused_by_name() -> None:
+    """fsspec's ftp filesystem takes a host: constructing it from the scheme was a TypeError."""
+    with pytest.raises(DataError, match="ftp:// is not supported as a dataset location.*needs host"):
+        open_source(DataConfig(uri="ftp://example.invalid/train.jsonl"))
 
 
 def test_local_streaming_is_lazy_and_len_raises(qa_jsonl: Path) -> None:

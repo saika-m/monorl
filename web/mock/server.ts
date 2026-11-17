@@ -12,6 +12,8 @@ import { deflateSync } from "node:zlib";
 // RunConfig.json_schema() as `monorl serve` answers it, written by
 // `python -m monorl.config.schema_json --write web/mock/config_schema.json` (web/README.md).
 import SCHEMA from "./config_schema.json";
+// PipelineConfig.json_schema(), likewise, written with `--pipeline --write web/mock/pipeline_schema.json`.
+import PIPELINE_SCHEMA from "./pipeline_schema.json";
 
 const PORT = Number(process.env.PORT ?? 8000);
 const HOME = homedir();
@@ -72,63 +74,6 @@ const now = () => Date.now() / 1000;
 const jobs = new Map<string, MockJob>();
 
 const stamp = () => new Date().toISOString().replace("T", " ").slice(0, 19);
-
-// Mirrors PipelineConfig.model_json_schema() (src/monorl/config/pipeline.py); the run config part is the generated schema.
-const PIPELINE_SCHEMA = {
-  title: "PipelineConfig",
-  type: "object",
-  properties: {
-    name: { anyOf: [{ type: "string" }, { type: "null" }], default: null, description: "Pipeline run name (defaults to '<model>-pipeline-<timestamp>')." },
-    base: { $ref: "#/$defs/RunConfig", description: "Base run configuration every stage starts from." },
-    stages: { type: "array", minItems: 1, items: { oneOf: [{ $ref: "#/$defs/TrainStage" }, { $ref: "#/$defs/RejectionSampleStage" }, { $ref: "#/$defs/EvalStage" }], discriminator: { propertyName: "type" } } },
-  },
-  required: ["base", "stages"],
-  $defs: {
-    ...SCHEMA.$defs,
-    RunConfig: { properties: SCHEMA.properties },
-    TrainStage: {
-      properties: {
-        type: { const: "train", default: "train" },
-        name: { type: "string", description: "Stage name (used for the stage directory)." },
-        overrides: { type: "object", description: "RunConfig fields merged over the pipeline base (e.g. {algorithm: {name: sft}, trainer: {max_steps: 50}})." },
-        init_from: { type: "string", default: "previous", description: "Policy initialisation: 'previous' (last train stage's final export), 'base' (base model), or a path." },
-        data_from: { enum: ["previous", "config"], default: "config", description: "'previous' uses the dataset written by the preceding rejection_sample stage as data.uri; an SFT stage then trains every policy turn of its conversations (algorithm.sft_turns: all)." },
-      },
-      required: ["name"],
-    },
-    RejectionSampleStage: {
-      properties: {
-        type: { const: "rejection_sample", default: "rejection_sample" },
-        name: { type: "string" },
-        data: { anyOf: [{ $ref: "#/$defs/DataConfig" }, { type: "null" }], default: null, description: "Prompts to sample from (defaults to the base data config)." },
-        num_samples: { type: "integer", default: 4, minimum: 1, description: "Episodes sampled per prompt." },
-        min_reward: { type: "number", default: 1, description: "Keep episodes whose total reward is >= this value." },
-        max_per_prompt: { type: "integer", default: 1, minimum: 1, description: "Keep at most this many accepted episodes per prompt." },
-        max_response_tokens: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }], default: null, description: "Drop episodes in which a policy turn is longer than this many tokens." },
-        max_context_tokens: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }], default: null, description: "Drop episodes whose context (prompt plus completion of their longest turn) exceeds this many tokens, e.g. the trainer.max_seq_len of the SFT stage that follows." },
-        require_finish: { type: "boolean", default: true, description: "Drop episodes in which a policy turn was cut off by the token limit or failed." },
-        dedupe: { type: "boolean", default: true, description: "Drop episodes whose conversation repeats one already kept for the same prompt." },
-        mix: { type: "array", items: { type: "string" }, description: "Extra chat/prompt_answer dataset URIs appended to the output." },
-        rollout_overrides: { type: "object", description: "RolloutConfig overrides for sampling." },
-        reward_overrides: { anyOf: [{ type: "array", items: { type: "object" } }, { type: "null" }], default: null, description: "Replace the base rewards for scoring." },
-        output: { anyOf: [{ type: "string" }, { type: "null" }], default: null, description: "Output jsonl path (default: <stage dir>/dataset.jsonl)." },
-        max_prompts: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }], default: null, description: "Sample from at most this many prompts." },
-      },
-      required: ["name"],
-    },
-    EvalStage: {
-      properties: {
-        type: { const: "eval", default: "eval" },
-        name: { type: "string" },
-        data: { anyOf: [{ $ref: "#/$defs/DataConfig" }, { type: "null" }], default: null, description: "Evaluation dataset (defaults to base data.eval_uri or data)." },
-        rollout_overrides: { type: "object", description: "RolloutConfig overrides for evaluation." },
-        max_prompts: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }], default: null, description: "Evaluate at most this many prompts." },
-        num_samples: { type: "integer", default: 1, minimum: 1, description: "Completions per prompt. 1 is greedy; more are sampled at the rollout temperature and reported as eval/pass_at_k." },
-      },
-      required: ["name"],
-    },
-  },
-};
 
 const patch = (id: string, target: string, applicable: boolean, applied: boolean) => ({
   id,
@@ -246,7 +191,7 @@ const RECIPES: { name: string; description: string; kind: "run" | "pipeline"; co
       data: { uri: "hf://HuggingFaceM4/VQAv2-sample", image_field: "image", prompt_field: "question", answer_field: "answer", format: "prompt_answer", prompt_template: "<image>\n{prompt}\nAnswer with a single word." },
       rollout: { backend: "vllm", group_size: 4, max_new_tokens: 32 },
       trainer: { max_steps: 100 },
-      rewards: [{ type: "exact_match", weight: 1.0, params: { normalize: true } }],
+      rewards: [{ type: "exact_match", weight: 1.0, params: { normalize: ["whitespace", "case"] } }],
       cluster: { gpus_per_node: 1, placement: "colocated" },
     },
   },
