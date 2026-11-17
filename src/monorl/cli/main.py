@@ -408,7 +408,9 @@ def patches_apply(
     framework: str = typer.Argument(..., help="Framework whose patchset to apply."),
     force: bool = typer.Option(False, "--force", help="Re-apply even if already applied."),
 ) -> None:
-    """Apply the registered patchset for FRAMEWORK to the installed package."""
+    """Apply the patchset of FRAMEWORK in this process and report which patches took. Nothing is
+    written to the installed package: a run applies the patches itself when it builds a component
+    of the framework, so this is a check that they apply to the installed version."""
     patching = _patching_module()
     _load_adapters()
     try:
