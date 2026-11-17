@@ -29,6 +29,9 @@ export class ApiError extends Error {
   }
 }
 
+/** Fired on `window` when the API answers 401; `detail` is the server's message on how to sign in. */
+export const UNAUTHORIZED_EVENT = "monorl:unauthorized";
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { ...init, headers: { "content-type": "application/json", ...(init?.headers ?? {}) } });
   if (!res.ok) {
@@ -44,6 +47,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* non-JSON error body */
     }
+    if (res.status === 401) window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT, { detail: message }));
     throw new ApiError(res.status, message, body);
   }
   return (await res.json()) as T;

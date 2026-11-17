@@ -1,5 +1,6 @@
+import { useEffect, useState } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
-import { api } from "./api";
+import { UNAUTHORIZED_EVENT, api } from "./api";
 import { useAsync } from "./hooks";
 import NewRun from "./pages/NewRun";
 import RunDetail from "./pages/RunDetail";
@@ -15,6 +16,13 @@ const NAV = [
 
 export default function App() {
   const schema = useAsync(() => api.schema(), []);
+  // The server's sign-in message, once any API call was refused for a missing or outdated session.
+  const [signIn, setSignIn] = useState<string | null>(null);
+  useEffect(() => {
+    const onUnauthorized = (e: Event) => setSignIn((e as CustomEvent<string>).detail);
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
   return (
     <SchemaContext.Provider value={schema.data}>
       <div className="flex h-full flex-col">
@@ -34,15 +42,22 @@ export default function App() {
               </NavLink>
             ))}
           </nav>
-          {schema.error && <span className="ml-auto text-xs text-rose-400">API unreachable: {schema.error}</span>}
+          {schema.error && !signIn && <span className="ml-auto text-xs text-rose-400">API unreachable: {schema.error}</span>}
         </header>
         <main className="min-h-0 flex-1 overflow-auto">
-          <Routes>
-            <Route path="/" element={<Runs />} />
-            <Route path="/new" element={<NewRun />} />
-            <Route path="/runs/:id" element={<RunDetail />} />
-            <Route path="/system" element={<System />} />
-          </Routes>
+          {signIn ? (
+            <div className="mx-auto mt-16 max-w-xl rounded-lg border border-slate-800 bg-slate-900 p-6">
+              <h1 className="text-lg font-semibold text-white">Sign in to monorl</h1>
+              <p className="mt-3 text-sm leading-6 text-slate-300">{signIn}</p>
+            </div>
+          ) : (
+            <Routes>
+              <Route path="/" element={<Runs />} />
+              <Route path="/new" element={<NewRun />} />
+              <Route path="/runs/:id" element={<RunDetail />} />
+              <Route path="/system" element={<System />} />
+            </Routes>
+          )}
         </main>
       </div>
     </SchemaContext.Provider>

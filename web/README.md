@@ -22,6 +22,10 @@ uses Node 24 and pnpm 10. `pnpm dev:mock` also needs [Bun](https://bun.sh) on `P
 `monorl serve --no-open` or `pnpm dev:mock` unchanged. `make web` from the repository root runs
 the install and the build.
 
+`monorl serve` wants a sign-in ([docs/WEB_UI.md](../docs/WEB_UI.md#access)): open
+`http://localhost:5173/?token=<token>` with the token of the URL it printed. Vite passes that
+request and `/api` on to the server (`vite.config.ts`); the mock needs no token.
+
 ## Build output
 
 `pnpm build` empties and rewrites `web/dist/` (gitignored): `index.html` plus hashed files under
