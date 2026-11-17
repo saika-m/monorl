@@ -62,7 +62,11 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 ### Rollout engines (`rollout.backend`)
 
 * `hf` — transformers `generate` with per-token logprobs, chat template applied by the engine,
-  works for CPU/MPS/CUDA. Used by every CPU recipe and by tests.
+  works for CPU/MPS/CUDA. Used by every CPU recipe and by tests. A batch is decoded by a chain of
+  `generate` calls: when a row finishes, the call ends and the next one continues the others from
+  the key-value cache without it, so no forward pass computes a finished row (run here on
+  SmolLM2-135M, 16 prompts of up to 256 tokens: 4096 row-steps before, about 1640 after). Models
+  with a processor and caches other than the default dynamic one are decoded in one call.
 * `vllm` — `vllm.LLM` (offline) with `enable_sleep_mode` for colocated runs; TP via
   `rollout.tensor_parallel_size`, DP via `rollout.data_parallel_size` (one `LLM` per replica).
   Weight updates arrive through the patched worker extension — `monorl_update_weights` /

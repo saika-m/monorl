@@ -442,7 +442,7 @@ def collate_media(per_sequence) -> dict[str, Tensor]
 ``pixel_values``/``image_grid_thw`` dict or ``None``); the trainer concatenates them per micro-batch
 and lets the model derive its own (M-RoPE) position ids. ``build_train_batch(..., processor=)``
 re-encodes the final-turn chat and requires the ids to equal the engine's recorded
-``prompt_token_ids``. The HF engine expands multimodal prompts to ``n`` rows itself (``generate``'s
+``prompt_token_ids``. The HF engine expands every prompt to ``n`` rows itself (``generate``'s
 ``num_return_sequences`` would ``repeat_interleave`` patch tensors). Multimodal episodes send the
 chat to the engine on every turn (one processor pass per turn, no prefix cache) and reject
 environment tool schemas.
