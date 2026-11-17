@@ -143,7 +143,8 @@ def test_a_wandb_directory_on_the_path_is_not_taken_for_the_package(
 
 def _run_three_steps_then_resume_to_five(make_config: Any, logging: dict[str, Any]) -> Path:
     """A run that ends at step 3 with its last checkpoint at step 2, resumed up to step 5: step 3
-    is run and logged a second time."""
+    is run a second time and the sinks are given it twice. ``metrics.jsonl`` has it once, since a
+    resume takes the file back to the checkpoint."""
 
     def config(max_steps: int) -> Any:
         return make_config(trainer={"max_steps": max_steps, "save_every": 2}, logging=logging)
@@ -153,7 +154,7 @@ def _run_three_steps_then_resume_to_five(make_config: Any, logging: dict[str, An
     assert (first.state, resumed.state) == ("succeeded", "succeeded") and resumed.final_step == 5
     run_dir = Path(resumed.run_dir)
     logged = metric_points(run_dir)
-    assert [len(logged[("reward/mean", step)]) for step in (1, 2, 3, 4, 5)] == [1, 1, 2, 1, 1]
+    assert [len(logged[("reward/mean", step)]) for step in (1, 2, 3, 4, 5)] == [1, 1, 1, 1, 1]
     return run_dir
 
 

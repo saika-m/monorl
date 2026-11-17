@@ -518,8 +518,9 @@ values at the same steps under the same names, and the W&B run holds the config 
 - **Resume.** The first row a start of the run logs marks its step, and TensorBoard hides what
   earlier starts wrote to the directory for that step and later ones. The run above, resumed with
   `--resume` and `trainer.max_steps=4`, starts at the checkpoint of step 2 and logs step 3 again:
-  `metrics.jsonl` then has two rows for step 3, `tensorboard/` two event files that show steps 1
-  to 4 once each (188 points), step 3 with the values of its second row. For the same reason a run
+  `tensorboard/` then has two event files that show steps 1 to 4 once each (188 points), step 3
+  with the values of the second start, the ones `metrics.jsonl` keeps
+  ([the record files after a resume](#the-record-files-after-a-resume)). For the same reason a run
   started again in its directory without `--resume` shows the new run only. In W&B every start is
   a new run of the same name: `run.log` has a second `wandb: new run 4dzz4bhc ...` line, the
   first run keeps steps 1 to 3 and the second has steps 3 and 4. With wandb's `WANDB_RUN_ID` set,

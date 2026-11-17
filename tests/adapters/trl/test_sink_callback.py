@@ -129,10 +129,6 @@ def test_a_trl_run_logs_every_metrics_row_to_the_sinks(
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason="needs callback.close() in the KeyboardInterrupt and Exception handlers of TrlBackend._train",
-)
 def test_a_failed_trl_run_closes_the_sinks_and_ends_the_wandb_run_as_failed(
     trl_config: RunConfig, packages: FakeSinkPackages, monkeypatch: pytest.MonkeyPatch
 ) -> None:

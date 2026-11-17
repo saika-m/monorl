@@ -268,11 +268,15 @@ class TRLPipelineBackend:
             try:
                 trainer.train(resume_from_checkpoint=resume_from)
                 final_path = str(self._save_final(trainer, tokenizer, run_dir / FINAL_DIR))
+            # Trainer.train calls no callback when it raises: the sinks are closed here, inside
+            # the handlers, where they still see the exception and end the W&B run as failed.
             except KeyboardInterrupt:
                 state, error = "cancelled", "interrupted"
+                callback.close()
             except Exception as e:  # noqa: BLE001 - must land in status.json
                 state, error = "failed", f"{type(e).__name__}: {e}"
                 reporter.log(traceback.format_exc())
+                callback.close()
         step = int(trainer.state.global_step)
         link_checkpoint(Path(args.output_dir), step)
         message = {"succeeded": f"finished {step} steps", "cancelled": f"cancelled after step {step}"}.get(
