@@ -448,8 +448,15 @@ def test_target_modified_after_apply_is_reported_and_reapplied(synthetic_package
 
 def test_status_for_unregistered_framework_is_empty_and_apply_raises() -> None:
     assert status("no_such_framework_zzz") == []
-    with pytest.raises(PatchError, match="no patchset registered"):
-        apply("no_such_framework_zzz")
+    register_patchset(PatchSet(framework="fakefw_known", patches=[]))
+    try:
+        # the error names the frameworks that do have patches, so a typo can be corrected
+        with pytest.raises(
+            PatchError, match=r"no patchset registered .*frameworks with patches: .*fakefw_known"
+        ):
+            apply("no_such_framework_zzz")
+    finally:
+        unregister_patchset("fakefw_known")
 
 
 def test_status_not_installed_framework() -> None:
