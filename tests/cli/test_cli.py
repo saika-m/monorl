@@ -373,6 +373,28 @@ def test_train_names_the_file_and_the_key_of_an_invalid_config(
     ]
 
 
+def test_train_reports_the_error_of_a_failed_run_without_repeating_its_traceback(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
+) -> None:
+    """A failed run reports its message followed by the traceback, which the run log has shown and
+    keeps: the command ends with the message and where the traceback is."""
+    run_config_dict["data"]["prompt_field"] = "no_such_column"
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    run_dir = tmp_path / "rd"
+    result = runner.invoke(
+        app, ["train", "--config", str(cfg_path), "--run-dir", str(run_dir)], env={"COLUMNS": "1000"}
+    )
+    assert result.exit_code == 1
+    summary = result.output.partition("state: failed")[2].strip().splitlines()
+    assert summary == [
+        "final step: 0",
+        "DataError: column 'no_such_column' not found; available: ['answer', 'prompt'] "
+        f"(traceback in {run_dir.resolve() / 'run.log'})",
+    ]
+    assert "Traceback (most recent call last)" in (run_dir / "run.log").read_text()
+
+
 # -- env check ----------------------------------------------------------------------------
 
 

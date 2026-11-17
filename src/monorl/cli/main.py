@@ -24,6 +24,7 @@ from monorl.config.loader import apply_overrides, load_yaml
 from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, MonorlError
+from monorl.core.reporting import LOG_FILE
 from monorl.core.types import MEDIA_PART_TYPES, message_media, message_text
 
 app = typer.Typer(
@@ -53,6 +54,15 @@ EXIT_BY_STATE: dict[str, int] = {"succeeded": 0, "failed": 1, "cancelled": 130}
 def _fail(message: str, code: int = 1) -> None:
     err_console.print(f"[bold red]error:[/bold red] {escape(message)}")
     raise typer.Exit(code)
+
+
+def _print_run_error(error: str, run_dir: str) -> None:
+    """The error of a run that did not succeed, once. A failed run reports its message followed by
+    the traceback, which the run log has printed already and keeps in ``run.log``."""
+    message, cut, _ = error.partition("\nTraceback (most recent call last)")
+    if cut:
+        message += f" (traceback in {Path(run_dir) / LOG_FILE})"
+    err_console.print(f"[red]{escape(message)}[/red]")
 
 
 def _yes_no(flag: bool | None) -> str:
@@ -112,7 +122,7 @@ def train(
     console.print(f"run dir: {escape(result.run_dir)}")
     console.print(f"state: {result.state}  final step: {result.final_step}")
     if result.error:
-        err_console.print(f"[red]{escape(result.error)}[/red]")
+        _print_run_error(result.error, result.run_dir)
     if result.metrics:
         table = Table(title="final metrics", show_lines=False)
         table.add_column("metric")
@@ -182,7 +192,7 @@ def _run_pipeline(config: Path, data: dict[str, Any], run_dir: Path | None, resu
     console.print(table)
     console.print(f"state: {result.state}")
     if result.error:
-        err_console.print(f"[red]{escape(result.error)}[/red]")
+        _print_run_error(result.error, result.run_dir)
     if result.final_model_path:
         console.print(f"final model: {escape(result.final_model_path)}")
     raise typer.Exit(EXIT_BY_STATE.get(result.state, 1))
