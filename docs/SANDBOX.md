@@ -206,7 +206,8 @@ my-task/
 
 Each task is one `Sample`: `id` = the directory name, `messages` = `[user: instruction]`
 (`data.system_prompt`, `prompt_template`, `max_prompt_tokens`, `shuffle`, `limit` apply as for
-any dataset), `reference` = `None`, and `metadata["row"]["task"]` = the task's settings.
+any dataset), `reference` = `None`, `metadata["row"]["task"]` = the task's settings and
+`metadata["task_dir"]` = the directory.
 `monorl data inspect <dir>` and the UI's dataset preview show the rows.
 
 ### Mapping
@@ -274,11 +275,13 @@ everything it tried, before an image is pulled or a container is started for it:
   renames (`KEY = "${JUDGE_API_KEY}"`). The names a task chooses never become variables of the
   Docker CLI process on the host.
 - **Directories of the host.** `tests/` and the build context `environment/` are directories on
-  the trainer host. They are accepted only from a task directory: the task has to be, entry for
-  entry, what its `task.toml` says on disk when the episode starts. A row of another source
-  that names a host directory (`verifier.tests`, `sandbox.build`) is refused, and so is a row
-  that points at a task directory but changes anything about it (its image, say). Editing a
-  task directory while a run uses it makes the run refuse that task: start the run again.
+  the trainer host. They are accepted only from a task directory that `data.uri` names: the
+  data layer marks the samples of such a source (`metadata["task_dir"]`, which no column of a
+  dataset can set), and the task has to be, entry for entry, what its `task.toml` says on disk
+  when the episode starts. A row of another source that names a host directory
+  (`verifier.tests`, `sandbox.build`) is refused, also when it names a task directory that
+  exists on the host. Editing a task directory while a run uses it makes the run refuse that
+  task: start the run again.
 - **Images.** A task may name any image, and with `keep_entrypoint` the image's entrypoint
   runs. That is what a task is for, and it is also the risk: use datasets of tasks whose
   images you would run yourself (section 4).

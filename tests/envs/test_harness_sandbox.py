@@ -996,15 +996,19 @@ def test_host_directories_come_from_a_task_directory_only(
     ):
         message = _refused(config, _row_samples(tmp_path, task), docker)
         assert "sample 'row0'" in message and named in message and "task directory" in message
-    # It points at a task directory that exists here, to get that task's tests into an image of
-    # its own choosing, or to read a secret into the task's verifier.
-    for change, differing in (
-        ({"sandbox": {"image": "attacker/img", "keep_entrypoint": True}}, "['sandbox']"),
-        ({"verifier": {**on_disk["verifier"], "user": "0"}}, "['verifier']"),
-        ({"dir": str(tmp_path / "tasks")}, "cannot be read as a task directory"),
+    # It names a task directory that exists here, as that directory's own source would (today's
+    # row is the task exactly as written; tomorrow's brings an image of its own for the tests).
+    # Saying so in the row, also in a column called like the data layer's mark, proves nothing.
+    data = tmp_path / "claims.jsonl"
+    for task, named in (
+        (on_disk, "sandbox.build and verifier.tests"),
+        ({key: value for key, value in on_disk.items() if key != "verifier"}, "sandbox.build"),
+        ({**on_disk, "sandbox": {"image": "box"}}, "verifier.tests"),
     ):
-        message = _refused(config, _row_samples(tmp_path, {**on_disk, **change}), docker)
-        assert "sample 'row0'" in message and differing in message
+        row = {"id": "claim", "prompt": "abc", "task_dir": on_disk["dir"], "task": task}
+        data.write_text(json.dumps(row) + "\n")
+        message = _refused(config, _task_samples(data), docker)
+        assert "sample 'claim'" in message and f"in {named}," in message
     # Build settings beyond the context are the run config's, also for a task directory.
     build = {"context": on_disk["sandbox"]["build"]["context"], "args": {"HTTP_PROXY": "http://evil"}}
     message = _refused(
@@ -1012,13 +1016,11 @@ def test_host_directories_come_from_a_task_directory_only(
     )
     assert "sandbox.build option(s) ['args']" in message
 
-    # The task directory itself runs, and so does the same task after a trip through JSON (a
-    # remote worker): it is what the directory says.
-    for sample in (real, *_row_samples(tmp_path, json.loads(json.dumps(on_disk)))):
-        (trajectory,) = _episodes(config, [sample])
-        assert trajectory.turns[-1].reward == 1.0
-    cp = docker.calls("cp")
-    assert [call["argv"][1] for call in cp] == [f"{tmp_path / 'tasks' / 'real' / 'tests'}/."] * 2
+    # The task directory itself runs: its tests are copied, from where it is.
+    (trajectory,) = _episodes(config, [real])
+    assert trajectory.turns[-1].reward == 1.0
+    (cp,) = docker.calls("cp")
+    assert cp["argv"][1] == f"{tmp_path / 'tasks' / 'real' / 'tests'}/."
     # Once the directory changes, what was read from it earlier is no longer the task.
     (tmp_path / "tasks" / "real" / "task.toml").write_text('[verifier]\nenv = { EXPECTED = "XYZ" }\n')
     with pytest.raises(ConfigError, match=r"sample 'real'.*differing: \['verifier'\]"):

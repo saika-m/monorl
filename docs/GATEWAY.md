@@ -347,6 +347,7 @@ env:
 | `command` | Required. The agent: an argv list, or a string that is split like a shell would split it (no shell runs it). It starts in the episode's fresh working directory, so name a script by absolute path or put it in `workdir.template`. |
 | `timeout` | Seconds the agent may run (default 600). |
 | `env` | Extra environment variables (values may use placeholders). |
+| `host_env` | Names of variables of monorl's own environment that a task of the dataset may read with `${VAR}` (default: none; [`SANDBOX.md`](SANDBOX.md), "What a task may set"). |
 | `verifier` | Optional command run in the working directory after the agent ended. Reward = the last line of its stdout if that is a number, else `1.0` for exit status 0 and `0.0` otherwise. |
 | `verifier_timeout` | Seconds (default 60); a verifier that takes longer scores 0. |
 | `workdir` | `root`: directory the per-episode directories are created under (default: system temp dir). `template`: directory copied into every fresh working directory. |

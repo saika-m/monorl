@@ -57,7 +57,8 @@ Tasks. A sample may bring its own environment, verifier and limits: a mapping un
 task format) fills in. They replace the ``env.params`` values for that sample::
 
     {"name": str,
-     "dir": directory,          # the task directory, when the task was read from one
+     "dir": directory,          # the task directory, when the task was read from one (a note:
+                                # what counts is the sample's metadata["task_dir"])
      "sandbox": {...},          # the options of sandbox.TASK_OPTIONS, laid over the configured ones
      "env": {name: value},      # the container's environment; "${VAR}" / "${VAR:-default}" are read from this host
      "timeout": seconds,        # the agent's; absent: env.params.timeout
@@ -69,8 +70,10 @@ A task is data: whoever wrote the dataset wrote it, not whoever runs monorl. It 
 container and nothing of this host (:func:`checked_task`): ``sandbox`` holds
 :data:`~monorl.envs.sandbox.TASK_OPTIONS` only, ``${VAR}`` reads only what ``env.params.host_env``
 lists, and directories of this host (``sandbox.build``, ``verifier.tests``) are accepted only from
-a task that is, entry for entry, what its task directory ``dir`` says on disk. Anything else is a
-``ConfigError`` naming the sample and what it tried.
+a sample of a task-directory source, which is the only one that sets ``metadata["task_dir"]``
+(outside ``metadata["row"]``, where a dataset's columns are), and only when the task is, entry
+for entry, what that directory says on disk. Anything else is a ``ConfigError`` naming the sample
+and what it tried.
 
 A task verifier is the Harbor one: after the agent has ended, ``tests`` is copied to ``/tests``
 and ``/tests/test.sh`` runs in the working directory; the reward is what it wrote to
@@ -172,7 +175,11 @@ def task_payload(sample: Sample) -> dict[str, Any]:
     tests live, what its author noted)."""
     hidden = [sample.reference, *(sample.metadata.get(key) for key in _ANSWER_METADATA)]
     hidden = [value for value in hidden if value is not None]
-    metadata = {key: value for key, value in sample.metadata.items() if key not in _ANSWER_METADATA}
+    metadata = {
+        key: value
+        for key, value in sample.metadata.items()
+        if key not in _ANSWER_METADATA and key != "task_dir"
+    }
     row = metadata.get("row")
     if isinstance(row, Mapping):
         task = task_spec(sample)
@@ -191,10 +198,12 @@ def checked_task(sample: Sample, task: Mapping[str, Any], *, paths: bool = True)
     the entry.
 
     A task names directories of this host in ``sandbox.build`` (sent to the Docker daemon) and
-    ``verifier.tests`` (copied into the container). Only a task directory may: the task has to
-    name it in ``dir`` and be exactly what :func:`monorl.data.tasks.load_task` reads from it now,
-    so the directories are that task's own ``environment/`` and ``tests/`` and they go into the
-    container that task describes, not into one a dataset row made up around them."""
+    ``verifier.tests`` (copied into the container). Only a task directory may: the sample has to
+    come from a task-directory source, which says so in ``metadata["task_dir"]`` (the data layer
+    sets it, no column of a row can), and the task has to be exactly what
+    :func:`monorl.data.tasks.load_task` reads from that directory now. So the directories are that
+    task's own ``environment/`` and ``tests/`` and they go into the container that task
+    describes. The ``dir`` a task names itself proves nothing."""
     where = f"sample {sample.id!r}"
     verifier = task.get("verifier")
     for name, entry in (
@@ -215,7 +224,7 @@ def checked_task(sample: Sample, task: Mapping[str, Any], *, paths: bool = True)
         named.append("verifier.tests")
     if not paths or not named:
         return
-    directory = task.get("dir")
+    directory = sample.metadata.get("task_dir")
     if not isinstance(directory, str) or not directory:
         raise ConfigError(
             f"{where}: its task names a directory of this host in {' and '.join(named)}, which only a "
@@ -230,7 +239,7 @@ def checked_task(sample: Sample, task: Mapping[str, Any], *, paths: bool = True)
     except (DataError, OSError) as e:
         raise ConfigError(
             f"{where}: its task names a directory of this host in {' and '.join(named)}, but its "
-            f"`dir` {directory!r} cannot be read as a task directory: {e}"
+            f"task directory {directory!r} cannot be read as one: {e}"
         ) from e
     differing = sorted(
         str(key)
@@ -239,9 +248,9 @@ def checked_task(sample: Sample, task: Mapping[str, Any], *, paths: bool = True)
     )
     if differing:
         raise ConfigError(
-            f"{where}: its task names the task directory {directory!r} but is not what that "
-            f"directory says (differing: {differing}), so the directories of this host it names "
-            "are refused. Read the task from its directory: name the directory in data.uri"
+            f"{where}: its task is not what its task directory {directory!r} says now "
+            f"(differing: {differing}), so the directories of this host it names are refused. "
+            "Start the run again to read the directory as it is"
         )
 
 
