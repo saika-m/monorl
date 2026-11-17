@@ -14,7 +14,9 @@ if TYPE_CHECKING:
 class MetricSinks:
     def __init__(self, config: RunConfig, run_dir: Path, reporter: RunReporter) -> None:
         self._wandb: Any = None
-        self._tb: Any = None
+        self._tb_dir = run_dir / "tensorboard"
+        self._tb_writer: Any = None  # the SummaryWriter class while the TensorBoard sink is on
+        self._tb: Any = None  # the writer, opened at the first row
         logging = config.logging
         if logging.wandb_project:
             try:
@@ -35,7 +37,8 @@ class MetricSinks:
             try:
                 from torch.utils.tensorboard import SummaryWriter
 
-                self._tb = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
+                self._tb_dir.mkdir(parents=True, exist_ok=True)
+                self._tb_writer = SummaryWriter
             except ImportError:
                 reporter.log("logging.tensorboard is set but `tensorboard` is not installed; skipping")
             except Exception as e:  # noqa: BLE001
@@ -43,31 +46,36 @@ class MetricSinks:
 
     @property
     def active(self) -> bool:
-        return self._wandb is not None or self._tb is not None
+        return self._wandb is not None or self._tb_writer is not None
 
     def log(self, step: int, metrics: dict[str, float], *, phase: str = "train") -> None:
+        step = int(step)
         numeric = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
         if not numeric:
             return
         if self._wandb is not None:
             try:
-                self._wandb.log(numeric, step=int(step))
+                self._wandb.log(numeric, step=step)
             except Exception:  # noqa: BLE001
                 pass
-        if self._tb is not None:
+        if self._tb_writer is not None:
+            if self._tb is None:
+                # purge_step: TensorBoard hides what an earlier process wrote to the directory for
+                # this step and later ones. A resumed run logs the steps after its checkpoint
+                # again, and they would show twice.
+                self._tb = self._tb_writer(log_dir=str(self._tb_dir), purge_step=step)
             for k, v in numeric.items():
                 # evaluation metrics are named eval/... already
                 tag = k if phase == "train" or k.startswith(f"{phase}/") else f"{phase}/{k}"
-                self._tb.add_scalar(tag, v, int(step))
+                self._tb.add_scalar(tag, v, step)
 
     def close(self) -> None:
         if self._tb is not None:
             try:
-                self._tb.flush()
-                self._tb.close()
+                self._tb.close()  # flushes
             except Exception:  # noqa: BLE001
                 pass
-            self._tb = None
+        self._tb = self._tb_writer = None
         if self._wandb is not None:
             try:
                 self._wandb.finish()
