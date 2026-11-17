@@ -40,7 +40,8 @@ cancels the handler on ``http.disconnect``, and ``AsyncLLM.generate``
 (``vllm/v1/engine/async_llm.py``) aborts its request in the engine when it is cancelled. The
 requests therefore run as tasks of an ``httpx.AsyncClient`` on a private event-loop thread:
 cancelling a task closes its connection, which a thread blocked in a synchronous ``httpx.Client``
-call could not be made to do.
+call could not be made to do. ``shutdown()`` drops every request in flight the same way before it
+stops that thread.
 """
 
 from __future__ import annotations
@@ -95,6 +96,13 @@ class _StatusError(RuntimeError):
         self.status = status
 
 
+class _ClientClosed(RuntimeError):
+    """A request was made after ``shutdown()``, or ``shutdown()`` dropped it."""
+
+    def __init__(self, url: str) -> None:
+        super().__init__(f"the vLLM server client for {url} was shut down")
+
+
 async def _stream(pieces: Iterator[bytes | memoryview]) -> AsyncIterator[bytes | memoryview]:
     for piece in pieces:
         yield piece
@@ -144,7 +152,8 @@ class VllmServerClient:
 
     ``cancel()`` disconnects the completion requests in flight, which makes the server abort
     their generation, and fails the ``generate`` calls waiting for the lock; all of them raise
-    :class:`GenerationCancelled`.
+    :class:`GenerationCancelled`. ``shutdown()`` does the same and ends every other request in
+    flight too; calls made after it raise ``RuntimeError``.
 
     With ``model.mtp.rollout`` the server has to draft with the model's MTP layers: the client
     checks what ``/monorl/info`` reports against the config when it is created and raises
@@ -193,6 +202,7 @@ class VllmServerClient:
         self._lock = threading.RLock()
         self._calls: set[_GenerateCall] = set()
         self._calls_lock = threading.Lock()
+        self._closed = False  # guarded by _calls_lock: no request is scheduled once it is set
         self._sleeping_tags: set[str] = set()  # vLLM memory tags currently released
         self._speculation: SpeculationCounters | None = None
         if speculative is not None:
@@ -221,6 +231,7 @@ class VllmServerClient:
     ) -> list[list[Completion]]:
         if not prompts:
             return []
+        self._check_usable()
         caps = prompt_caps(params, len(prompts), max_new_tokens)
         text_idx: dict[int, list[int]] = {}  # generation cap -> its text prompts
         for i, p in enumerate(prompts):
@@ -275,6 +286,10 @@ class VllmServerClient:
                         want_logprobs=params.logprobs,
                         top_logprobs=params.top_logprobs,
                     )
+        except _ClientClosed:
+            if call.cancelled:  # shutdown() while this call was in flight
+                raise GenerationCancelled("generation cancelled") from None
+            raise
         finally:
             with self._calls_lock:
                 self._calls.discard(call)
@@ -290,6 +305,7 @@ class VllmServerClient:
                     call.request.cancel()
 
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        self._check_usable()
         if not self._drafting:
             # The server does not draft: the MTP layers the trainer holds are not its business.
             weights = ((name, tensor) for name, tensor in weights if not is_wire_name(name))
@@ -329,6 +345,7 @@ class VllmServerClient:
         return self._speculation.delta(self._spec_decode_totals())
 
     def load_weights_from_path(self, path: str | os.PathLike[str]) -> None:
+        self._check_usable()
         with self._lock:
             self._wake(("weights",))
             self._post("/load_weights_from_path", json={"path": os.fspath(path)})
@@ -337,6 +354,7 @@ class VllmServerClient:
     def sleep(self) -> None:
         if not self._sleep_enabled:
             return
+        self._check_usable()
         with self._lock:
             if self._sleeping_tags:
                 return
@@ -346,18 +364,41 @@ class VllmServerClient:
     def wake_up(self) -> None:
         if not self._sleep_enabled:
             return
+        self._check_usable()
         with self._lock:
             self._wake(_ALL_TAGS)
 
     def shutdown(self) -> None:
-        if self._loop.is_closed():
-            return
-        asyncio.run_coroutine_threadsafe(self._client.aclose(), self._loop).result()
+        """Close the connections and stop the event-loop thread. The requests in flight are
+        dropped first: their ``generate`` calls raise :class:`GenerationCancelled` as after
+        :meth:`cancel`, other calls ``RuntimeError``, as does every call made afterwards.
+        Repeated calls are harmless."""
+        with self._calls_lock:
+            if self._closed:
+                return
+            self._closed = True
+            for call in self._calls:
+                call.cancelled = True
+        asyncio.run_coroutine_threadsafe(self._close(), self._loop).result()
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop_thread.join()
         self._loop.close()
 
     # -- internals ------------------------------------------------------------------------
+    def _check_usable(self) -> None:
+        """Raise once :meth:`shutdown` has stopped the event-loop thread: a call waiting for a
+        request there would wait forever. Public methods check before they do anything else."""
+        if self._closed:
+            raise _ClientClosed(self._url)
+
+    async def _close(self) -> None:
+        """On the event loop: drop every request in flight, then close the connections."""
+        requests = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in requests:
+            task.cancel()
+        await asyncio.gather(*requests, return_exceptions=True)
+        await self._client.aclose()
+
     def _check_server_drafts(self, speculative: dict[str, Any]) -> None:
         """Raise :class:`ConfigError` unless every worker of the server drafts the way
         ``model.mtp.rollout`` compiles to (``speculative``)."""
@@ -420,12 +461,19 @@ class VllmServerClient:
             if call is not None and call.cancelled:
                 sending.close()
                 raise GenerationCancelled("generation cancelled")
+            try:
+                self._check_usable()
+            except RuntimeError:
+                sending.close()
+                raise
             request = asyncio.run_coroutine_threadsafe(sending, self._loop)
             if call is not None:
                 call.request = request
         try:
             return request.result()
-        except concurrent.futures.CancelledError:  # only cancel() cancels a request
+        except concurrent.futures.CancelledError:
+            if call is None:  # cancel() cancels the requests of generate calls, shutdown() all
+                raise _ClientClosed(self._url) from None
             raise GenerationCancelled("generation cancelled") from None
         except BaseException:
             request.cancel()  # interrupted while waiting (KeyboardInterrupt): drop the request too
