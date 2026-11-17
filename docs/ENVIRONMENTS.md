@@ -352,8 +352,11 @@ and `env.params: {transport: stdio, command: [...]}` ([ENV_SDK.md](ENV_SDK.md); 
 the schema with this server's command, not trained here). `monorl.envs.server.serve(factory,
 transport=, host=, port=, name=, parallel_episodes=)` serves a zero-argument factory over `stdio`
 or `http`, as the `__main__` block above does. `monorl env check` starts the server, then runs
-spec, health, reset, `--turns` steps (default 1) and close, validating every response. It resets
-with a fixed sample (`reference: "hello"`) and steps with the text `hello`.
+spec, health, reset, `--turns` steps (default 1) and close, validating every response. By default
+it resets with a built-in sample (`reference: "hello"`) and steps with the text `hello`. For an
+environment that needs more, `--reference VALUE` sets the reference (read like a `--set` value:
+`7` is an integer), `--sample FILE.json` gives the sample as a JSON object with any of `id`,
+`messages`, `reference` and `metadata`, and `--action TEXT` is the text of every step.
 
 ```console
 $ .venv/bin/monorl env check --command .venv/bin/python --command $DEMO/guess_env.py

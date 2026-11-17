@@ -455,19 +455,45 @@ def env_check(
     turns: int = typer.Option(1, "--turns", min=1, help="Steps to run after reset."),
     cwd: Path | None = typer.Option(None, "--cwd", help="Working directory for the stdio server."),
     timeout: float = typer.Option(30.0, "--timeout", help="Seconds to wait for each response."),
+    sample: Path | None = typer.Option(
+        None,
+        "--sample",
+        help="JSON file with the sample to reset with: an object with any of id, messages, reference, "
+        "metadata. Keys left out keep the built-in sample's value.",
+    ),
+    reference: str | None = typer.Option(
+        None,
+        "--reference",
+        help="Reference of the sample, read like a --set value (7 is an integer, '\"7\"' a string). "
+        "Built-in sample: the string hello.",
+    ),
+    action: str | None = typer.Option(
+        None, "--action", help="Completion text sent with every step. Default: hello."
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Drive a MEP/1 server through spec → health → reset → step×N → close and report conformance."""
-    from monorl.cli.envcheck import run_check
+    from monorl.cli.envcheck import CANNED_ACTION, check_sample, run_check
+    from monorl.core.types import Completion
 
     if bool(command) == bool(url):
         _fail("pass exactly one of --command or --url", code=2)
+    try:
+        reset_with = check_sample(sample, reference)
+    except ValueError as e:
+        _fail(str(e), code=2)
+        return
+    step_with = CANNED_ACTION
+    if action is not None:
+        step_with = Completion(text=action, token_ids=[], finish_reason="stop")
     report = run_check(
         command=list(command) if command else None,
         url=url,
         turns=turns,
         cwd=str(cwd) if cwd else None,
         timeout=timeout,
+        sample=reset_with,
+        action=step_with,
     )
     if as_json:
         typer.echo(json.dumps(report.to_dict(), indent=2, default=str))

@@ -410,6 +410,92 @@ def test_env_check_server_death_exit_1(runner: CliRunner, mep_server_script: Pat
     assert "closed stdout" in result.output
 
 
+def _check_guessing_server(runner: CliRunner, script: Path, *options: str) -> Any:
+    argv = ["env", "check", "--json", "--command", sys.executable, "--command", str(script)]
+    return runner.invoke(app, [*argv, "--command", "--int-reference", *options])
+
+
+def test_env_check_built_in_sample_rejected_by_reset_says_how_to_give_one(
+    runner: CliRunner, mep_server_script: Path
+) -> None:
+    result = _check_guessing_server(runner, mep_server_script)
+    assert result.exit_code == 1
+    error = json.loads(result.stdout)["error"]
+    assert "reference must be an integer, got 'hello'" in error
+    assert "--sample" in error and "--reference" in error
+
+    # a sample the caller chose is the caller's to fix: the server's error stands alone
+    result = _check_guessing_server(runner, mep_server_script, "--reference", "seven")
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "ValueError: reference must be an integer, got 'seven'"
+
+
+def test_env_check_reference_and_action_options(runner: CliRunner, mep_server_script: Path) -> None:
+    result = _check_guessing_server(runner, mep_server_script, "--reference", "7", "--turns", "2")
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    sent = report["reset"]["info"]["sample"]
+    assert sent["reference"] == 7
+    # everything else is still the built-in sample and the built-in action
+    assert sent["id"] == "env-check-0" and report["reset"]["messages"] == sent["messages"]
+    assert "monorl env check" in sent["messages"][0]["content"]
+    assert [(s["reward"], s["done"]) for s in report["steps"]] == [(0.0, False), (0.0, False)]
+    assert report["steps"][0]["messages"] == [{"role": "user", "content": "echo:hello"}]
+
+    result = _check_guessing_server(
+        runner, mep_server_script, "--reference", "7", "--action", "7", "--turns", "2"
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert [(s["reward"], s["done"]) for s in report["steps"]] == [(1.0, True)]
+
+
+def test_env_check_sample_file(runner: CliRunner, mep_server_script: Path, tmp_path: Path) -> None:
+    given = {
+        "messages": [{"role": "system", "content": "Guess."}, {"role": "user", "content": "Go."}],
+        "reference": 12,
+        "metadata": {"range": 20},
+    }
+    path = tmp_path / "sample.json"
+    path.write_text(json.dumps(given), encoding="utf-8")
+    result = _check_guessing_server(runner, mep_server_script, "--sample", str(path), "--action", "12")
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.stdout)
+    assert report["reset"]["info"]["sample"] == {"id": "env-check-0", **given}
+    assert report["steps"][0]["reward"] == 1.0
+
+    # --reference replaces the file's reference and nothing else
+    result = _check_guessing_server(runner, mep_server_script, "--sample", str(path), "--reference", "3")
+    assert json.loads(result.stdout)["reset"]["info"]["sample"] == {
+        "id": "env-check-0",
+        **given,
+        "reference": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        (None, "cannot read sample file"),
+        ("{not json", "is not JSON"),
+        ("[1, 2]", "must hold a JSON object"),
+        ('{"refrence": 7}', "unknown keys ['refrence']"),
+        ('{"messages": "Guess."}', "messages must be a list"),
+        ('{"metadata": [1]}', "metadata must be an object"),
+    ],
+)
+def test_env_check_rejects_a_bad_sample_file(
+    runner: CliRunner, mep_server_script: Path, tmp_path: Path, content: str | None, expected: str
+) -> None:
+    path = tmp_path / "sample.json"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    result = _check_guessing_server(runner, mep_server_script, "--sample", str(path))
+    assert result.exit_code == 2
+    assert result.stdout == ""  # no report: the server was never asked anything
+    assert expected in " ".join(result.stderr.split())
+
+
 def test_env_check_requires_exactly_one_target(runner: CliRunner) -> None:
     assert runner.invoke(app, ["env", "check"]).exit_code == 2
     result = runner.invoke(app, ["env", "check", "--command", "x", "--url", "http://h"])
