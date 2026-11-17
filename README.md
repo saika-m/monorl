@@ -138,8 +138,9 @@ AWS_ENDPOINT_URL=http://localhost:9000 monorl data inspect s3://my-bucket/data/t
 ```
 
 A run writes `~/.monorl/runs/<run_name>/`: `config.yaml`, `status.json`, `metrics.jsonl`,
-`trajectories.jsonl`, `run.log`, `checkpoints/` and the exported model in `final/`. `--resume`
-continues from the latest checkpoint.
+`trajectories.jsonl`, `run.log`, the exported model in `final/` and, every
+`trainer.save_every` steps, a checkpoint under `checkpoints/` (every 10 in this recipe, so the
+five steps above write none). `--resume` continues from the latest checkpoint.
 
 `make install` installs the versions pinned in [`requirements.lock`](requirements.lock), the ones
 CI runs the tests on: monorl's dependencies with the extras `dev`, `trl`, `distributed`,
