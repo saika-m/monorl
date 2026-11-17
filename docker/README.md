@@ -20,7 +20,8 @@ Build arguments and their defaults:
 
 - `Dockerfile.cpu`: `PYTHON_VERSION` (3.12), `NODE_VERSION` (24), `UV_VERSION` (0.11.16),
   `MONORL_EXTRAS` (`trl,distributed,rewards,openenv,hermes`; add `multimodal` for image
-  prompts). The packages are installed at the versions of `requirements.lock`, hashes checked.
+  prompts and `sinks` for W&B and TensorBoard). The packages are installed at the versions of
+  `requirements.lock`, hashes checked.
 - `Dockerfile.vllm`: `VLLM_VERSION` (`v0.33.0`), `MONORL_EXTRAS` (`vllm,distributed,rewards`).
 - `Dockerfile.sglang`: `SGLANG_VERSION` (`v0.5.23`), `MONORL_EXTRAS`
   (`sglang,distributed,rewards`).

@@ -144,9 +144,9 @@ this recipe, so the five steps above write none). `--resume` continues from the 
 
 `make install` installs the versions pinned in [`requirements.lock`](requirements.lock), the ones
 CI runs the tests on: monorl's dependencies with the extras `dev`, `trl`, `distributed`,
-`rewards`, `openenv`, `hermes` and `multimodal` (image prompts), and PyTorch's CPU build (on
-macOS the regular build, MPS included). `make sync` brings an existing `.venv` back to the lock
-after a pull.
+`rewards`, `openenv`, `hermes`, `multimodal` (image prompts) and `sinks` (W&B and TensorBoard),
+and PyTorch's CPU build (on macOS the regular build, MPS included). `make sync` brings an
+existing `.venv` back to the lock after a pull.
 
 GPU engines and backends are extras (`.[vllm]`, `.[sglang]`, `.[verl]`) and are not part of the
 lock. Unsloth gets its own venv (`make install-unsloth`) and NeMo-RL is a git checkout

@@ -36,7 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = "requirements.lock"
 PINS = "third_party/pins.toml"
-EXTRAS = ("dev", "trl", "distributed", "multimodal", "rewards", "openenv", "hermes")
+EXTRAS = ("dev", "trl", "distributed", "multimodal", "rewards", "sinks", "openenv", "hermes")
 PYTHON = "3.11"
 """The oldest Python of ``requires-python``; later versions are covered by markers."""
 CONSTRAINTS = ".lock-pins.txt"

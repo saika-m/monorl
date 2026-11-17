@@ -599,9 +599,11 @@ under the name it has there, at the row's step. Text and null values stay in `me
 | `logging.wandb_project` (unset) | `wandb` | a W&B run in that project, named `run_name`, with the full config; its files are in `<run_dir>/wandb/` (`WANDB_DIR` is not used) |
 | `logging.tensorboard` (false) | `tensorboard` | event files in `<run_dir>/tensorboard/`, one per start of the run |
 
-Neither package is a dependency of monorl or in `requirements.lock`. This section was run in a copy
-of `.venv` with `tensorboard` 2.21.0 and `wandb` 0.31.0 added, W&B offline (`WANDB_MODE=offline`);
-nothing was sent to a W&B server, so what the W&B site shows was not seen.
+Both packages are the extra `sinks` (`pip install "monorl[sinks]"`) and are pinned in
+`requirements.lock`, so `make install` has them; the CPU image does not (build it with
+`--build-arg MONORL_EXTRAS=trl,distributed,rewards,openenv,hermes,sinks`). This section was run
+with `tensorboard` 2.21.0 and `wandb` 0.31.0, the versions of the lock, W&B offline
+(`WANDB_MODE=offline`); nothing was sent to a W&B server, so what the W&B site shows was not seen.
 
 ```bash
 WANDB_MODE=offline .venv/bin/monorl train \
