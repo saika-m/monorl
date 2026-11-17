@@ -801,3 +801,17 @@ def test_data_inspect_renders_media_parts_as_markers(runner: CliRunner, tmp_path
     assert [" ".join(line.split()) for line in sample_lines] == [
         f"[user] <image: {tmp_path / 'red.png'}> What colour?"
     ]
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1"])
+def test_env_check_refuses_a_timeout_that_is_not_positive(runner: CliRunner, timeout: str) -> None:
+    result = runner.invoke(app, ["env", "check", "--url", "http://127.0.0.1:9", "--timeout", timeout])
+    assert result.exit_code == 2, result.output
+    assert f"--timeout must be greater than 0 seconds, got {float(timeout)}" in result.output
+
+
+def test_env_serve_param_without_a_value_is_named_as_written(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["env", "serve", "single_turn", "-p", "max_turns"])
+    assert result.exit_code == 2, result.output
+    assert "--param must look like key=value, got 'max_turns'" in result.output
+    assert "params." not in result.output

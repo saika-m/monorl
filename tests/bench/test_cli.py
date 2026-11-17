@@ -235,3 +235,9 @@ def test_plan_given_a_pipeline_config_says_so(runner, run_config_dict, tmp_path:
     out = _flat(result.output)
     assert "is a pipeline config" in out and "config.yaml" in out
     assert "invalid RunConfig" not in out
+
+
+def test_env_refuses_a_timeout_that_is_not_positive(runner) -> None:
+    result = runner.invoke(app, ["env", "--url", "http://127.0.0.1:9", "--timeout", "0"])
+    assert result.exit_code == 2, result.output
+    assert "--timeout must be greater than 0 seconds" in result.output

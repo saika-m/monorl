@@ -194,6 +194,8 @@ def env(
 
     if bool(command) == bool(url):
         _fail("pass exactly one of --command or --url", code=2)
+    if not timeout > 0:
+        _fail(f"--timeout must be greater than 0 seconds, got {timeout}", code=2)
     levels = _int_list(parallel, "--parallel")
     target = EnvTarget(
         command=list(command) if command else None, url=url, cwd=str(cwd) if cwd else None, timeout_s=timeout

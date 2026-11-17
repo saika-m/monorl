@@ -542,6 +542,8 @@ def env_check(
 
     if bool(command) == bool(url):
         _fail("pass exactly one of --command or --url", code=2)
+    if not timeout > 0:
+        _fail(f"--timeout must be greater than 0 seconds, got {timeout}", code=2)
     try:
         reset_with = check_sample(sample, reference)
     except ValueError as e:
@@ -628,6 +630,10 @@ def env_serve(
     from monorl.envs.server import allowed_host_names
     from monorl.envs.server import serve as serve_env
 
+    for item in param or []:
+        key, eq, _ = item.partition("=")
+        if not eq or not all(key.strip().split(".")):
+            _fail(f"--param must look like key=value, got {item!r}", code=2)
     try:
         allowed_host_names(allowed_host or ())
     except ValueError as e:
