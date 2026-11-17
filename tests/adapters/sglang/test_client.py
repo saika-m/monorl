@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import multiprocessing
 import pickle
 import threading
 from collections.abc import Callable
@@ -493,7 +494,7 @@ def test_mtp_weights_are_not_sent_to_a_server_that_does_not_draft(server, run_co
     assert len(server.requests) == n
 
 
-# -- shutdown ------------------------------------------------------------------------------------
+# -- shutdown, and a fork of the process ----------------------------------------------------------
 
 
 def _in_thread(fn: Callable[..., Any], *args: Any) -> Future[Any]:
@@ -509,6 +510,30 @@ def _in_thread(fn: Callable[..., Any], *args: Any) -> Future[Any]:
 
     threading.Thread(target=run, daemon=True).start()
     return outcome
+
+
+def _in_fork(fn: Callable[[], Any]) -> str:
+    """What ``fn()`` does in a fork of this process: ``"returned"``, or the error it raises as
+    ``"<type>: <message>"``. A child that has not answered after 5 s fails the test."""
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+
+    def report() -> None:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 - reported to the parent
+            sender.send(f"{type(e).__name__}: {e}")
+        else:
+            sender.send("returned")
+
+    child = context.Process(target=report, daemon=True)
+    child.start()
+    try:
+        assert receiver.poll(5), "the call hangs in the forked process"
+        return receiver.recv()
+    finally:
+        child.kill()
+        child.join(5)
 
 
 def test_shutdown_ends_the_generate_calls_in_flight(loopback, server):
@@ -572,3 +597,28 @@ def test_shutdown_ends_a_generate_call_that_is_asking_how_the_server_drafts(run_
     _in_thread(client.shutdown).result(timeout=5)
     with pytest.raises(GenerationCancelled):
         running.result(timeout=5)
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="needs os.fork")
+def test_a_client_in_a_forked_process_fails_at_once(loopback, server):
+    """The thread that runs a client's requests exists in the process that built it only."""
+    web, client = loopback
+    generate = lambda: client.generate([[1, 2, 3]], SamplingParams(n=2))  # noqa: E731
+    assert len(generate()[0]) == 2
+    for call in (generate, lambda: client.load_weights_from_path("/ckpt"), client.server_info):
+        outcome = _in_fork(call)
+        assert outcome.startswith("RuntimeError: ") and "fork" in outcome and "process" in outcome
+    # a child that cleans up closes nothing of the parent's
+    assert _in_fork(client.shutdown) == "returned"
+    assert server.paths() == ["/generate"]
+    assert len(generate()[0]) == 2
+
+    # A fork taken while a call is in flight copies the lock that call holds, and nothing in the
+    # child releases it: the child is told before it waits for the lock.
+    web.stall = True
+    loading = _in_thread(client.load_weights_from_path, "/ckpt")
+    assert web.stalled.get(timeout=5) == "/update_weights_from_disk"
+    assert "fork" in _in_fork(lambda: client.load_weights_from_path("/ckpt"))
+    _in_thread(client.shutdown).result(timeout=5)
+    with pytest.raises(RuntimeError, match="was shut down"):
+        loading.result(timeout=5)

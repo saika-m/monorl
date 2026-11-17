@@ -37,7 +37,8 @@ output — and calls ``abort_request(rid)`` for every request of the batch. The 
 run as tasks of an ``httpx.AsyncClient`` on a private event-loop thread: cancelling a task closes
 its connection, which a thread blocked in a synchronous ``httpx.Client`` call could not be made
 to do. (``POST /abort_request`` exists too, but takes one request id per call.) ``shutdown()``
-drops every request in flight the same way before it stops that thread.
+drops every request in flight the same way before it stops that thread, which exists only in the
+process that built the client.
 """
 
 from __future__ import annotations
@@ -110,7 +111,9 @@ class SGLangServerClient:
     ``cancel()`` disconnects the ``/generate`` requests in flight, which makes the server abort
     their generation; the interrupted ``generate`` calls raise :class:`GenerationCancelled`.
     ``shutdown()`` does the same and ends every other request in flight too; calls made after it
-    raise ``RuntimeError``.
+    raise ``RuntimeError``. So does every call in a process forked from the one that built the
+    client, where the thread that runs the requests does not exist: a process builds its own
+    client.
     """
 
     def __init__(
@@ -135,6 +138,7 @@ class SGLangServerClient:
             target=self._loop.run_forever, name=f"monorl-sglang-client-{replica}", daemon=True
         )
         self._loop_thread.start()
+        self._pid = os.getpid()  # the only process the loop thread runs in
         self._lock = threading.Lock()
         self._calls: set[_GenerateCall] = set()
         self._calls_lock = threading.Lock()
@@ -280,7 +284,10 @@ class SGLangServerClient:
         """Close the connections and stop the event-loop thread. The requests in flight are
         dropped first: their ``generate`` calls raise :class:`GenerationCancelled` as after
         :meth:`cancel`, other calls ``RuntimeError``, as does every call made afterwards.
-        Repeated calls are harmless."""
+        Repeated calls are harmless. In a forked process there is nothing to close: connections
+        and thread belong to the process that built the client."""
+        if os.getpid() != self._pid:
+            return
         with self._calls_lock:
             if self._closed:
                 return
@@ -294,8 +301,16 @@ class SGLangServerClient:
 
     # -- internals ----------------------------------------------------------------------
     def _check_usable(self) -> None:
-        """Raise once :meth:`shutdown` has stopped the event-loop thread: a call waiting for a
-        request there would wait forever. Public methods check before they do anything else."""
+        """Raise unless this process can run requests: the event-loop thread is not copied into
+        a forked process, and :meth:`shutdown` stops it. A call waiting for a request there
+        would wait forever. Public methods check before they take a lock, which a fork may have
+        copied while another thread held it."""
+        if os.getpid() != self._pid:
+            raise RuntimeError(
+                f"the sglang server client for {self._url} was built in process {self._pid} and is used in "
+                f"process {os.getpid()}, a fork of it, where the thread that runs its requests does not "
+                "exist; build the client in the process that uses it"
+            )
         if self._closed:
             raise _ClientClosed(self._url)
 

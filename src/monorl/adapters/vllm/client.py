@@ -41,7 +41,7 @@ cancels the handler on ``http.disconnect``, and ``AsyncLLM.generate``
 requests therefore run as tasks of an ``httpx.AsyncClient`` on a private event-loop thread:
 cancelling a task closes its connection, which a thread blocked in a synchronous ``httpx.Client``
 call could not be made to do. ``shutdown()`` drops every request in flight the same way before it
-stops that thread.
+stops that thread, which exists only in the process that built the client.
 """
 
 from __future__ import annotations
@@ -153,7 +153,9 @@ class VllmServerClient:
     ``cancel()`` disconnects the completion requests in flight, which makes the server abort
     their generation, and fails the ``generate`` calls waiting for the lock; all of them raise
     :class:`GenerationCancelled`. ``shutdown()`` does the same and ends every other request in
-    flight too; calls made after it raise ``RuntimeError``.
+    flight too; calls made after it raise ``RuntimeError``. So does every call in a process
+    forked from the one that built the client, where the thread that runs the requests does not
+    exist: a process builds its own client.
 
     With ``model.mtp.rollout`` the server has to draft with the model's MTP layers: the client
     checks what ``/monorl/info`` reports against the config when it is created and raises
@@ -199,6 +201,7 @@ class VllmServerClient:
             target=self._loop.run_forever, name=f"monorl-vllm-client-{replica}", daemon=True
         )
         self._loop_thread.start()
+        self._pid = os.getpid()  # the only process the loop thread runs in
         self._lock = threading.RLock()
         self._calls: set[_GenerateCall] = set()
         self._calls_lock = threading.Lock()
@@ -372,7 +375,10 @@ class VllmServerClient:
         """Close the connections and stop the event-loop thread. The requests in flight are
         dropped first: their ``generate`` calls raise :class:`GenerationCancelled` as after
         :meth:`cancel`, other calls ``RuntimeError``, as does every call made afterwards.
-        Repeated calls are harmless."""
+        Repeated calls are harmless. In a forked process there is nothing to close: connections
+        and thread belong to the process that built the client."""
+        if os.getpid() != self._pid:
+            return
         with self._calls_lock:
             if self._closed:
                 return
@@ -386,8 +392,16 @@ class VllmServerClient:
 
     # -- internals ------------------------------------------------------------------------
     def _check_usable(self) -> None:
-        """Raise once :meth:`shutdown` has stopped the event-loop thread: a call waiting for a
-        request there would wait forever. Public methods check before they do anything else."""
+        """Raise unless this process can run requests: the event-loop thread is not copied into
+        a forked process, and :meth:`shutdown` stops it. A call waiting for a request there
+        would wait forever. Public methods check before they take a lock, which a fork may have
+        copied while another thread held it."""
+        if os.getpid() != self._pid:
+            raise RuntimeError(
+                f"the vLLM server client for {self._url} was built in process {self._pid} and is used in "
+                f"process {os.getpid()}, a fork of it, where the thread that runs its requests does not "
+                "exist; build the client in the process that uses it"
+            )
         if self._closed:
             raise _ClientClosed(self._url)
 
