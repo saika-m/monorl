@@ -423,6 +423,7 @@ class ComponentLoop:
             max_context_tokens=self.config.context_budget,
             retries=env_cfg.retries,
             failures=failures,
+            turn_batching=self.config.rollout.turn_batching,
         )
         if not failures:
             return trajectories, 0

@@ -356,6 +356,17 @@ class RolloutConfig(_Model):
             "whole conversation every turn."
         ),
     )
+    turn_batching: Literal["lockstep", "arrival"] = Field(
+        "lockstep",
+        description=(
+            "How the turns of concurrent episodes reach an engine. 'lockstep': once every running episode "
+            "has its next prompt, all of them are generated in one call, in a fixed order, so a run repeats "
+            "for a fixed seed; an episode waits for the slowest environment step of its round. 'arrival': "
+            "an episode asks as soon as its environment has answered and requests are batched as they "
+            "arrive: faster when environment steps are slow and uneven, not repeatable. Agent harnesses "
+            "that drive their own episodes always run the second way."
+        ),
+    )
     device: str | None = Field(None, description="Device for the 'hf' backend (cpu/mps/cuda); auto if unset.")
     extra: dict[str, Any] = Field(default_factory=dict, description="Engine-specific options passed through.")
 

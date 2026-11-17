@@ -31,10 +31,28 @@ in the trajectory's `reward_breakdown` and reported as `reward/env` ([RUNS.md](R
 `rewards:` may be empty for every type except `single_turn`. See also
 [CREDIT_ASSIGNMENT.md](CREDIT_ASSIGNMENT.md) (per-turn credit) and [ALGORITHMS.md](ALGORITHMS.md).
 
-Parallel episodes: episodes run on a thread pool, at most `rollout.extra.max_parallel_episodes`
-(default 64) at a time, each with its own environment instance; generation requests are batched
-across them. An exception from `reset`, `step` or prompt rendering is a failure of that
-episode's environment; aborts and rollout engine failures always end the batch.
+Parallel episodes: at most `rollout.extra.max_parallel_episodes` (default 64) run at a time,
+each with its own environment instance; `reset`, `step` and prompt rendering run on a thread
+pool. An exception from one of them is a failure of that episode's environment; aborts and
+rollout engine failures always end the batch.
+
+Turn batching: `rollout.turn_batching` decides how the turns of those episodes reach the engine.
+
+- `lockstep` (the default): the episodes take their turns together. Once every running episode
+  has its next prompt, all prompts go to the engine in one call, in the order of the episodes,
+  and a finished episode's place is taken by the next one before the following call. Which
+  prompts share a call never depends on how long anything took, so a run repeats for a fixed
+  seed ([RUNS.md](RUNS.md#what-a-run-does)). Every episode waits for the slowest environment step
+  of its round.
+- `arrival`: an episode asks for its next completion as soon as its environment has answered,
+  and requests that arrive within `rollout.extra.batch_max_wait_ms` (default 10) of each other
+  share a call. Nothing waits for a slow environment, and a run does not repeat. Choose it when
+  environment steps take seconds and differ a lot between episodes.
+
+With several engines each engine batches its own episodes. A call holds at most
+`rollout.extra.batch_max_size` prompts (default: the sequences of a step). The agent harnesses
+(`harness`, `hermes`) decide themselves when they call the policy, so their requests are always
+batched by arrival.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -247,6 +265,10 @@ An environment is any object with these members (`monorl.core.interfaces.Environ
 | `step(action) -> StepResult` | `action` is a `Completion` (`text`, `finish_reason`, ...); return `StepResult(messages, reward=0.0, done=True, info={})`, with no messages on the last step |
 | `close() -> None` | release resources; also called after a failure |
 | `tools` (optional) | OpenAI-style function schemas for the chat template; not with image inputs |
+| `max_concurrent_episodes` (optional) | how many episodes may be open at once, for an environment whose `reset` otherwise waits for another episode to end; the runner then opens no more (with `turn_batching: lockstep` such a wait would never end). `remote` over http reports its servers' places |
+
+For a run to repeat, an environment has to be a function of the sample and the completions it is
+given: no state shared between instances, no dependence on the order in which they are created.
 
 `$DEMO/guess_env.py`:
 

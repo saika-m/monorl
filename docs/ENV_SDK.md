@@ -263,8 +263,9 @@ flight:
    connections/threads, so `parallel_episodes` can be large and the server can live on another
    machine. Start it with `--transport http --addr 0.0.0.0:8081` and point `params.url` at it.
    The client keeps at most `spec.parallel_episodes` episodes open per server (`params.parallel`
-   overrides that) and queues further resets until one ends, since a server at capacity refuses
-   new episodes. For several replicas of one environment list them in `params.urls`: an
+   overrides that), since a server at capacity refuses new episodes: the orchestrator runs no
+   more episodes at a time than the servers have places (with `rollout.turn_batching: arrival`
+   further resets queue until an episode ends). For several replicas of one environment list them in `params.urls`: an
    episode's state lives in one process, so each episode is pinned to one replica (the least
    loaded) for all of its requests — a single load-balanced or round-robin address in `url`
    would scatter them and fail with `unknown_episode`.

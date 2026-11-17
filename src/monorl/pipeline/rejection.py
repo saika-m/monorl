@@ -103,6 +103,7 @@ class PolicySampler:
             max_context_tokens=self.config.context_budget,
             retries=env_cfg.retries,
             failures=failures,
+            turn_batching=self.config.rollout.turn_batching,
         )
         self.attempted += len(specs)
         if failures:

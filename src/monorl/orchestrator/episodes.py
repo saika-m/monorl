@@ -2,10 +2,24 @@
 
 Each episode owns one environment instance. A stepped :class:`~monorl.core.interfaces.Environment`
 follows the multi-turn loop from its docstring; an :class:`~monorl.core.interfaces.EpisodeDriver`
-(an external agent harness behind the capture gateway) runs the whole episode itself. Episodes
-run concurrently on a thread pool; their ``generate`` calls go through a
-:class:`monorl.rollout.BatchingEngine`, so many concurrent single-prompt requests coalesce into a
-few batched engine calls.
+(an external agent harness behind the capture gateway) runs the whole episode itself.
+
+Turn batching (``rollout.turn_batching``). ``lockstep``: the episodes of an engine take their
+turns together. Environment work (``reset``, ``step``, rendering the next prompt) runs on a thread
+pool; once every running episode of the engine has its next prompt, the prompts go to the engine
+as one ``generate`` call per distinct :class:`SamplingParams`, in the order of the specs. Which
+prompts share a call, and in which order, therefore never depends on timing, and neither does the
+set of running episodes: a finished episode's place is taken by the next spec before the next
+call. A run with a fixed seed repeats as long as its environments and engines are deterministic.
+The price is that every episode waits for the slowest environment step of its round.
+
+``arrival``: every episode runs on its own thread and asks the engine for one completion at a time,
+as soon as its environment has answered; a :class:`monorl.rollout.BatchingEngine` coalesces the
+requests that arrive together. Nothing waits for a slow environment, and nothing repeats. An
+:class:`EpisodeDriver` always runs this way: its harness decides when it calls the policy.
+
+Engines are independent: with several engines every engine batches the turns of its own episodes
+and shares ``max_parallel`` evenly with the others (at least one episode each).
 
 Text prompts are sent to the engine as token ids: turn 0 is rendered with :func:`chat_prompt_ids`
 (with the environment's tool schemas, if any), every later turn is built by
@@ -42,10 +56,11 @@ import contextlib
 import dataclasses
 import logging
 import threading
-from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any
+from collections import deque
+from collections.abc import Callable, Generator, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from monorl.core.errors import DataError, EpisodeAborted, GenerationCancelled, GenerationFailed, MonorlError
 from monorl.core.interfaces import Environment, EpisodeDriver, RolloutEngine
@@ -59,12 +74,18 @@ from monorl.core.types import (
     Turn,
     messages_have_media,
 )
+from monorl.rollout.batching import params_key
 from monorl.rollout.render import chat_prompt_ids, continue_prompt_ids
 
 log = logging.getLogger(__name__)
 
 CANCEL_INTERVAL_S = 0.05
 """How often ``run_episodes`` re-issues ``engine.cancel()`` while an abort is being carried out."""
+
+TurnBatching = Literal["lockstep", "arrival"]
+
+_Request = tuple[PromptInput, SamplingParams]
+"""What an episode asks the engine for: one prompt and the sampling parameters of that turn."""
 
 
 @dataclass(slots=True)
@@ -97,71 +118,46 @@ def run_episode(
 ) -> Trajectory:
     """One episode; an environment failure is retried ``retries`` times, each time with a fresh
     environment, and raised when the last attempt fails too (module docstring)."""
-    attempt = 0
-    while True:
-        try:
-            return _run_once(
-                spec,
-                env_factory=env_factory,
-                tokenizer=tokenizer,
-                params=params,
-                abort=abort,
-                turn_rendering=turn_rendering,
-                max_context_tokens=max_context_tokens,
-            )
-        except (EpisodeAborted, GenerationFailed):
-            raise
-        except Exception as e:
-            if attempt >= retries or (abort is not None and abort.is_set()):
-                raise
-            attempt += 1
-            log.warning(
-                "episode %s failed (%s: %s); retry %d of %d",
-                spec.group_id,
-                type(e).__name__,
-                e,
-                attempt,
-                retries,
-            )
+    return run_episodes(
+        [spec],
+        env_factory=env_factory,
+        tokenizer=tokenizer,
+        params=params,
+        max_parallel=1,
+        abort=abort,
+        turn_rendering=turn_rendering,
+        max_context_tokens=max_context_tokens,
+        retries=retries,
+    )[0]
 
 
-def _run_once(
-    spec: EpisodeSpec,
-    *,
-    env_factory: Callable[[], Environment | EpisodeDriver],
-    tokenizer: Any,
-    params: SamplingParams,
-    abort: threading.Event | None,
-    turn_rendering: str,
-    max_context_tokens: int | None,
-) -> Trajectory:
-    env = env_factory()
+def _ask(spec: EpisodeSpec, prompts: Sequence[PromptInput], params: SamplingParams) -> list[Completion]:
+    """One completion per prompt from the spec's engine; ``spec`` names the call in errors."""
     try:
-        if hasattr(env, "run_episode"):
-            return env.run_episode(
-                spec.sample,
-                group_id=spec.group_id,
-                engine=spec.engine,
-                tokenizer=tokenizer,
-                params=params,
-                abort=abort,
-                turn_rendering=turn_rendering,
-                max_context_tokens=max_context_tokens,
-            )
-        return _step_episode(
-            env,
-            spec,
-            tokenizer=tokenizer,
-            params=params,
-            abort=abort,
-            turn_rendering=turn_rendering,
-            max_context_tokens=max_context_tokens,
+        outputs = spec.engine.generate(prompts, params)
+    except GenerationCancelled as e:
+        raise EpisodeAborted(f"episode {spec.group_id} aborted during generation") from e
+    except Exception as e:
+        raise GenerationFailed(f"episode {spec.group_id}: the rollout engine failed: {e}") from e
+    if len(outputs) != len(prompts):
+        raise GenerationFailed(
+            f"episode {spec.group_id}: the rollout engine returned {len(outputs)} results for "
+            f"{len(prompts)} prompts"
         )
-    finally:
-        env.close()
+    return [completions[0] for completions in outputs]
 
 
-def _step_episode(
+def _drive(turns: Generator[_Request, Completion, Trajectory], spec: EpisodeSpec) -> Trajectory:
+    """Run an episode's turns to the end, asking the engine for one completion at a time."""
+    try:
+        prompt, params = next(turns)
+        while True:
+            prompt, params = turns.send(_ask(spec, [prompt], params)[0])
+    except StopIteration as stop:
+        return stop.value
+
+
+def _turns(
     env: Environment,
     spec: EpisodeSpec,
     *,
@@ -170,7 +166,9 @@ def _step_episode(
     abort: threading.Event | None,
     turn_rendering: str,
     max_context_tokens: int | None,
-) -> Trajectory:
+) -> Generator[_Request, Completion, Trajectory]:
+    """The turns of a stepped episode: yields what the next turn asks of the engine, is sent the
+    completion, and returns the trajectory. Everything between two yields is environment work."""
     messages: list[Message] = list(env.reset(spec.sample))
     # ``[]`` (remote/OpenEnv environments without tools) means no tool schemas, like ``None``.
     tools = getattr(env, "tools", None) or None
@@ -217,12 +215,7 @@ def _step_episode(
                     break
                 if room < params.max_new_tokens:
                     turn_params = dataclasses.replace(params, max_new_tokens=room)
-        try:
-            completion = spec.engine.generate([prompt], turn_params)[0][0]
-        except GenerationCancelled as e:
-            raise EpisodeAborted(f"episode {spec.group_id} aborted during generation") from e
-        except Exception as e:
-            raise GenerationFailed(f"episode {spec.group_id}: the rollout engine failed: {e}") from e
+        completion = yield prompt, turn_params
         if completion.prompt_token_ids is not None:
             prompt_ids = list(completion.prompt_token_ids)
         elif multimodal:
@@ -262,6 +255,272 @@ def _step_episode(
     )
 
 
+@dataclass(slots=True)
+class _Live:
+    """An episode that is running: ``request`` is set while it waits for its turn's completion."""
+
+    index: int
+    spec: EpisodeSpec
+    attempt: int = 0
+    env: Environment | EpisodeDriver | None = None
+    turns: Generator[_Request, Completion, Trajectory] | None = None
+    request: _Request | None = None
+
+
+@dataclass(slots=True)
+class _Outcome:
+    """What the runs of one :func:`run_episodes` call share. ``fatal`` and ``failed`` are appended
+    to by several threads and read once all of them have ended."""
+
+    trajectories: list[Trajectory | None]
+    fatal: list[tuple[int, BaseException]] = field(default_factory=list)
+    """``(spec index, error)`` of what ends the whole call."""
+    failed: list[tuple[int, EpisodeFailure]] = field(default_factory=list)
+    halt: threading.Event = field(default_factory=threading.Event)
+    """Set with the first fatal error: nothing new is started."""
+
+
+class _Environments:
+    """The environment factory of one :func:`run_episodes` call. :meth:`limit` has to make an
+    environment to ask it; the first episode that needs one gets that one."""
+
+    def __init__(self, factory: Callable[[], Environment | EpisodeDriver]) -> None:
+        self._factory = factory
+        self._made: list[Environment | EpisodeDriver] = []
+        self._lock = threading.Lock()
+
+    def limit(self) -> int | None:
+        """``max_concurrent_episodes`` of the environments (``None``: they do not say, or the
+        first one could not be made, which the episode that needs it will report)."""
+        try:
+            env = self._factory()
+        except Exception:  # noqa: BLE001
+            return None
+        with self._lock:
+            self._made.append(env)
+        try:
+            limit = getattr(env, "max_concurrent_episodes", None)
+        except Exception:  # noqa: BLE001 - the same failure will be the episode's
+            return None
+        return max(1, int(limit)) if limit is not None else None
+
+    def make(self) -> Environment | EpisodeDriver:
+        with self._lock:
+            if self._made:
+                return self._made.pop()
+        return self._factory()
+
+    def __enter__(self) -> _Environments:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        with self._lock:
+            unused, self._made = self._made, []
+        for env in unused:
+            env.close()
+
+
+class _Run:
+    """Runs ``items`` (``(spec index, spec)``, in order), at most ``capacity`` at a time.
+
+    The loop owns all the state. Environment work (starting an episode, its ``step``, the next
+    prompt) runs on a pool and comes back as a trajectory, as the episode's next request, or as
+    the error it raised. With ``lockstep`` the engine is called once nothing is on the pool, for
+    every running episode; otherwise an episode asks the engine itself and stays on the pool until
+    it has ended, like an :class:`EpisodeDriver` always does."""
+
+    def __init__(
+        self,
+        items: Sequence[tuple[int, EpisodeSpec]],
+        outcome: _Outcome,
+        *,
+        capacity: int,
+        lockstep: bool,
+        env_factory: Callable[[], Environment | EpisodeDriver],
+        tokenizer: Any,
+        params: SamplingParams,
+        abort: threading.Event | None,
+        turn_rendering: str,
+        max_context_tokens: int | None,
+        retries: int,
+        tolerate: bool,
+    ) -> None:
+        self.queue = deque(items)
+        self.outcome = outcome
+        self.capacity = capacity
+        self.lockstep = lockstep
+        self.env_factory = env_factory
+        self.tokenizer = tokenizer
+        self.params = params
+        self.abort = abort
+        self.turn_rendering = turn_rendering
+        self.max_context_tokens = max_context_tokens
+        self.retries = retries
+        self.tolerate = tolerate
+        self.live: dict[int, _Live] = {}
+        self.working: dict[Future[Trajectory | _Request | Exception], _Live] = {}
+        self.pool: ThreadPoolExecutor | None = None
+
+    def run(self) -> None:
+        try:
+            if self.capacity > 1:
+                self.pool = ThreadPoolExecutor(self.capacity, thread_name_prefix="monorl-episode")
+            while True:
+                while self.queue and len(self.live) < self.capacity and not self.outcome.halt.is_set():
+                    index, spec = self.queue.popleft()
+                    self.live[index] = episode = _Live(index, spec)
+                    self._work(episode, None)
+                if self.working:
+                    done, _ = wait(self.working, return_when=FIRST_COMPLETED)
+                    for future in sorted(done, key=lambda f: self.working[f].index):
+                        self._settle(self.working.pop(future), future.result())
+                elif self.live and not self.outcome.halt.is_set():
+                    self._generate([self.live[index] for index in sorted(self.live)])
+                else:
+                    return
+        except BaseException as e:
+            self._fatal(-1, e)
+        finally:
+            for future in self.working:
+                future.exception()  # a step in flight finishes before its environment is closed
+            for episode in self.live.values():
+                try:
+                    self._close(episode)
+                except Exception:  # noqa: BLE001 - the error that ended the run is the one to report
+                    log.exception("closing the environment of episode %s failed", episode.spec.group_id)
+            if self.pool is not None:
+                self.pool.shutdown(wait=True)
+
+    # -- environment work: on the pool, or inline when there is none ------------------------
+    def _work(self, episode: _Live, completion: Completion | None) -> None:
+        """Start ``episode`` (no ``completion``) or hand it the completion it asked for."""
+        if self.pool is None:
+            self._settle(episode, self._advance(episode, completion))
+        else:
+            self.working[self.pool.submit(self._advance, episode, completion)] = episode
+
+    def _advance(self, episode: _Live, completion: Completion | None) -> Trajectory | _Request | Exception:
+        """The episode's next request, its trajectory once it has ended (its environment is closed
+        then), or what it raised (likewise)."""
+        spec = episode.spec
+        try:
+            result: Trajectory | _Request
+            if episode.turns is not None:
+                result = self._next(episode.turns, completion)
+            else:
+                episode.env = env = self.env_factory()
+                if hasattr(env, "run_episode"):
+                    result = env.run_episode(
+                        spec.sample,
+                        group_id=spec.group_id,
+                        engine=spec.engine,
+                        tokenizer=self.tokenizer,
+                        params=self.params,
+                        abort=self.abort,
+                        turn_rendering=self.turn_rendering,
+                        max_context_tokens=self.max_context_tokens,
+                    )
+                else:
+                    turns = _turns(
+                        env,
+                        spec,
+                        tokenizer=self.tokenizer,
+                        params=self.params,
+                        abort=self.abort,
+                        turn_rendering=self.turn_rendering,
+                        max_context_tokens=self.max_context_tokens,
+                    )
+                    if self.lockstep:
+                        episode.turns = turns
+                        result = self._next(turns, None)
+                    else:
+                        result = _drive(turns, spec)
+            if isinstance(result, Trajectory):
+                self._close(episode)
+            return result
+        except Exception as e:
+            try:
+                self._close(episode)
+            except Exception:  # noqa: BLE001 - the episode's own error is the one to report
+                log.exception("closing the environment of episode %s failed", spec.group_id)
+            return e
+
+    @staticmethod
+    def _next(
+        turns: Generator[_Request, Completion, Trajectory], completion: Completion | None
+    ) -> Trajectory | _Request:
+        try:
+            return next(turns) if completion is None else turns.send(completion)
+        except StopIteration as stop:
+            return stop.value
+
+    @staticmethod
+    def _close(episode: _Live) -> None:
+        env, turns = episode.env, episode.turns
+        episode.env = episode.turns = episode.request = None
+        if turns is not None:
+            turns.close()
+        if env is not None:
+            env.close()
+
+    # -- the loop's side ----------------------------------------------------------------------
+    def _settle(self, episode: _Live, result: Trajectory | _Request | Exception) -> None:
+        spec = episode.spec
+        if isinstance(result, Trajectory):
+            self.outcome.trajectories[episode.index] = result
+            del self.live[episode.index]
+        elif not isinstance(result, Exception):
+            episode.request = result
+        elif isinstance(result, (EpisodeAborted, GenerationFailed)):
+            self._fatal(episode.index, result)
+        elif episode.attempt < self.retries and not self._stopping():
+            episode.attempt += 1
+            log.warning(
+                "episode %s failed (%s: %s); retry %d of %d",
+                spec.group_id,
+                type(result).__name__,
+                result,
+                episode.attempt,
+                self.retries,
+            )
+            self._work(episode, None)
+        elif not self.tolerate:
+            self._fatal(episode.index, result)
+        else:
+            failure = EpisodeFailure(spec=spec, error=result, attempts=self.retries + 1)
+            self.outcome.failed.append((episode.index, failure))
+            log.warning("episode %s failed for good (%s: %s)", spec.group_id, type(result).__name__, result)
+            del self.live[episode.index]
+
+    def _stopping(self) -> bool:
+        return self.outcome.halt.is_set() or (self.abort is not None and self.abort.is_set())
+
+    def _fatal(self, index: int, error: BaseException) -> None:
+        self.outcome.fatal.append((index, error))
+        self.outcome.halt.set()
+
+    def _generate(self, waiting: Sequence[_Live]) -> None:
+        """One engine call per distinct sampling parameters for the episodes that wait for their
+        turn (in spec order); every episode goes back to its environment with its completion."""
+        calls: dict[tuple[Any, ...], list[_Live]] = {}
+        for episode in waiting:
+            assert episode.request is not None
+            calls.setdefault(params_key(episode.request[1]), []).append(episode)
+        for episodes in calls.values():
+            first = episodes[0]
+            assert first.request is not None
+            try:
+                completions = _ask(
+                    first.spec, [e.request[0] for e in episodes if e.request is not None], first.request[1]
+                )
+            except (EpisodeAborted, GenerationFailed) as e:
+                self._fatal(first.index, e)
+                return
+            for episode, completion in zip(episodes, completions, strict=True):
+                episode.request = None
+                self._work(episode, completion)
+
+
 def run_episodes(
     specs: Sequence[EpisodeSpec],
     *,
@@ -274,13 +533,16 @@ def run_episodes(
     max_context_tokens: int | None = None,
     retries: int = 0,
     failures: list[EpisodeFailure] | None = None,
+    turn_batching: TurnBatching = "lockstep",
 ) -> list[Trajectory]:
     """Run every spec to completion, ``max_parallel`` episodes at a time; order is preserved.
+    ``turn_batching`` decides how their turns reach the engines (module docstring).
 
-    Without ``failures`` the first episode failure is re-raised after the other in-flight episodes
-    finish. With a ``failures`` list, an episode whose environment failed on all ``retries + 1``
-    attempts is appended to it and missing from the result; aborts and engine failures are still
-    raised (module docstring).
+    Without ``failures`` an episode failure ends the call: it is re-raised once the environment
+    work in flight has finished (the failure of the earliest spec, if several failed). With a
+    ``failures`` list, an episode whose environment failed on all ``retries + 1`` attempts is
+    appended to it (in spec order) and missing from the result; aborts and engine failures are
+    still raised (module docstring).
 
     Once ``abort`` is set the episodes raise :class:`EpisodeAborted`: at their next turn boundary,
     or straight out of a ``generate`` call in flight when the spec's engine implements ``cancel()``
@@ -292,41 +554,59 @@ def run_episodes(
     if not specs:
         return []
     workers = max(1, min(int(max_parallel), len(specs)))
-
-    def attempt(spec: EpisodeSpec) -> Trajectory | None:
-        try:
-            return run_episode(
-                spec,
-                env_factory=env_factory,
-                tokenizer=tokenizer,
-                params=params,
-                abort=abort,
-                turn_rendering=turn_rendering,
-                max_context_tokens=max_context_tokens,
-                retries=retries,
-            )
-        except (EpisodeAborted, GenerationFailed):
-            raise
-        except Exception as e:
-            if failures is None:
-                raise
-            failures.append(EpisodeFailure(spec=spec, error=e, attempts=retries + 1))
-            log.warning("episode %s failed for good (%s: %s)", spec.group_id, type(e).__name__, e)
-            return None
-
-    with _cancel_generation_on_abort(specs, abort):
-        if workers == 1:
-            results = [attempt(spec) for spec in specs]
+    lockstep = turn_batching == "lockstep"
+    parts: list[list[tuple[int, EpisodeSpec]]] = [list(enumerate(specs))]
+    environments = _Environments(env_factory)
+    if lockstep:
+        by_engine: dict[int, list[tuple[int, EpisodeSpec]]] = {}
+        for item in parts[0]:
+            by_engine.setdefault(id(item[1].engine), []).append(item)
+        parts = list(by_engine.values())
+        # An episode that waited in ``reset`` for another one to end would hold up the turn that
+        # lets it end. With fewer places than engines every engine runs one episode at a time,
+        # which waits for a place while it holds none.
+        workers = min(workers, environments.limit() or workers)
+    outcome = _Outcome(trajectories=[None] * len(specs))
+    runs = [
+        _Run(
+            part,
+            outcome,
+            capacity=min(max(1, workers // len(parts)), len(part)),
+            lockstep=lockstep,
+            env_factory=environments.make,
+            tokenizer=tokenizer,
+            params=params,
+            abort=abort,
+            turn_rendering=turn_rendering,
+            max_context_tokens=max_context_tokens,
+            retries=retries,
+            tolerate=failures is not None,
+        )
+        for part in parts
+    ]
+    with _cancel_generation_on_abort(specs, abort), environments:
+        if len(runs) == 1:
+            runs[0].run()
         else:
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="monorl-episode") as pool:
-                futures = [pool.submit(attempt, spec) for spec in specs]
-                try:
-                    results = [f.result() for f in futures]
-                except BaseException:
-                    for f in futures:
-                        f.cancel()
-                    raise
-    return [trajectory for trajectory in results if trajectory is not None]
+            threads = [
+                threading.Thread(target=run.run, name=f"monorl-episode-engine-{k}", daemon=True)
+                for k, run in enumerate(runs)
+            ]
+            for thread in threads:
+                thread.start()
+            try:
+                for thread in threads:
+                    thread.join()
+            except BaseException:
+                outcome.halt.set()
+                for thread in threads:
+                    thread.join()
+                raise
+    if outcome.fatal:
+        raise min(outcome.fatal, key=lambda entry: entry[0])[1]
+    if failures is not None:
+        failures.extend(failure for _, failure in sorted(outcome.failed, key=lambda entry: entry[0]))
+    return [trajectory for trajectory in outcome.trajectories if trajectory is not None]
 
 
 @contextlib.contextmanager

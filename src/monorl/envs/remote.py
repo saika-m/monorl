@@ -298,6 +298,11 @@ class HttpTransport:
 class SlotSource(Protocol):
     """Hands a transport to an episode and takes it back when the episode ends."""
 
+    @property
+    def capacity(self) -> int | None:
+        """How many episodes can hold a transport before :meth:`acquire` waits for one to end;
+        ``None`` when it never waits."""
+
     def spec(self) -> EnvSpec: ...
 
     def acquire(self) -> Transport: ...
@@ -329,6 +334,10 @@ class HttpSlotSource:
         if self._parallel_override is not None:
             return max(1, int(self._parallel_override))
         return max(1, self.spec().parallel_episodes)
+
+    @property
+    def capacity(self) -> int:
+        return self.parallel * len(self.transports)
 
     def acquire(self) -> HttpTransport:
         with self._cv:
@@ -400,6 +409,8 @@ class StdioPool:
     @property
     def processes(self) -> list[StdioTransport]:
         return [s.transport for s in self._slots]
+
+    capacity = None  # a full process is joined by a new one
 
     def acquire(self) -> StdioTransport:
         cap = self.parallel
@@ -558,6 +569,11 @@ class RemoteEnv:
         if self._episode is ep:
             self._episode = None
             self._source.release(ep.transport)
+
+    @property
+    def max_concurrent_episodes(self) -> int | None:
+        """Episodes the servers admit at once; a further ``reset`` waits for one of them to end."""
+        return self._source.capacity
 
     def reset(self, sample: Sample) -> list[Message]:
         if self._episode is not None:

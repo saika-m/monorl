@@ -119,10 +119,10 @@ truncated importance weights, ratio masks and score centering ([`OFF_POLICY.md`]
 disaggregated runs. In colocated runs the engine cannot generate while it sleeps, so async only
 helps with `enable_sleep_mode: false` and enough memory for both.
 
-Episodes within a step are always parallel: `group_size × prompts_per_step` episodes run as
-concurrent tasks against the environment pool (remote MEP/1 servers advertise
-`parallel_episodes`), and their `generate` calls are coalesced by the batching engine so the
-inference backend sees large batches even for multi-turn envs.
+Episodes within a step are always parallel: `group_size × prompts_per_step` episodes run
+against the environment pool (remote MEP/1 servers advertise `parallel_episodes`), and their
+turns are generated in batches, so the inference backend sees large batches even for multi-turn
+envs ([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)).
 
 ## Resuming and cancellation
 

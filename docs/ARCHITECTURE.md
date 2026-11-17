@@ -268,11 +268,14 @@ def policy_loss(logprobs: Tensor[B,T], old_logprobs: Tensor[B,T] | None,
 def kl_penalty(logprobs, ref_logprobs, estimator: Literal["k1","k2","k3"]) -> Tensor[B,T]
 
 # monorl.rollout
-class BatchingEngine(RolloutEngine):   # wraps any engine; concurrent generate() calls from episode
-    def __init__(self, engine, *, max_batch_size: int, max_wait_ms: float)   # threads are coalesced into one engine call
+class BatchingEngine(RolloutEngine):
+    # wraps any engine; generate() calls that arrive together are coalesced into one
+    # engine call, and a call is split at max_batch_size
+    def __init__(self, engine, *, max_batch_size: int, max_wait_ms: float)
 
 # monorl.envs
-def make_env(config: RunConfig) -> Environment     # registry.get("env", config.env.type)(config)
+def make_env(config: RunConfig) -> Environment
+#   registry.get("env", config.env.type)(config)
 ```
 
 ### Patching API — `monorl.patching`

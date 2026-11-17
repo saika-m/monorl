@@ -161,6 +161,12 @@ class Environment(Protocol):
 
     Environments are stateful per episode; the orchestrator creates one via the factory per
     episode (or calls ``reset`` again on a reusable instance).
+
+    An environment that admits only so many episodes at a time, so that a further ``reset`` waits
+    for one of them to end, says how many in an attribute ``max_concurrent_episodes``. The episode
+    runner then keeps no more than that open: with ``rollout.turn_batching: lockstep`` an episode
+    that waits in ``reset`` for another one to end would wait for ever, because the others take
+    their next turn only once it is ready.
     """
 
     max_turns: int

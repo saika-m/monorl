@@ -199,6 +199,7 @@ const SCHEMA = {
         enable_sleep_mode: { type: "boolean", default: true, description: "Offload engine memory while training (colocated)." },
         async_steps_ahead: { type: "integer", default: 0, minimum: 0, description: "Generate up to N batches ahead of training (off-policy staleness bound). 0 = synchronous." },
         turn_rendering: { enum: ["tokens", "template"], default: "tokens", description: "How a multi-turn prompt is built. 'tokens': the sampled tokens of earlier turns stay in the context and only new messages are rendered. 'template': the chat template re-renders the whole conversation every turn." },
+        turn_batching: { enum: ["lockstep", "arrival"], default: "lockstep", description: "How the turns of concurrent episodes reach an engine. 'lockstep': once every running episode has its next prompt, all of them are generated in one call, in a fixed order, so a run repeats for a fixed seed; an episode waits for the slowest environment step of its round. 'arrival': an episode asks as soon as its environment has answered and requests are batched as they arrive: faster when environment steps are slow and uneven, not repeatable. Agent harnesses that drive their own episodes always run the second way." },
         device: { description: "Device for the 'hf' backend (cpu/mps/cuda); auto if unset." },
       },
     },

@@ -100,9 +100,10 @@ recorded logprobs (vLLM's lossy rejection samplers, SGLang accept thresholds bel
 with drafting on either) are config errors.
 
 Every engine implements `generate(prompts, params) -> list[list[Completion]]` with exactly
-`params.n` completions per prompt and per-token logprobs; the orchestrator's `BatchingEngine`
-coalesces concurrent episode requests into one engine call. A completion that ends on one of
-`rollout.stop` keeps the stop string in its text on every engine — vLLM and SGLang cut it by
+`params.n` completions per prompt and per-token logprobs; the turns of concurrent episodes
+reach it as batches ([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)). A completion that
+ends on one of `rollout.stop` keeps the stop string in its text on every engine — vLLM and
+SGLang cut it by
 default, so the adapters send `include_stop_str_in_output=True` / `no_stop_trim=True` — which is
 what lets `tool_calling` parse a closing `</tool_call>` and keeps re-rendered chats token-exact.
 
