@@ -84,6 +84,10 @@ The SFT loop has no rollouts, rewards, environments or weight sync. Each step en
 - Second signal: `KeyboardInterrupt` is raised at once. The state is `cancelled`, no checkpoint is
   saved for the interrupted step (from the code, not run here).
 
+`run(..., cancel=event)` takes the event the first signal sets. A pipeline passes its own to every
+train stage, so a signal that arrives in the last step of a stage, which ends `succeeded`, still
+stops the pipeline before the next stage ([PIPELINES.md](PIPELINES.md#resume-and-cancellation)).
+
 A real cancel of an SFT run (`kill -INT` after step 1 was logged, exit code 130):
 
 ```text

@@ -346,6 +346,38 @@ def test_sigterm_during_train_stage_cancels_pipeline(
     assert "received SIGTERM" in (Path(result.stages[1]["run_dir"]) / "run.log").read_text()
 
 
+def test_sigterm_during_the_last_step_of_a_train_stage_stops_the_pipeline_after_it(
+    make_pipeline: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage has nothing left to cancel and ends ``succeeded``; the request to stop is for the
+    pipeline all the same, which must not start the next stage."""
+    stages = [
+        {"type": "train", "name": "first", "overrides": {"trainer": {"max_steps": 2}}},
+        {"type": "train", "name": "second", "overrides": {"trainer": {"max_steps": 2}}},
+        {"type": "eval", "name": "eval"},
+    ]
+    original = fakes.FakeTrainer.train_step
+
+    def train_step(self: Any, batch: Any) -> dict[str, float]:
+        out = original(self, batch)
+        if self.config.run_name == "00-first" and self.step == 2:
+            _sigterm_self()
+        return out
+
+    monkeypatch.setattr(fakes.FakeTrainer, "train_step", train_step)
+    result = run_pipeline(make_pipeline(stages))
+    assert [s["state"] for s in result.stages] == ["succeeded", "pending", "pending"]
+    assert result.state == "cancelled"
+    assert result.stages[0]["step"] == 2 and (Path(result.stages[0]["run_dir"]) / "final").is_dir()
+    assert read_status(result.stages[0]["run_dir"])["state"] == "succeeded"
+    assert "received SIGTERM" in (Path(result.stages[0]["run_dir"]) / "run.log").read_text()
+    assert not Path(result.stages[1]["run_dir"]).exists()
+    assert read_status(result.run_dir)["state"] == "cancelled"
+    assert "cancelled after 1 of 3 stages" in read_status(result.run_dir)["message"]
+    assert read_manifest(result.run_dir)["state"] == "cancelled"
+    assert result.final_model_path is None
+
+
 def test_sigterm_during_rejection_stage_cancels_pipeline(
     make_pipeline: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

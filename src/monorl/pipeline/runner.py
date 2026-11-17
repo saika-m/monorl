@@ -269,7 +269,9 @@ class _StageRunner:
         stage_dir = Path(record.run_dir)
         # Also without a checkpoint: the stage starts over then, and so must its record files.
         resume_stage = self.resume and stage_dir.is_dir()
-        result = run_training(run_config, stage_dir, resume=resume_stage)
+        # The stage handles signals itself while it runs; with the pipeline's event it also tells
+        # the pipeline, which stops before the next stage whatever state this one ends in.
+        result = run_training(run_config, stage_dir, resume=resume_stage, cancel=self.cancel)
         record.step = int(result.final_step)
         record.summary = {k: float(v) for k, v in result.metrics.items() if isinstance(v, (int, float))}
         record.state = result.state

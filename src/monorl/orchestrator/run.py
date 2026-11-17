@@ -42,7 +42,17 @@ def resolve_run_dir(config: RunConfig) -> Path:
     return Path(config.logging.run_root).expanduser() / (config.run_name or default_run_name(config))
 
 
-def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False) -> RunResult:
+def run(
+    config: RunConfig,
+    run_dir: Path | None = None,
+    *,
+    resume: bool = False,
+    cancel: threading.Event | None = None,
+) -> RunResult:
+    """Run ``config`` in ``run_dir``. ``cancel`` is the event that the first SIGINT or SIGTERM sets
+    while the run is in progress. A caller with more to do after this run (the pipeline, between
+    its stages) passes its own: the result alone does not tell it that it was asked to stop, since
+    a run that was in its last step when the signal came ends ``succeeded``."""
     if config.run_name is None:
         config = config.model_copy(update={"run_name": default_run_name(config)})
     target = Path(run_dir).expanduser() if run_dir is not None else resolve_run_dir(config)
@@ -55,7 +65,8 @@ def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False)
         for name in (METRICS_FILE, TRAJECTORIES_FILE):
             if drop_rows(reporter.run_dir / name, lambda row: False):
                 reporter.log(f"removed the unfinished last line an earlier run left in {name}")
-    cancel = threading.Event()
+    if cancel is None:
+        cancel = threading.Event()
     backend = config.trainer.backend
     kind = "pipeline" if config.is_pipeline_backend else "sft" if config.is_sft else "component"
     with signal_guard(cancel, reporter, "finishing the current step, then stopping"):
