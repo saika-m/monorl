@@ -170,7 +170,8 @@ def test_rows_end_at_their_cap_or_before_it(engine: HFRolloutEngine, greedy: boo
     with _forward_rows(engine.model) as rows:
         out = ending.generate(prompts, params, max_new_tokens=caps)
     completions = [c for group in out for c in group]
-    assert rows == _needed_rows(completions)
+    # the twelve sampled rows share two prompts, which a pass of their own computes first
+    assert rows == ([] if greedy else [2]) + _needed_rows(completions)
     reasons = set()
     for cap, group in zip(caps, out, strict=True):
         for c in group:
@@ -281,7 +282,8 @@ def test_tokens_keep_their_distribution_when_rows_leave_the_batch(engine: HFRoll
     params = SamplingParams(n=n, max_new_tokens=3, temperature=temperature, top_k=2, seed=12)
     with _forward_rows(model) as rows:
         out = _ending(engine, [eos]).generate([short, other], params)
-    assert rows[0] == 2 * n and rows[1] < rows[0]  # the rows that ended are not in the second pass
+    # after the pass over the two prompts their rows share: the rows that ended are not in the next
+    assert rows[:2] == [2, 2 * n] and rows[2] < rows[1]
     counts = Counter(tuple(c.token_ids) for c in out[0])
     assert set(counts) <= set(expected)
     chi2 = sum((counts[outcome] - n * p) ** 2 / (n * p) for outcome, p in expected.items())
