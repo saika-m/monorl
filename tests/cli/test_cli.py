@@ -373,6 +373,16 @@ def test_train_names_the_file_and_the_key_of_an_invalid_config(
     ]
 
 
+def test_train_given_a_recipe_name_says_where_the_recipe_is(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["train", "--config", "grpo_gsm8k_smollm_cpu"], env={"COLUMNS": "1000"})
+    assert result.exit_code == 1
+    path = recipes_dir() / "grpo_gsm8k_smollm_cpu.yaml"
+    assert "config file not found: grpo_gsm8k_smollm_cpu" in result.output
+    assert f"--config {path}" in result.output
+    result = runner.invoke(app, ["train", "--config", "no_such_recipe"], env={"COLUMNS": "1000"})
+    assert result.output.strip() == "error: config file not found: no_such_recipe"
+
+
 def test_train_reports_the_error_of_a_failed_run_without_repeating_its_traceback(
     runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
 ) -> None:

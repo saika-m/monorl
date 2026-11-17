@@ -56,6 +56,18 @@ def _fail(message: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
+def _recipe_hint(config: Path) -> str:
+    """For a ``--config`` that is no file but names a bundled recipe: where that recipe is."""
+    from monorl.config.recipes import get_recipe
+
+    if config.exists():
+        return ""
+    try:
+        return f" (the recipe of that name is passed by its path: --config {get_recipe(str(config)).path})"
+    except ConfigError:
+        return ""
+
+
 def _print_run_error(error: str, run_dir: str) -> None:
     """The error of a run that did not succeed, once. A failed run reports its message followed by
     the traceback, which the run log has printed already and keeps in ``run.log``."""
@@ -102,7 +114,7 @@ def train(
     try:
         data = apply_overrides(load_yaml(config), set_)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(str(e) + _recipe_hint(config))
         return
     if is_pipeline_payload(data):
         _run_pipeline(config, data, run_dir, resume)
@@ -156,7 +168,7 @@ def pipeline(
     try:
         data = apply_overrides(load_yaml(config), set_)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(str(e) + _recipe_hint(config))
         return
     if not is_pipeline_payload(data):
         _fail(f"{config} is not a pipeline config (needs top-level `base:` and `stages:`)")
