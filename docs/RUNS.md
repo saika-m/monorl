@@ -25,7 +25,10 @@ The component loop runs steps `1..trainer.max_steps`. Each step:
    environment rewards, minus `algorithm.overlong_penalty` when the last completion hit the limit.
 4. Train step: advantages and the token batch are built, then `trainer.train_step` runs
    `algorithm.num_epochs` times on that batch ([ALGORITHMS.md](ALGORITHMS.md)).
-5. Weight sync: the trainer's weights are pushed to every rollout engine.
+5. Weight sync: the trainer's weights are pushed to every rollout engine. After its first sync an
+   engine that takes partial updates (the `hf` engine) is sent only the tensors that changed; the
+   `checkpoint` strategy and the vLLM and SGLang engines get all of them every time
+   ([DISTRIBUTED.md](DISTRIBUTED.md)).
 6. Checkpoint: when `step % trainer.save_every == 0` (default 50).
 7. Report: when `step % logging.log_every == 0` (default 1) or on the last step, one `train` row
    goes to `metrics.jsonl` and up to `logging.trajectories_per_step` episodes go to

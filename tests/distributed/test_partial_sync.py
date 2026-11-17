@@ -139,65 +139,103 @@ def test_mtp_weights_are_sent_all_together_or_not_at_all():
 # -- the reference trainer and the hf engine ---------------------------------------------------
 
 
-@pytest.mark.parametrize("lora", [True, False], ids=["lora", "full"])
-def test_hf_engines_hold_the_trainers_weights_after_every_sync(tiny_model_dir: Path, tmp_path: Path, lora):
+def _hf_engine(tiny_model_dir: Path, device: str = "cpu"):
+    """An engine whose weights are not the trainer's, so that a tensor it is not sent shows."""
+    from monorl.rollout.hf_engine import HFRolloutEngine
+    from tests.trainer.conftest import make_config
+
+    config = make_config(tiny_model_dir)
+    config.rollout.device = device
+    engine = HFRolloutEngine(config)
+    with torch.no_grad():
+        for parameter in engine.model.parameters():
+            parameter.add_(1.0)
+    return engine
+
+
+def _train_batch(tiny_model_dir: Path):
     from transformers import AutoTokenizer
 
-    from monorl.rollout.hf_engine import HFRolloutEngine
-    from monorl.trainer.reference import ReferenceTrainer
     from tests.trainer.conftest import make_batch as make_train_batch
+
+    return make_train_batch(AutoTokenizer.from_pretrained(tiny_model_dir))
+
+
+def _assert_hf_engines_hold(engines, trainer) -> None:
+    exported = dict(trainer.export_weights())
+    for engine in engines:
+        state = engine.model.state_dict()
+        assert set(state) == set(exported)
+        for name, tensor in exported.items():
+            assert torch.equal(state[name].cpu(), tensor), name
+
+
+@pytest.mark.parametrize("lora", [True, False], ids=["lora", "full"])
+def test_hf_engines_hold_the_trainers_weights_after_every_sync(tiny_model_dir: Path, tmp_path: Path, lora):
+    from monorl.trainer.reference import ReferenceTrainer
     from tests.trainer.conftest import make_config, reinforce_loss
 
-    class Engine(HFRolloutEngine):
-        accepts_partial_weights = True
-
-        def update_weights(self, weights):
-            self.received = []
-            super().update_weights((name, self.received.append(name) or tensor) for name, tensor in weights)
-
-    def build() -> Engine:
-        """An engine whose weights are not the trainer's, so that a tensor it is not sent shows."""
-        engine = Engine(make_config(tiny_model_dir))
-        with torch.no_grad():
-            for parameter in engine.model.parameters():
-                parameter.add_(1.0)
-        return engine
-
-    def synced(engines: list[Engine]) -> dict[str, float]:
+    def synced(engines) -> float:
         metrics = sync.sync(trainer, engines)
-        exported = dict(trainer.export_weights())
-        for engine in engines:
-            state = engine.model.state_dict()
-            assert set(state) == set(exported)
-            for name, tensor in exported.items():
-                assert torch.equal(state[name], tensor), name
-        return metrics
+        _assert_hf_engines_hold(engines, trainer)
+        return metrics["weight_sync/bytes"]
 
-    batch = make_train_batch(AutoTokenizer.from_pretrained(tiny_model_dir))
+    batch = _train_batch(tiny_model_dir)
     trainer = ReferenceTrainer(make_config(tiny_model_dir, lora=lora), loss_fn=reinforce_loss)
     sync = InProcessWeightSync()
-    engines = [build(), build()]
+    engines = [_hf_engine(tiny_model_dir), _hf_engine(tiny_model_dir)]
     try:
-        names = [name for name, _ in trainer.export_weights()]
-        first = synced(engines)
-        assert engines[0].received == names
+        everything = sum(t.numel() * t.element_size() for _, t in trainer.export_weights())
+        assert synced(engines) == 2 * everything
         for _ in range(3):
             trainer.train_step(batch)
-            later = synced(engines)
+            sent = synced(engines)
             if lora:  # the embedding is most of the model and no adapter touches it
-                assert "model.embed_tokens.weight" not in engines[0].received
-                assert 0 < later["weight_sync/bytes"] < first["weight_sync/bytes"] / 10
+                assert 0 < sent < 2 * everything / 10
             else:
-                assert engines[0].received == names
+                assert sent == 2 * everything
         if lora:
             trainer.save_checkpoint(tmp_path / "ckpt")
             trainer.train_step(batch)
             synced(engines)
             trainer.load_checkpoint(tmp_path / "ckpt")
             synced(engines)
-        engines.append(build())
-        synced(engines)
-        assert engines[-1].received == names
+        before = synced(engines)
+        engines.append(_hf_engine(tiny_model_dir))
+        assert synced(engines) == before + everything
     finally:
         for engine in engines:
             engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",  # where sleeping releases nothing
+        pytest.param(
+            "cuda",
+            marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")],
+        ),
+    ],
+)
+def test_hf_engine_that_slept_holds_the_trainers_weights(tiny_model_dir: Path, device):
+    """Partial pushes count on the engine keeping its weights while it sleeps, and reach it asleep."""
+    from monorl.trainer.reference import ReferenceTrainer
+    from tests.trainer.conftest import make_config, reinforce_loss
+
+    batch = _train_batch(tiny_model_dir)
+    trainer = ReferenceTrainer(make_config(tiny_model_dir, lora=True), loss_fn=reinforce_loss)
+    sync = InProcessWeightSync()
+    engine = _hf_engine(tiny_model_dir, device)
+    try:
+        everything = sync.sync(trainer, [engine])["weight_sync/bytes"]
+        for sync_asleep in (True, False):
+            engine.sleep()
+            trainer.train_step(batch)
+            if not sync_asleep:
+                engine.wake_up()
+            assert sync.sync(trainer, [engine])["weight_sync/bytes"] < everything / 10
+            engine.wake_up()
+            _assert_hf_engines_hold([engine], trainer)
+    finally:
+        engine.shutdown()

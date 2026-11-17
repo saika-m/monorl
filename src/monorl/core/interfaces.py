@@ -77,6 +77,13 @@ class RolloutEngine(Protocol):
     Optional capability (duck-typed): ``speculation_stats() -> SpeculationStats | None`` returns
     what speculative decoding did since the previous call (reading restarts the counters), or
     ``None`` when the engine does not draft (``model.mtp.rollout``, ``docs/MTP.md``).
+
+    Optional capability (duck-typed): ``accepts_partial_weights = True`` lets weight sync leave out
+    of ``update_weights`` the tensors the engine was sent before and that did not change since. The
+    engine promises that ``update_weights`` replaces the tensors it is given and keeps every other
+    one, and that it still has its weights at the next update: an engine that drops them while it
+    sleeps, or whose server may be restarted behind it, must not set it. Without the attribute
+    every update carries all weights.
     """
 
     def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]: ...
@@ -108,7 +115,16 @@ class RolloutEngine(Protocol):
 
 @runtime_checkable
 class Trainer(Protocol):
-    """Owns the policy parameters and optimizer. Loss functions come from :mod:`monorl.algorithms`."""
+    """Owns the policy parameters and optimizer. Loss functions come from :mod:`monorl.algorithms`.
+
+    Optional capability (duck-typed, not a protocol member): ``trainable_params``, the tensors the
+    optimizer writes. With it weight sync sends an engine that takes partial updates
+    (``RolloutEngine.accepts_partial_weights``) only what changed. The trainer promises that the
+    list is complete, that an exported tensor it did not train and did not change is yielded on
+    the same storage every time, and that any other write to such a tensor is an in-place operation
+    of torch, which advances the tensor's version counter (``tensor.data`` and numpy views do not).
+    Without the attribute every sync carries all weights.
+    """
 
     @property
     def step(self) -> int: ...

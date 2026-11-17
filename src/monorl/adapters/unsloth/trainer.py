@@ -321,6 +321,11 @@ class UnslothTrainer:
         pin_logits_env()
         return self.inner.compute_values(batch)
 
+    @property
+    def trainable_params(self) -> list[nn.Parameter]:
+        """What the inner trainer's optimizer writes (:class:`~monorl.core.interfaces.Trainer`)."""
+        return self.inner.trainable_params
+
     def export_weights(self) -> Iterator[tuple[str, torch.Tensor]]:
         return iter_merged_weights(self.hf_model)
 

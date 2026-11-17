@@ -100,6 +100,7 @@ class StateEngine(FakeEngine):
 def register(registry: Any) -> None:
     registry.register("rollout_engine", "state", lambda config, **kw: StateEngine(**kw))
     registry.register("trainer", "state", lambda config, **kw: StateTrainer(**kw))
+    registry.register("rollout_engine", "probed_hf", probed_hf_engine)
 
 
 def _held(engine: RolloutEngine) -> dict[str, list[Any]]:
@@ -201,7 +202,7 @@ def test_object_store_sync_delivers_every_tensor_exactly(ray_session, make_confi
         assert metrics["weight_sync/chunks"] == 7
 
         # The same objects again, after the engine wrote to the MTP tensors it was given.
-        refs, _ = trainer.export_weight_refs(64)
+        refs, _ = ray.get(trainer.actors[0].export_weight_chunks.remote(64))
         for _ in range(2):
             engine.pull_weights_async(refs).result()
             assert _held(engine) == sent
@@ -212,6 +213,120 @@ def test_object_store_sync_delivers_every_tensor_exactly(ray_session, make_confi
         exported["i64.ids"].add_(1)
         exported["f32.large"].zero_()
         assert fingerprint(dict(trainer.export_weights())) == sent
+    finally:
+        rt.close()
+
+
+@pytest.mark.parametrize("strategy", ["inprocess", "broadcast"])
+def test_ray_sync_sends_what_changed_and_everything_when_an_actor_may_not_hold_it(
+    ray_session, make_config, tmp_path: Path, strategy
+):
+    """The trainer trains one of its two tensors. An engine actor is sent that one only, as long
+    as it holds the rest: not at first, not after a sync or another update of it failed, not after
+    its engine was built anew."""
+    fail_flag = tmp_path / "fail"
+    cfg = make_config(
+        rollout={"backend": "flaky", "extra": {"fail_flag": str(fail_flag)}},
+        trainer={"backend": "adapter"},
+        cluster={
+            "mode": "ray",
+            "placement": "disaggregated",
+            "weight_sync": strategy,
+            "extra": {"providers": ["distributed_fakes"]},
+        },
+    )
+    rt = build_runtime(cfg)
+    try:
+        engine, trainer = rt.engines[0], rt.trainer
+
+        def synced() -> float:
+            sent = rt.weight_sync.sync(trainer, rt.engines)["weight_sync/bytes"]
+            assert _tag(engine) == _trainer_tag(trainer)
+            return sent
+
+        everything = synced()
+        trainer.train_step(_batch())
+        trained = synced()
+        assert trained < everything
+        if strategy == "inprocess":  # the object store counts the tensors' bytes and nothing else
+            assert (everything, trained) == (4 * (8 * 4 + 4 * 4), 4 * 4 * 4)
+
+        trainer.train_step(_batch())
+        fail_flag.touch()
+        with pytest.raises(ray.exceptions.RayTaskError, match="broke down"):
+            rt.weight_sync.sync(trainer, rt.engines)
+        fail_flag.unlink()
+        assert synced() == everything
+        trainer.train_step(_batch())
+        assert synced() == trained
+
+        fail_flag.touch()
+        with pytest.raises(ray.exceptions.RayTaskError, match="broke down"):
+            engine.update_weights(make_weights(3).items())  # weights that are no push of the trainer's
+        fail_flag.unlink()
+        assert synced() == everything
+
+        ray.get(engine.actors[0].build.remote({}))  # a new engine in the actor, with weights of its own
+        assert _tag(engine) != _trainer_tag(trainer)
+        assert synced() == everything
+    finally:
+        rt.close()
+
+
+def probed_hf_engine(config: Any, *, replica: int = 0, **_: Any) -> RolloutEngine:
+    """The ``hf`` engine with other weights than the checkpoint's and a ``generate`` that tells
+    what its model holds, which is all a test sees of an engine inside an actor."""
+    from monorl.rollout.hf_engine import HFRolloutEngine
+
+    class Probed(HFRolloutEngine):
+        def generate(self, prompts: Any, params: Any) -> list[list[Completion]]:
+            held = fingerprint(dict(self.model.state_dict()))
+            return [[Completion(text=json.dumps(held), token_ids=[])] for _ in prompts]
+
+    engine = Probed(config, replica=replica)
+    with torch.no_grad():
+        for parameter in engine.model.parameters():
+            parameter.add_(1.0)
+    return engine
+
+
+def test_object_store_sync_of_lora_training_into_hf_engine(ray_session, make_config, tiny_model_dir: Path):
+    """The reference trainer and the ``hf`` engine in actors: after every sync the engine holds
+    exactly what the trainer exports, though only the first sync carries the frozen tensors."""
+    from transformers import AutoTokenizer
+
+    from tests.trainer.conftest import make_batch as make_train_batch
+
+    cfg = make_config(
+        model={"lora": {"enabled": True, "r": 4, "alpha": 8, "dropout": 0.0}},
+        rollout={"backend": "probed_hf", "device": "cpu"},
+        trainer={
+            "backend": "reference",
+            "device": "cpu",
+            "precision": "fp32",
+            "micro_batch_size": 2,
+            "learning_rate": 1e-2,
+            "max_steps": 10,
+            "max_seq_len": 64,
+        },
+        cluster={"mode": "ray", "extra": {"providers": ["test_ray_runtime"]}},
+    )
+    batch = make_train_batch(AutoTokenizer.from_pretrained(tiny_model_dir))
+    rt = build_runtime(cfg)
+    try:
+        engine, trainer = rt.engines[0], rt.trainer
+
+        def synced() -> float:
+            sent = rt.weight_sync.sync(trainer, rt.engines)["weight_sync/bytes"]
+            exported = fingerprint(dict(trainer.export_weights()))
+            assert _held(engine) == exported
+            return sent
+
+        assert _held(engine) != fingerprint(dict(trainer.export_weights()))
+        everything = synced()
+        for _ in range(3):
+            trainer.train_step(batch)
+            assert 0 < synced() < everything / 10
     finally:
         rt.close()
 

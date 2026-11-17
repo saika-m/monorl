@@ -133,13 +133,18 @@ class PatchingEngine(FakeEngine):
 
 
 class FlakyEngine(PatchingEngine):
-    """While ``failing``, an update takes its stream, fails, and leaves the engine with weights
-    of its own, like an engine that broke down and came back."""
+    """While ``failing`` is set or the file ``fail_flag`` exists (the switch for an engine in
+    another process), an update takes its stream, fails, and leaves the engine with weights of its
+    own, like an engine that broke down and came back."""
 
     failing = False
 
+    def __init__(self, seed: int = 0, *, fail_flag: str | None = None, **kw: Any) -> None:
+        super().__init__(seed, **kw)
+        self.fail_flag = fail_flag
+
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        if not self.failing:
+        if not self.failing and not (self.fail_flag and Path(self.fail_flag).exists()):
             return super().update_weights(weights)
         self.received = [name for name, _ in weights]
         for tensor in self.weights.values():
@@ -152,8 +157,10 @@ class AdapterTrainer(FakeTrainer):
     trainer it lists what its optimizer writes in ``trainable_params``, and like torch's fused
     optimizers it writes without advancing the tensors' version counters."""
 
-    def __init__(self, seed: int = 1, *, trained: Sequence[str] = ("model.layers.0.proj.weight",)) -> None:
-        super().__init__(seed)
+    def __init__(
+        self, seed: int = 1, *, trained: Sequence[str] = ("model.layers.0.proj.weight",), **kw: Any
+    ) -> None:
+        super().__init__(seed, **kw)
         self.trained = tuple(trained)
 
     @property
@@ -182,6 +189,12 @@ def make_batch() -> TrainBatch:
 def register(registry: Any) -> None:
     registry.register("rollout_engine", "fake", lambda config, **kw: FakeEngine(0, **kw))
     registry.register("trainer", "fake", lambda config, **kw: FakeTrainer(1, **kw))
+    registry.register(
+        "rollout_engine",
+        "flaky",
+        lambda config, **kw: FlakyEngine(0, fail_flag=config.rollout.extra.get("fail_flag"), **kw),
+    )
+    registry.register("trainer", "adapter", lambda config, **kw: AdapterTrainer(1, **kw))
 
 
 # -- helpers for multi-process weight-sync tests (importable by spawn) ------------------------

@@ -346,6 +346,10 @@ class HFRolloutEngine:
     mtp_layers: MtpLayers | None = None
     """The model's MTP layers when the engine drafts with them (``model.mtp.rollout``)."""
 
+    accepts_partial_weights = True
+    """``update_weights`` copies into the tensors it is given and leaves the others, and the model
+    keeps its weights while the engine sleeps: weight sync may leave out what did not change."""
+
     def __init__(self, config: RunConfig, *, replica: int = 0) -> None:
         self.config = config
         self.replica = replica

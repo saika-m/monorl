@@ -95,9 +95,9 @@ After every optimizer step the trainer's weights have to reach every engine repl
 
 | strategy | mechanism | use |
 |---|---|---|
-| `inprocess` | `trainer.export_weights()` streams `(name, tensor)` straight into `engine.update_weights()` | `mode: local`, same process (CPU/MPS/1 GPU) |
-| `cuda_ipc` | tensors stay on the GPU; handles are shared via CUDA IPC with the colocated engine process (vLLM worker extension / SGLang `update_weights_from_tensor`) | colocated multi-process on one node — fastest |
-| `broadcast` | a NCCL (CUDA) / Gloo (CPU) process group spanning trainer and engine ranks; the trainer rank 0 broadcasts each tensor, engines load it in place | disaggregated, multi-node |
+| `inprocess` | `trainer.export_weights()` streams `(name, tensor)` straight into `engine.update_weights()`. After its first sync an engine that takes partial updates (`hf`) is sent only the tensors that changed: with LoRA the merged weights of the adapted modules, not the frozen rest. A sync that failed is followed by a complete one | `mode: local`, same process (CPU/MPS/1 GPU) |
+| `cuda_ipc` | tensors stay on the GPU; handles are shared via CUDA IPC with the colocated engine process (vLLM worker extension / SGLang `update_weights_from_tensor`). Unchanged tensors are left out as with `inprocess`; vLLM and SGLang engines do not take partial updates and get every tensor | colocated multi-process on one node; fastest |
+| `broadcast` | a NCCL (CUDA) / Gloo (CPU) process group spanning trainer and engine ranks; the trainer rank 0 broadcasts each tensor, engines load it in place. Unchanged tensors are left out when every engine takes partial updates | disaggregated, multi-node |
 | `checkpoint` | trainer saves an HF checkpoint to shared storage, engines reload from it | simplest, slowest; any topology, survives engine restarts |
 | `auto` | `inprocess` for local; `cuda_ipc` for colocated Ray; `broadcast` for disaggregated | default |
 

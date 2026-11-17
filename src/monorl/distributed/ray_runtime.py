@@ -34,6 +34,15 @@ Weight sync (``plan.weight_sync``)
 * ``checkpoint`` → :class:`~monorl.distributed.weight_sync.CheckpointWeightSync` via the registry
   (needs a filesystem shared by all actors; set ``cluster.extra.sync_dir``).
 
+The first three leave out the tensors that the engine actors hold
+(:class:`~monorl.distributed.weight_sync.SentWeights`). What the engines were sent is known where
+the tensors are, in the rank-0 trainer actor (:meth:`TrainerActor._push`); whether an engine still
+has it is known in its actor (:meth:`RolloutEngineActor.held_weights`). Every push has an id: the
+strategy asks the engine actors which push they hold and the trainer actor sends the changes since
+then only if that is its last one, and everything otherwise. So the first sync, the sync after one
+that failed anywhere, and the sync after an engine was built anew or given weights in another way
+carry every tensor.
+
 ``Runtime.close()`` shuts engines down, kills all actors and removes the placement group.
 """
 
@@ -45,8 +54,10 @@ import os
 import socket
 import sys
 import time
+import uuid
 import warnings
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -65,6 +76,8 @@ from monorl.distributed.weight_sync import (
     BroadcastWeightSync,
     CudaIpcWeightSync,
     IpcHandle,
+    SentWeights,
+    accepts_partial_weights,
     open_ipc_handles,
 )
 from monorl.mtp import is_wire_name
@@ -127,6 +140,26 @@ def _store_chunk(chunk: list[tuple[str, torch.Tensor]]) -> Any:
     )
 
 
+def _store_in_chunks(weights: Iterable[tuple[str, torch.Tensor]], chunk_bytes: int) -> tuple[list[Any], int]:
+    """:func:`_store_chunk` ``weights`` in chunks of ``chunk_bytes``; returns ``(refs, total_bytes)``."""
+    refs: list[Any] = []
+    chunk: list[tuple[str, torch.Tensor]] = []
+    pending = 0
+    total = 0
+    for name, tensor in weights:
+        t = tensor.detach().cpu().contiguous().resolve_conj().resolve_neg()
+        size = t.numel() * t.element_size()
+        if chunk and pending + size > chunk_bytes:
+            refs.append(_store_chunk(chunk))
+            chunk, pending = [], 0
+        chunk.append((name, t))
+        pending += size
+        total += size
+    if chunk:
+        refs.append(_store_chunk(chunk))
+    return refs, total
+
+
 def _stored_weights(ref: Any, *, private: bool) -> Iterator[tuple[str, torch.Tensor]]:
     """The tensors of one :func:`_store_chunk` object.
 
@@ -168,6 +201,8 @@ class RolloutEngineActor:
         self._sys_path = list(sys_path)
         self.engine: RolloutEngine | None = None
         self._broadcast: BroadcastWeightSync | None = None
+        self._held: str | None = None
+        """The push of the trainer actor whose weights the engine holds (:meth:`_update`)."""
 
     # lifecycle
     def node_ip(self) -> str:
@@ -180,6 +215,7 @@ class RolloutEngineActor:
         _prepare_process(self._sys_path, self._providers, env)
         config = RunConfig.from_dict(self._config_dict)
         factory = registry.get("rollout_engine", config.rollout.backend)
+        self._held = None
         self.engine = factory(config, replica=self.replica, tp_rank=self.tp_rank, tp_size=self.tp_size)
 
     def _engine(self) -> RolloutEngine:
@@ -192,10 +228,12 @@ class RolloutEngineActor:
         return self._engine().generate(prompts, params)
 
     def update_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
-        self._engine().update_weights(weights)
+        with self._update(None) as engine:
+            engine.update_weights(weights)
 
     def load_weights_from_path(self, path: str) -> None:
-        self._engine().load_weights_from_path(path)
+        with self._update(None) as engine:
+            engine.load_weights_from_path(path)
 
     def sleep(self) -> None:
         self._engine().sleep()
@@ -217,7 +255,22 @@ class RolloutEngineActor:
         return read() if callable(read) else None
 
     # weight sync entry points
-    def pull_weights(self, refs: list[Any]) -> int:
+    @contextmanager
+    def _update(self, push: str | None) -> Iterator[RolloutEngine]:
+        """An update of the engine's weights. When it ends the engine holds the trainer actor's
+        ``push``; when it fails, or brings other weights than a push (``None``), the engine holds
+        nothing that a later push could build on."""
+        self._held = None
+        yield self._engine()
+        self._held = push
+
+    def held_weights(self) -> str | None:
+        """The trainer actor's push that the engine holds, for an engine that may be sent only what
+        changed since (:func:`~monorl.distributed.weight_sync.accepts_partial_weights`); ``None``
+        when it has to be sent everything."""
+        return self._held if accepts_partial_weights(self._engine()) else None
+
+    def pull_weights(self, refs: list[Any], push: str | None = None) -> int:
         counted = [0]
 
         def stream() -> Iterator[tuple[str, torch.Tensor]]:
@@ -226,21 +279,25 @@ class RolloutEngineActor:
                     counted[0] += tensor.numel() * tensor.element_size()
                     yield name, tensor
 
-        self._engine().update_weights(stream())
+        with self._update(push) as engine:
+            engine.update_weights(stream())
         return counted[0]
 
-    def receive_broadcast(self, spec: BroadcastGroupSpec, rank: int) -> dict[str, float]:
-        engine = self._engine()
-        own = getattr(engine, "receive_broadcast", None)
-        if callable(own):  # tensor-parallel adapters coordinate their own workers
-            return own(spec, rank)
-        if self._broadcast is None:
-            self._broadcast = BroadcastWeightSync(spec, rank=rank)
-        return self._broadcast.receive(engine)
+    def receive_broadcast(
+        self, spec: BroadcastGroupSpec, rank: int, push: str | None = None
+    ) -> dict[str, float]:
+        with self._update(push) as engine:
+            own = getattr(engine, "receive_broadcast", None)
+            if callable(own):  # tensor-parallel adapters coordinate their own workers
+                return own(spec, rank)
+            if self._broadcast is None:
+                self._broadcast = BroadcastWeightSync(spec, rank=rank)
+            return self._broadcast.receive(engine)
 
-    def update_weights_from_ipc(self, handles: Sequence[IpcHandle]) -> None:
-        self._engine().update_weights(open_ipc_handles(handles))
-        torch.cuda.synchronize()
+    def update_weights_from_ipc(self, handles: Sequence[IpcHandle], push: str | None = None) -> None:
+        with self._update(push) as engine:
+            engine.update_weights(open_ipc_handles(handles))
+            torch.cuda.synchronize()
 
 
 class TrainerActor:
@@ -262,6 +319,9 @@ class TrainerActor:
         self._broadcast: BroadcastWeightSync | None = None
         self._ipc: CudaIpcWeightSync | None = None
         self._ipc_keepalive: list[torch.Tensor] = []
+        self._sent = SentWeights()
+        self._pushed: str | None = None
+        """The push that ``_sent`` describes: what an engine actor has to hold to be sent less."""
 
     def node_ip(self) -> str:
         return _node_ip()
@@ -310,37 +370,43 @@ class TrainerActor:
 
     # weight export paths
     def export_weight_chunks(self, chunk_bytes: int) -> tuple[list[Any], int]:
-        """Put the exported weights into the object store in chunks (:func:`_store_chunk`);
-        returns ``(refs, total_bytes)``."""
-        refs: list[Any] = []
-        chunk: list[tuple[str, torch.Tensor]] = []
-        pending = 0
-        total = 0
-        for name, tensor in self._trainer().export_weights():
-            t = tensor.detach().cpu().contiguous().resolve_conj().resolve_neg()
-            size = t.numel() * t.element_size()
-            if chunk and pending + size > chunk_bytes:
-                refs.append(_store_chunk(chunk))
-                chunk, pending = [], 0
-            chunk.append((name, t))
-            pending += size
-            total += size
-        if chunk:
-            refs.append(_store_chunk(chunk))
-        return refs, total
+        """Put all of the exported weights into the object store (:func:`_store_in_chunks`), for a
+        reader that is not an engine in weight sync; returns ``(refs, total_bytes)``."""
+        return _store_in_chunks(self._trainer().export_weights(), chunk_bytes)
 
     def export_weights_list(self) -> list[tuple[str, torch.Tensor]]:
         return [(n, t.detach().cpu()) for n, t in self._trainer().export_weights()]
 
-    def broadcast_weights(self, spec: BroadcastGroupSpec) -> dict[str, float]:
+    @contextmanager
+    def _push(self, held: str | None, push: str) -> Iterator[Iterator[tuple[str, torch.Tensor]]]:
+        """The weights of push ``push`` to engine actors that all hold push ``held`` (``None``:
+        one of them may hold anything): the tensors that changed since ``held`` when that is this
+        actor's last push, every tensor otherwise. ``push`` is the last one once the block ends;
+        after a block that failed there is none."""
+        if held is None or held != self._pushed:
+            self._sent.forget()
+        self._pushed = None
+        with self._sent.push(self._trainer()) as stream:
+            yield stream
+        self._pushed = push
+
+    def push_weight_chunks(self, chunk_bytes: int, held: str | None, push: str) -> tuple[list[Any], int]:
+        """:meth:`_push` into the object store (:func:`_store_in_chunks`); returns
+        ``(refs, total_bytes)``."""
+        with self._push(held, push) as stream:
+            return _store_in_chunks(stream, chunk_bytes)
+
+    def broadcast_weights(self, spec: BroadcastGroupSpec, held: str | None, push: str) -> dict[str, float]:
         if self._broadcast is None:
             self._broadcast = BroadcastWeightSync(spec, rank=0)
-        return self._broadcast.send(self._trainer().export_weights())
+        with self._push(held, push) as stream:
+            return self._broadcast.send(stream)
 
-    def export_ipc_handles(self) -> tuple[list[IpcHandle], int]:
+    def export_ipc_handles(self, held: str | None, push: str) -> tuple[list[IpcHandle], int]:
         if self._ipc is None:
             self._ipc = CudaIpcWeightSync()
-        handles, keepalive = self._ipc.export_handles(self._trainer().export_weights())
+        with self._push(held, push) as stream:
+            handles, keepalive = self._ipc.export_handles(stream)
         self._ipc_keepalive = keepalive
         return handles, sum(t.numel() * t.element_size() for t in keepalive)
 
@@ -426,15 +492,22 @@ class RayRolloutEngine:
 
         return ray.get(self.actors[0].speculation_stats.remote())
 
-    # sync hooks (non-blocking; return handles)
-    def pull_weights_async(self, refs: list[Any]) -> _RayHandle:
-        return _RayHandle(self._all("pull_weights", refs))
+    # sync hooks (non-blocking; return handles). ``push`` names the trainer actor's push that the
+    # weights are (:meth:`TrainerActor._push`); without it the actors hold no push afterwards.
+    def pull_weights_async(self, refs: list[Any], push: str | None = None) -> _RayHandle:
+        return _RayHandle(self._all("pull_weights", refs, push))
 
-    def begin_receive_broadcast(self, spec: BroadcastGroupSpec, rank: int) -> _RayHandle:
-        return _RayHandle([a.receive_broadcast.remote(spec, rank + r) for r, a in enumerate(self.actors)])
+    def begin_receive_broadcast(
+        self, spec: BroadcastGroupSpec, rank: int, push: str | None = None
+    ) -> _RayHandle:
+        return _RayHandle(
+            [a.receive_broadcast.remote(spec, rank + r, push) for r, a in enumerate(self.actors)]
+        )
 
-    def update_weights_from_ipc_async(self, handles: Sequence[IpcHandle]) -> _RayHandle:
-        return _RayHandle(self._all("update_weights_from_ipc", list(handles)))
+    def update_weights_from_ipc_async(
+        self, handles: Sequence[IpcHandle], push: str | None = None
+    ) -> _RayHandle:
+        return _RayHandle(self._all("update_weights_from_ipc", list(handles), push))
 
     def update_weights_from_ipc(self, handles: Sequence[IpcHandle]) -> None:
         self.update_weights_from_ipc_async(handles).result()
@@ -515,11 +588,11 @@ class RayTrainer:
 
         ray.get([a.save_pretrained.remote(str(path)) for a in self.actors])
 
-    # sync hooks (rank 0)
-    def export_weight_refs(self, chunk_bytes: int) -> tuple[list[Any], int]:
+    # sync hooks (rank 0); ``held`` and ``push`` as in :meth:`TrainerActor._push`
+    def push_weight_refs(self, chunk_bytes: int, held: str | None, push: str) -> tuple[list[Any], int]:
         import ray
 
-        return ray.get(self.actors[0].export_weight_chunks.remote(chunk_bytes))
+        return ray.get(self.actors[0].push_weight_chunks.remote(chunk_bytes, held, push))
 
     def node_ip(self) -> str:
         import ray
@@ -531,15 +604,15 @@ class RayTrainer:
 
         return int(ray.get(self.actors[0].free_port.remote()))
 
-    def broadcast_weights(self, spec: BroadcastGroupSpec) -> dict[str, float]:
+    def broadcast_weights(self, spec: BroadcastGroupSpec, held: str | None, push: str) -> dict[str, float]:
         import ray
 
-        return ray.get(self.actors[0].broadcast_weights.remote(spec))
+        return ray.get(self.actors[0].broadcast_weights.remote(spec, held, push))
 
-    def export_ipc_handles(self) -> tuple[list[IpcHandle], int]:
+    def export_ipc_handles(self, held: str | None, push: str) -> tuple[list[IpcHandle], int]:
         import ray
 
-        return ray.get(self.actors[0].export_ipc_handles.remote())
+        return ray.get(self.actors[0].export_ipc_handles.remote(held, push))
 
     def release_ipc_exports(self) -> None:
         import ray
@@ -562,6 +635,22 @@ def _require(obj: Any, cls: type, role: str) -> None:
         )
 
 
+def _proxies(trainer: Trainer, engines: Sequence[RolloutEngine]) -> tuple[RayTrainer, list[RayRolloutEngine]]:
+    _require(trainer, RayTrainer, "trainer")
+    for engine in engines:
+        _require(engine, RayRolloutEngine, "engine")
+    return trainer, list(engines)  # type: ignore[return-value]
+
+
+def _held_by(engines: Sequence[RayRolloutEngine]) -> str | None:
+    """The trainer actor's push that every actor of ``engines`` holds
+    (:meth:`RolloutEngineActor.held_weights`); ``None`` unless it is one and the same."""
+    import ray
+
+    held = set(ray.get([actor.held_weights.remote() for engine in engines for actor in engine.actors]))
+    return held.pop() if len(held) == 1 else None
+
+
 class RayObjectStoreWeightSync:
     """Trainer rank 0 → ``ray.put`` chunks → every engine actor pulls. Ray's ``inprocess`` analogue."""
 
@@ -571,14 +660,12 @@ class RayObjectStoreWeightSync:
         self.chunk_bytes = chunk_bytes
 
     def sync(self, trainer: Trainer, engines: Sequence[RolloutEngine]) -> dict[str, float]:
-        _require(trainer, RayTrainer, "trainer")
+        source, receivers = _proxies(trainer, engines)
         t0 = time.perf_counter()
-        refs, total = trainer.export_weight_refs(self.chunk_bytes)  # type: ignore[attr-defined]
+        push = uuid.uuid4().hex
+        refs, total = source.push_weight_refs(self.chunk_bytes, _held_by(receivers), push)
         t_exported = time.perf_counter()
-        handles = []
-        for engine in engines:
-            _require(engine, RayRolloutEngine, "engine")
-            handles.append(engine.pull_weights_async(refs))  # type: ignore[attr-defined]
+        handles = [engine.pull_weights_async(refs, push) for engine in receivers]
         for h in handles:
             h.result()
         return {
@@ -615,17 +702,17 @@ class RayBroadcastWeightSync:
         return self.spec
 
     def sync(self, trainer: Trainer, engines: Sequence[RolloutEngine]) -> dict[str, float]:
-        _require(trainer, RayTrainer, "trainer")
-        if len(engines) != self.plan.engine_replicas:
-            raise WeightSyncError(f"expected {self.plan.engine_replicas} engines, got {len(engines)}")
-        spec = self._spec(trainer)  # type: ignore[arg-type]
+        source, receivers = _proxies(trainer, engines)
+        if len(receivers) != self.plan.engine_replicas:
+            raise WeightSyncError(f"expected {self.plan.engine_replicas} engines, got {len(receivers)}")
+        spec = self._spec(source)
         t0 = time.perf_counter()
         tp = self.plan.engine_tensor_parallel
-        handles = []
-        for i, engine in enumerate(engines):
-            _require(engine, RayRolloutEngine, "engine")
-            handles.append(engine.begin_receive_broadcast(spec, 1 + i * tp))  # type: ignore[attr-defined]
-        metrics = trainer.broadcast_weights(spec)  # type: ignore[attr-defined]
+        held, push = _held_by(receivers), uuid.uuid4().hex
+        handles = [
+            engine.begin_receive_broadcast(spec, 1 + i * tp, push) for i, engine in enumerate(receivers)
+        ]
+        metrics = source.broadcast_weights(spec, held, push)
         for h in handles:
             h.result()
         metrics["weight_sync/seconds"] = time.perf_counter() - t0
@@ -638,18 +725,16 @@ class RayCudaIpcWeightSync:
     name = "cuda_ipc"
 
     def sync(self, trainer: Trainer, engines: Sequence[RolloutEngine]) -> dict[str, float]:
-        _require(trainer, RayTrainer, "trainer")
+        source, receivers = _proxies(trainer, engines)
         t0 = time.perf_counter()
-        handles, total = trainer.export_ipc_handles()  # type: ignore[attr-defined]
+        push = uuid.uuid4().hex
+        handles, total = source.export_ipc_handles(_held_by(receivers), push)
         try:
-            pending = []
-            for engine in engines:
-                _require(engine, RayRolloutEngine, "engine")
-                pending.append(engine.update_weights_from_ipc_async(handles))  # type: ignore[attr-defined]
+            pending = [engine.update_weights_from_ipc_async(handles, push) for engine in receivers]
             for h in pending:
                 h.result()
         finally:
-            trainer.release_ipc_exports()  # type: ignore[attr-defined]
+            source.release_ipc_exports()
         return {
             "weight_sync/bytes": float(total),
             "weight_sync/seconds": time.perf_counter() - t0,
