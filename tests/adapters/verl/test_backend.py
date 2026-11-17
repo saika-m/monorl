@@ -7,8 +7,10 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
 from monorl.adapters.verl import backend as backend_module
 from monorl.adapters.verl.backend import (
@@ -19,6 +21,7 @@ from monorl.adapters.verl.backend import (
     link_checkpoints,
     resume_step,
 )
+from monorl.config.schema import RunConfig
 from monorl.core.errors import BackendUnavailable
 from monorl.core.registry import registry
 from monorl.core.reporting import RunReporter, iter_metrics, list_checkpoints, read_status
@@ -111,6 +114,38 @@ def test_prepare_stages_run_dir(make_config, tmp_path: Path):
     assert (run_dir / "verl_config.yaml").exists()
     assert (run_dir / "verl_overrides.txt").read_text().splitlines() == overrides
     assert "actor_rollout_ref.rollout.multi_turn.enable=true" in overrides
+
+
+def test_prepare_leaves_a_secret_of_a_reward_in_no_file_of_the_run_directory(
+    base_config: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``api_key: ${OPENAI_API_KEY}`` in the params of ``llm_judge``: no file that ``prepare`` stages
+    holds the value, and the reward module names the variable for verl's workers to resolve."""
+    from monorl.config import loader
+
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-verl-0123456789abcdef")
+    params = {"model": "judge-model", "api_key": "${OPENAI_API_KEY}"}
+    base_config["rewards"] = [{"type": "llm_judge", "params": params}]
+    source = tmp_path / "user-config.yaml"
+    source.write_text(yaml.safe_dump(base_config))
+    cfg = RunConfig.from_yaml(source)
+    assert cfg.rewards[0].params["api_key"] == "sk-verl-0123456789abcdef"
+
+    run_dir = tmp_path / "run"
+    VerlBackend(cfg).prepare(cfg, run_dir)
+    files = sorted(p for p in run_dir.rglob("*") if p.is_file())
+    assert [p.name for p in files] == [
+        "config.yaml",
+        "train.parquet",
+        "monorl_reward.py",
+        "verl_config.yaml",
+        "verl_overrides.txt",
+    ]
+    holding = [p.name for p in files if b"sk-verl-0123456789abcdef" in p.read_bytes()]
+    assert holding == []
+    assert "'api_key': '${OPENAI_API_KEY}'" in (run_dir / "monorl_reward.py").read_text()
+    assert RunConfig.from_yaml(run_dir / "config.yaml") == cfg
 
 
 def test_run_requires_verl_unless_custom_python(make_config, tmp_path: Path):
