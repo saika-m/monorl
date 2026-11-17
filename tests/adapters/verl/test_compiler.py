@@ -229,6 +229,7 @@ def test_eval_and_logging(make_config, tmp_path: Path, data_file: Path):
     assert ov["data.val_files"] == str(tmp_path / "data" / "val.parquet")
     assert ov["trainer.test_freq"] == "5"
     assert ov["trainer.logger"] == "[console,wandb,tensorboard]"
+    assert ov["trainer.project_name"] == "proj"  # the W&B project verl logs to
     assert ov["trainer.rollout_data_dir"] == "null"
 
 

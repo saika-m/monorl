@@ -545,7 +545,7 @@ code, not run here: neither framework is installed):
 
 | Backend | `logging.wandb_project` | `logging.tensorboard` |
 |---|---|---|
-| `verl` | adds `wandb` to `trainer.logger`; the run is named `run_name` and its project is always `monorl`, not the value of the key | adds `tensorboard` to `trainer.logger`; monorl passes no directory |
+| `verl` | adds `wandb` to `trainer.logger`; the run is named `run_name` and its project (`trainer.project_name`) is the value of the key | adds `tensorboard` to `trainer.logger`; monorl passes no directory |
 | `nemo_rl` | `logger.wandb_enabled`, with the project and `run_name` in `logger.wandb` | `logger.tensorboard_enabled`; `logger.log_dir` is `<run_dir>/nemo_rl/logs` |
 
 ## Pipeline backends and pipelines
