@@ -8,10 +8,12 @@ from typing import Any
 import httpx
 import pytest
 import torch
+from fastapi import FastAPI
 from vllm_fakes import LoopbackServer
 
 from monorl.adapters.vllm.client import VllmServerClient
-from monorl.adapters.vllm.common import tensor_from_bytes
+from monorl.adapters.vllm.common import decode_weights
+from monorl.adapters.vllm.server import attach_router
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, GenerationCancelled
 from monorl.core.interfaces import RolloutEngine
@@ -28,6 +30,7 @@ class FakeServer:
         self.fail_paths: set[str] = set()
         self.finish_reasons = ["stop"]
         self.shuffle = True
+        self.weights: dict[str, torch.Tensor] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -69,10 +72,11 @@ class FakeServer:
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 },
             )
-        if path == "/update_named_param":
-            q = request.url.params
-            t = tensor_from_bytes(request.content, q["dtype"], [int(s) for s in q["shape"].split(",") if s])
-            return httpx.Response(200, json={"name": q["name"], "loaded": [1], "sum": float(t.float().sum())})
+        if path == "/monorl/update_weights":
+            assert int(request.headers["content-length"]) == len(request.content)
+            weights, _ = decode_weights(bytearray(request.content))
+            self.weights.update(weights)
+            return httpx.Response(200, json={"tensors": len(weights), "loaded": [len(weights)]})
         return httpx.Response(200, json={"status": "ok", "path": path})
 
     def paths(self) -> list[str]:
@@ -177,18 +181,133 @@ def test_null_logprob_becomes_nan(client: VllmServerClient) -> None:
     assert math.isnan(lps[0]) and lps[1] == -0.5
 
 
-def test_update_weights_streams_each_tensor(client: VllmServerClient, server: FakeServer) -> None:
-    w = [("a.weight", torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)), ("b", torch.tensor(2.5))]
-    client.update_weights(iter(w))
-    reqs = [r for r in server.requests if r.url.path == "/update_named_param"]
-    assert [r.url.params["name"] for r in reqs] == ["a.weight", "b"]
-    assert reqs[0].url.params["dtype"] == "bfloat16" and reqs[0].url.params["shape"] == "2,3"
-    assert reqs[0].headers["content-type"] == "application/octet-stream"
-    assert len(reqs[0].content) == 12  # 6 x bf16
-    assert reqs[1].url.params["shape"] == "" and len(reqs[1].content) == 4
-    assert server.paths()[-1] == "/reset_prefix_cache"
-    restored = tensor_from_bytes(reqs[0].content, "bfloat16", [2, 3])
-    assert torch.equal(restored, w[0][1])
+class WeightsEngine:
+    """The engine behind a monorl server, as far as weights go: every worker copies what an
+    update carries into its parameters (``default_weight_loader``, vLLM ``weight_utils.py``)."""
+
+    def __init__(self) -> None:
+        self.params: dict[str, torch.Tensor] = {}
+        self.updates: list[list[int]] = []
+        """Per ``monorl_update_weights`` call, the byte sizes of the tensors it carried."""
+
+    async def collective_rpc(
+        self, method: str, timeout: float | None = None, args: tuple = (), kwargs: Any = None
+    ):
+        if method == "monorl_update_weights":
+            (weights,) = args
+            self.updates.append([t.numel() * t.element_size() for _, t in weights])
+            for name, tensor in weights:
+                self.params[name] = torch.empty_like(tensor).copy_(tensor)
+            return [len(weights)]
+        return [None]
+
+
+@pytest.fixture
+def served(vllm_config: RunConfig):
+    """``client(budget)``: a client whose requests run the real server routes, and the engine
+    those routes drive."""
+    app = FastAPI()
+    attach_router(app)
+    app.post("/reset_prefix_cache")(lambda: {})
+    engine = WeightsEngine()
+    app.state.engine_client = engine
+    clients: list[VllmServerClient] = []
+
+    def client(weight_request_bytes: int | None = None) -> VllmServerClient:
+        extra: dict[str, Any] = {"mode": "server", "url": "http://vllm.test:8000"}
+        if weight_request_bytes is not None:
+            extra["weight_request_bytes"] = weight_request_bytes
+        vllm_config.rollout.extra = extra
+        clients.append(VllmServerClient(vllm_config, transport=httpx.ASGITransport(app=app)))
+        return clients[-1]
+
+    yield client, engine
+    for c in clients:
+        c.shutdown()
+
+
+def _mixed_weights() -> list[tuple[str, torch.Tensor]]:
+    g = torch.Generator().manual_seed(3)
+    return [
+        ("embed.weight", torch.randn(40, 16, generator=g).to(torch.bfloat16)),  # 1280 B
+        ("scale", torch.tensor(2.5)),  # 0-d
+        ("l0.bias", torch.randn(7, generator=g).to(torch.float16)),
+        ("empty", torch.empty(0, 3)),
+        ("l0.weight", torch.randn(16, 16, generator=g, requires_grad=True)),  # 1024 B
+        ("transposed", torch.randn(5, 9, generator=g, dtype=torch.float64).t()),  # not contiguous
+        ("sliced", torch.arange(60, dtype=torch.int64)[10:50:3]),
+        ("mask", torch.rand(3, 5, generator=g) > 0.5),
+        ("steps", torch.tensor(7, dtype=torch.int32)),
+        ("codes", torch.arange(200, dtype=torch.uint8).reshape(2, 4, 25)),
+        ("l1.weight", torch.randn(3, 2, 4, generator=g)),
+        ("head.weight", torch.randn(64, 16, generator=g).to(torch.bfloat16)),  # 2048 B
+    ]
+
+
+@pytest.mark.parametrize("budget", [1, 100, 512, 1500, None])
+def test_update_weights_leaves_the_server_with_exactly_the_weights_sent(served, budget: int | None) -> None:
+    make_client, engine = served
+    weights = _mixed_weights()
+    make_client(budget).update_weights(iter(weights))
+
+    assert list(engine.params) == [name for name, _ in weights]
+    for name, tensor in weights:
+        got = engine.params[name]
+        assert got.dtype == tensor.dtype and got.shape == tensor.shape, name
+        assert torch.equal(got, tensor.detach()), name
+
+    sizes = [t.numel() * t.element_size() for _, t in weights]
+    if budget is None:  # the default budget holds all of a small model
+        assert len(engine.updates) == 1
+        return
+    for carried in engine.updates:  # a request stays within the budget unless one tensor exceeds it
+        assert sum(carried) <= budget or len(carried) == 1
+    # Consecutive requests cannot both fit into one, so their number is bounded by the bytes sent.
+    assert len(engine.updates) <= 2 * sum(sizes) // budget + 1
+    if budget == 1500:  # nothing is oversized but the head: small tensors share requests
+        assert [len(carried) for carried in engine.updates] == [4, 3, 4, 1]
+
+
+def test_update_weights_bundles_small_tensors_around_large_ones(served) -> None:
+    make_client, engine = served
+    weights = [(f"norm{i}", torch.full((8,), float(i))) for i in range(200)]  # 32 B each
+    weights.insert(50, ("big0", torch.ones(100, 10)))  # 4000 B
+    weights.insert(120, ("big1", torch.zeros(100, 10)))
+    make_client(1024).update_weights(weights)
+    total = sum(t.numel() * t.element_size() for _, t in weights)
+    oversized = 2
+    assert len(engine.updates) <= -(-total // 1024) + 2 * oversized  # 202 tensors in 11 requests at most
+    assert all(torch.equal(engine.params[name], tensor) for name, tensor in weights)
+
+
+def test_update_weights_streams_large_tensors_over_a_socket(loopback, server: FakeServer) -> None:
+    _, client = loopback
+    g = torch.Generator().manual_seed(5)
+    weights = [
+        ("a.weight", torch.randn(700, 1000, generator=g).to(torch.bfloat16)),  # 1.4 MB: several pieces
+        ("b", torch.tensor(2.5)),
+        ("c.weight", torch.randn(300, 1000, generator=g)),
+    ]
+    client.update_weights(iter(weights))
+    assert server.paths() == ["/monorl/update_weights", "/reset_prefix_cache"]
+    assert server.requests[0].headers["content-type"] == "application/vnd.monorl.weights"
+    for name, tensor in weights:
+        assert server.weights[name].dtype == tensor.dtype and torch.equal(server.weights[name], tensor)
+
+
+def test_update_weights_names_a_server_of_another_version(
+    client: VllmServerClient, server: FakeServer
+) -> None:
+    def old_server(request: httpx.Request) -> httpx.Response:
+        server.requests.append(request)
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    client._client = httpx.AsyncClient(base_url=client.url, transport=httpx.MockTransport(old_server))
+    with pytest.raises(RuntimeError, match="same monorl version"):
+        client.update_weights([("w", torch.zeros(2))])
+    assert server.paths() == ["/monorl/update_weights"]  # no cache reset after a failed update
+    with pytest.raises(ValueError, match="complex64"):  # a dtype the format lacks is refused before sending
+        client.update_weights([("w", torch.zeros(2, dtype=torch.complex64))])
 
 
 def test_load_weights_from_path(client: VllmServerClient, server: FakeServer, tmp_path) -> None:

@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import io
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +16,11 @@ import httpx
 import pytest
 import torch
 from PIL import Image
-from vllm_fakes import FakeLLM
+from vllm_fakes import FakeLLM, LoopbackServer
 
 from monorl.adapters.vllm.client import VllmServerClient
 from monorl.adapters.vllm.common import (
+    ImageUrlCache,
     chat_completion_kwargs,
     chat_completion_messages,
     completions_from_chat_response,
@@ -25,7 +29,7 @@ from monorl.adapters.vllm.common import (
     tokens_prompt_kwargs,
 )
 from monorl.config.schema import RunConfig
-from monorl.core.errors import ConfigError
+from monorl.core.errors import ConfigError, GenerationCancelled
 from monorl.core.registry import registry
 from monorl.core.types import SamplingParams
 
@@ -102,7 +106,9 @@ def test_tokens_prompt_and_limit_mm() -> None:
 
 
 def test_chat_completion_messages_and_kwargs(image_path: Path) -> None:
-    msgs = chat_completion_messages([{"role": "system", "content": "be brief"}, *_chat(image_path)])
+    msgs = chat_completion_messages(
+        [{"role": "system", "content": "be brief"}, *_chat(image_path)], ImageUrlCache()
+    )
     assert msgs[0] == {"role": "system", "content": "be brief"}
     parts = msgs[1]["content"]
     assert parts[0]["type"] == "image_url" and parts[0]["image_url"]["url"].startswith(
@@ -112,11 +118,13 @@ def test_chat_completion_messages_and_kwargs(image_path: Path) -> None:
     assert parts[1] == {"type": "text", "text": "colour?"}
     data_url = "data:image/png;base64,AAAA"
     passthrough = chat_completion_messages(
-        [{"role": "user", "content": [{"type": "image", "image": data_url}]}]
+        [{"role": "user", "content": [{"type": "image", "image": data_url}]}], ImageUrlCache()
     )
     assert passthrough[0]["content"][0]["image_url"]["url"] == data_url
     with pytest.raises(ConfigError, match="audio"):
-        chat_completion_messages([{"role": "user", "content": [{"type": "audio", "audio": "a.wav"}]}])
+        chat_completion_messages(
+            [{"role": "user", "content": [{"type": "audio", "audio": "a.wav"}]}], ImageUrlCache()
+        )
 
     kw = chat_completion_kwargs(SamplingParams(n=3, max_new_tokens=5, top_k=-1, logprobs=True, seed=7))
     assert kw["n"] == 3 and kw["max_completion_tokens"] == 5 and kw["top_k"] == 0 and kw["seed"] == 7
@@ -285,3 +293,215 @@ def test_client_routes_image_prompts_through_chat_completions(
         -0.2,
     ]  # text prompt took /v1/completions
     assert out[2][1].token_ids == [1, 5]
+
+
+# -- server mode: concurrent chat requests, images encoded once ----------------------------------
+
+
+def _ask(image_path: Path, question: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": [{"type": "image", "image": str(image_path)}, {"type": "text", "text": question}],
+        }
+    ]
+
+
+def _sent_image(body: dict[str, Any], part: int = 0) -> Image.Image:
+    url = body["messages"][0]["content"][part]["image_url"]["url"]
+    return Image.open(io.BytesIO(base64.b64decode(url.partition(",")[2]))).convert("RGB")
+
+
+class HeldChatServer(httpx.AsyncBaseTransport):
+    """Answers a chat request only once ``expect`` of them have arrived, the latest first, with
+    the question it was asked as the completion; ``fail`` questions get a 500 at once, and with
+    ``hold`` the others are never answered."""
+
+    def __init__(self, expect: int, *, fail: tuple[str, ...] = (), hold: bool = False) -> None:
+        self.expect, self.fail, self.hold = expect, fail, hold
+        self.arrived: list[str] = []
+        self.answered: list[str] = []
+        self.dropped: list[str] = []
+        self.most_in_flight = self.in_flight = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(await request.aread())
+        if request.url.path != "/v1/chat/completions":
+            return httpx.Response(200, json=json.loads(ChatServer().handler(request).content))
+        question = body["messages"][-1]["content"][-1]["text"]
+        position = len(self.arrived)
+        self.arrived.append(question)
+        if question in self.fail:
+            return httpx.Response(500, text=f"boom {question}")
+        self.in_flight += 1
+        self.most_in_flight = max(self.most_in_flight, self.in_flight)
+        try:
+            async with asyncio.timeout(10):  # a client sending one at a time ends here
+                while len(self.arrived) < self.expect or self.hold:
+                    await asyncio.sleep(0.005)
+                await asyncio.sleep(0.02 * (self.expect - position))
+        except asyncio.CancelledError:
+            self.dropped.append(question)
+            raise
+        finally:
+            self.in_flight -= 1
+        self.answered.append(question)
+        choice = {
+            "index": 0,
+            "message": {"role": "assistant", "content": question},
+            "token_ids": [position],
+            "finish_reason": "stop",
+        }
+        return httpx.Response(200, json={"choices": [choice], "prompt_token_ids": [7]})
+
+
+def _server_client(
+    vllm_config: RunConfig, transport: httpx.AsyncBaseTransport | None, url: str = "http://vllm.test:8000"
+):
+    vllm_config.rollout.extra = {"mode": "server", "url": url, "model_name": "policy"}
+    return VllmServerClient(vllm_config, transport=transport)
+
+
+def test_chat_requests_are_in_flight_together_and_results_keep_prompt_order(
+    vllm_config: RunConfig, image_path: Path
+) -> None:
+    server = HeldChatServer(expect=4)
+    client = _server_client(vllm_config, server)
+    questions = ["q0", "q1", "q2", "q3"]
+    prompts: list[Any] = [_ask(image_path, q) for q in questions]
+    prompts.insert(2, [1, 2, 3])  # a text prompt in between keeps its place too
+    try:
+        out = client.generate(prompts, SamplingParams(n=1, logprobs=False, max_new_tokens=2))
+    finally:
+        client.shutdown()
+    assert server.most_in_flight == 4
+    assert server.answered == list(reversed(server.arrived))  # answered in another order than asked
+    assert [group[0].text for i, group in enumerate(out) if i != 2] == questions
+    assert len(out) == 5 and len(out[2]) == 1
+
+
+def test_one_failing_chat_request_fails_the_call_with_its_error(
+    vllm_config: RunConfig, image_path: Path
+) -> None:
+    server = HeldChatServer(expect=3, fail=("bad",), hold=True)
+    client = _server_client(vllm_config, server)
+    try:
+        with pytest.raises(RuntimeError, match=r"vllm\.test:8000/v1/chat/completions -> 500: boom bad"):
+            client.generate(
+                [_ask(image_path, "slow0"), _ask(image_path, "bad"), _ask(image_path, "slow1")],
+                SamplingParams(n=1, logprobs=False),
+            )
+        # The requests that were still running are dropped, not left generating on the server.
+        assert sorted(server.dropped) == ["slow0", "slow1"] and server.in_flight == 0
+        server.fail, server.hold, server.expect = (), False, 0
+        out = client.generate([_ask(image_path, "again")], SamplingParams(n=1, logprobs=False))
+        assert out[0][0].text == "again"
+        # Two failures by the time the call fails: the earlier prompt's error is the one reported.
+        server.fail = ("bad1", "bad0")
+        with pytest.raises(RuntimeError, match="boom bad0"):
+            client.generate(
+                [_ask(image_path, "bad0"), _ask(image_path, "bad1")], SamplingParams(n=1, logprobs=False)
+            )
+    finally:
+        client.shutdown()
+
+
+def test_cancel_disconnects_every_chat_request_in_flight(vllm_config: RunConfig, image_path: Path) -> None:
+    web = LoopbackServer(ChatServer().handler)
+    client = _server_client(vllm_config, None, web.url)
+    try:
+        web.stall = True
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            running = pool.submit(
+                client.generate, [_ask(image_path, "a"), _ask(image_path, "b")], SamplingParams(n=1)
+            )
+            assert [web.stalled.get(timeout=5) for _ in range(2)] == ["/v1/chat/completions"] * 2
+            client.cancel()
+            with pytest.raises(GenerationCancelled):
+                running.result(timeout=5)
+        assert [web.disconnects.get(timeout=5) for _ in range(2)] == ["/v1/chat/completions"] * 2
+        web.stall = False
+        out = client.generate([_ask(image_path, "c")], SamplingParams(n=1, logprobs=True))
+        assert out[0][0].text == "chat-0"
+    finally:
+        client.shutdown()
+        web.close()
+
+
+def test_a_conversation_encodes_each_image_once_and_never_sends_a_stale_one(
+    vllm_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monorl.rollout.media as media
+
+    encodes: list[tuple[int, int]] = []
+    encode = media.image_data_url
+
+    def counting(image: Image.Image, **kw: Any) -> str:
+        encodes.append(image.size)
+        return encode(image, **kw)
+
+    monkeypatch.setattr(media, "image_data_url", counting)
+    red, blue = tmp_path / "red.png", tmp_path / "blue.png"
+    Image.new("RGB", (6, 4), (255, 0, 0)).save(red)
+    Image.new("RGB", (6, 4), (0, 0, 255)).save(blue)
+    conversation: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": str(red)},
+                {"type": "image", "image": blue.as_uri()},
+                {"type": "text", "text": "turn 0"},
+            ],
+        }
+    ]
+    server = ChatServer()
+    client = _server_client(vllm_config, httpx.MockTransport(server.handler))
+    params = SamplingParams(n=1, logprobs=False)
+    try:
+        for turn in range(1, 6):
+            client.generate([conversation], params)
+            conversation = [
+                *conversation,
+                {"role": "assistant", "content": f"answer {turn}"},
+                {"role": "user", "content": [{"type": "text", "text": f"turn {turn}"}]},
+            ]
+        assert len(encodes) == 2  # not once per image and turn
+        bodies = [json.loads(r.content) for r in server.requests]
+        assert all(_sent_image(b, 0).getpixel((0, 0)) == (255, 0, 0) for b in bodies)
+        assert all(_sent_image(b, 1).getpixel((0, 0)) == (0, 0, 255) for b in bodies)
+
+        # The file behind a reference is replaced by a picture of the same size: the new one is sent.
+        Image.new("RGB", (6, 4), (0, 255, 0)).save(red)
+        client.generate([conversation], params)
+        sent = json.loads(server.requests[-1].content)
+        assert _sent_image(sent, 0).getpixel((0, 0)) == (0, 255, 0)
+        assert _sent_image(sent, 1).getpixel((0, 0)) == (0, 0, 255)
+        assert len(encodes) == 3
+    finally:
+        client.shutdown()
+
+
+def test_image_url_cache_stays_within_its_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import monorl.rollout.media as media
+
+    encodes: list[int] = []
+    encode = media.image_data_url
+    monkeypatch.setattr(media, "image_data_url", lambda image, **kw: encodes.append(1) or encode(image, **kw))
+    paths = []
+    for i, colour in enumerate([(255, 0, 0), (0, 255, 0), (0, 0, 255)]):
+        paths.append(str(tmp_path / f"{i}.png"))
+        Image.new("RGB", (8, 8), colour).save(paths[-1])
+    urls = [ImageUrlCache().data_url(p) for p in paths]
+    assert len(set(urls)) == 3
+    small, large = min(map(len, urls)), max(map(len, urls))
+
+    def encodes_for(max_bytes: int, order: list[int]) -> int:
+        cache = ImageUrlCache(max_bytes)
+        encodes.clear()
+        assert [cache.data_url(paths[i]) for i in order] == [urls[i] for i in order]
+        return len(encodes)
+
+    assert encodes_for(3 * large, [0, 1, 2, 0, 1, 2]) == 3
+    assert encodes_for(2 * large, [0, 1, 0, 2, 0, 1]) == 4  # 2 pushes out 1, the least recently used
+    assert encodes_for(2 * large + small // 2, [0, 1, 2, 0]) == 4  # room for two, not for three
+    assert encodes_for(small - 1, [0, 0, 1]) == 3  # nothing fits: every use encodes, the URLs stay right
