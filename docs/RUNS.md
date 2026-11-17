@@ -389,6 +389,52 @@ characters are cut with a marker and inline `data:` media over 64 KiB is replace
 One line per event, `YYYY-MM-DD HH:MM:SS <message>`; status changes appear as `[state] message`.
 Lines are also echoed to stderr unless `MONORL_REPORTER_ECHO=0`.
 
+**Failures.** A run that fails because its config, its data or its installation has to change
+ends with one line, the message `status.json` has:
+
+```text
+2026-11-17 02:41:13 [failed] DatasetNotFound: dataset path not found: /tmp/no-such.jsonl
+```
+
+These are the errors `ConfigError`, `DataError`, `RegistryError` and `BackendUnavailable`: an
+unknown trainer, engine, reward or environment, a provider that cannot be imported, a dataset
+path, split or column that does not exist, a dataset without usable samples, a framework that is
+not installed. A `model.name_or_path` or `model.tokenizer_name_or_path` that is written as a path
+(it starts with `/`, `./`, `../` or `~`) and is not a directory is one of them, found before
+anything is loaded. The path is taken as written, as transformers takes it: `~` is not expanded,
+and the message says so. Nothing is checked with `cluster.ray_address`, where the nodes of that
+cluster load the model. Every other exception has its traceback in `run.log` before the
+`[failed]` line, and `monorl train` says where: `(traceback in <run_dir>/run.log)`. That includes
+what a component raises as a plain `ValueError` for parameters it cannot use, such as
+`llm_judge` without `base_url`.
+
+**Warnings.** While a run is in progress, what its process logs through Python's `logging` under
+`monorl` at WARNING or above is a line of `run.log`, `<LEVEL> <logger>: <message>` after the time,
+followed by the traceback when the record has one. `monorl.rewards.llm_judge` (judgments that
+failed), `monorl.orchestrator.episodes` (an episode that failed and is tried again or left out),
+`monorl.envs.remote` (an environment process that is started again) and `monorl.envs.sandbox` (a
+container that was not removed) log this way. One step of the CPU recipe with an `llm_judge` reward
+whose `base_url` nobody listens on and `max_attempts: 1` wrote, between `[running] training steps
+1..1` and the line of step 1: `2026-11-17 02:45:38 WARNING monorl.rewards.llm_judge: reward
+llm_judge: 8 of 8 judgments failed and scored 0 (8x ConnectError: [Errno 61] Connection refused)`.
+The terminal had the same line once, as the echo of the log line. A program that configures
+`logging` itself gets the record in its handlers and no echo. Records below WARNING and records of
+other loggers (a library, a provider module that logs under its own name) are not collected. The
+`rejection_sample` and `eval` stages of a pipeline collect into the `run.log` of the stage, as a
+train stage does; the pipeline's own `run.log` holds the lines of the pipeline.
+
+Only the process of the run is covered. A warning logged in a Ray worker is not in `run.log`:
+Ray prints the worker's stderr on the driver's. Run here with a local Ray and an actor that logs
+under `monorl`, next to a warning of the driver: `run.log` had the driver's line only, and stderr
+had it and `(Worker pid=78825) warning logged in a Ray actor`. The engines and the trainer ranks
+of `cluster.mode: ray` are such actors (from `src/monorl/distributed/ray_runtime.py`; a run with
+`cluster.mode: ray` was not made for this). A job started by `monorl serve` has its stderr in
+`run.log` and the echo off, so it has the run's own warnings once, with the time, and those of
+Ray workers as Ray prints them (the first run here with `MONORL_REPORTER_ECHO=0` and stderr
+appended to `run.log`, not through the server; the second from
+`src/monorl/server/jobs.py`). The `verl` and `nemo_rl` backends run the framework in a child
+process whose output goes to `run.log` line by line (from the code, neither is installed here).
+
 ### `checkpoints/step-N/`
 
 Written by the reference trainer into `step-N.tmp` and renamed once the rows of step `N` are in
