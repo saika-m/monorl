@@ -29,14 +29,21 @@ def test_a_signal_during_a_write_of_the_reporter_cancels_instead_of_hanging(tmp_
 
 
 def test_a_second_signal_interrupts_and_the_handlers_are_restored(tmp_path: Path) -> None:
+    """The second signal is announced like the first, and sets the event that tells the threads
+    working for the block that the main thread was interrupted."""
     reporter = RunReporter(tmp_path, echo=False)
-    cancel = threading.Event()
+    cancel, interrupt = threading.Event(), threading.Event()
     before = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
     with pytest.raises(KeyboardInterrupt, match="SIGINT"):
-        with signal_guard(cancel, reporter, "stopping"):
+        with signal_guard(cancel, reporter, "stopping", interrupt=interrupt):
             os.kill(os.getpid(), signal.SIGTERM)
-            assert cancel.wait(10)
+            assert cancel.wait(10) and not interrupt.is_set()
             os.kill(os.getpid(), signal.SIGINT)
             threading.Event().wait(10)  # the second signal interrupts this
+    assert interrupt.is_set()
     assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == before
-    assert (tmp_path / LOG_FILE).read_text().count("received") == 1  # only the first is announced
+    log = (tmp_path / LOG_FILE).read_text().splitlines()
+    assert [line.split(" ", 2)[2] for line in log] == [
+        "received SIGTERM: stopping",
+        "received SIGINT again: stopping now",
+    ]

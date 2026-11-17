@@ -109,7 +109,8 @@ def _run(
         cancel = threading.Event()
     backend = config.trainer.backend
     kind = "pipeline" if config.is_pipeline_backend else "sft" if config.is_sft else "component"
-    with signal_guard(cancel, reporter, "finishing the current step, then stopping"):
+    interrupt = threading.Event()
+    with signal_guard(cancel, reporter, "finishing the current step, then stopping", interrupt=interrupt):
         reporter.set_status("running", f"starting {kind} backend {backend!r} (resume={resume})", step=0)
         try:
             check_local_model(config)
@@ -119,7 +120,9 @@ def _run(
             elif config.is_sft:
                 result = SFTLoop(config, reporter, cancel=cancel, resume=resume).run()
             else:
-                result = ComponentLoop(config, reporter, cancel=cancel, resume=resume).run()
+                result = ComponentLoop(
+                    config, reporter, cancel=cancel, resume=resume, interrupt=interrupt
+                ).run()
         except KeyboardInterrupt:
             result = RunResult(
                 state="cancelled",

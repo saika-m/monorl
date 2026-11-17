@@ -81,8 +81,15 @@ The SFT loop has no rollouts, rewards, environments or weight sync. Each step en
   sync, a due checkpoint, reporting, a due evaluation), then the loop stops. If that step was not
   checkpointed already, `checkpoints/step-N/` is saved. `final/` is not written and the state is
   `cancelled`. If the step that finished was the last one, the run completes as `succeeded`.
-- Second signal: `KeyboardInterrupt` is raised at once. The state is `cancelled`, no checkpoint is
-  saved for the interrupted step (from the code, not run here).
+- Second signal: the run stops at once and says so (`received SIGINT again: stopping now`).
+  `KeyboardInterrupt` is raised on the main thread, and what other threads were doing for the run
+  is aborted instead of waited for: a generation in flight ends through the engine's `cancel()`
+  (`hf`, `vllm` and `sglang` have one; `hf` stops within one decoding step), an episode at its
+  next turn. Two things are still waited for: an environment step in flight, and the batch of an
+  engine that has no `cancel()`. The state is `cancelled` and nothing more is written: no
+  checkpoint for the interrupted step, and a checkpoint that was being saved stays `step-N.tmp`
+  and never becomes `step-N`. `metrics.jsonl` and `trajectories.jsonl` keep the rows they have,
+  as after a kill; `--resume` continues from the newest checkpoint ([Resume](#resume)).
 
 `run(..., cancel=event)` takes the event the first signal sets. A pipeline passes its own to every
 train stage, so a signal that arrives in the last step of a stage, which ends `succeeded`, still
@@ -95,6 +102,17 @@ A real cancel of an SFT run (`kill -INT` after step 1 was logged, exit code 130)
 2026-11-12 22:42:42 stopping after step 2 (cancel requested)
 2026-11-12 22:42:44 saved checkpoint .../cancel/checkpoints/step-2
 2026-11-12 22:42:44 [cancelled] cancelled after step 2
+```
+
+A real second signal, one second after the first, while step 1 of
+`configs/recipes/grpo_gsm8k_smollm_cpu.yaml` was generating (`hf` engine on CPU, LoRA,
+`rollout.max_new_tokens=128`). The process ended 0.6 s after it with exit code 130; a second
+signal during a train step and during an evaluation ended it in 0.9 s each:
+
+```text
+2026-11-17 02:45:17 received SIGINT: finishing the current step, then stopping
+2026-11-17 02:45:18 received SIGINT again: stopping now
+2026-11-17 02:45:18 [cancelled] cancelled after step 0
 ```
 
 ## Starting runs

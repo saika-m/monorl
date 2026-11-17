@@ -10,13 +10,29 @@ from contextlib import contextmanager
 
 from monorl.core.reporting import RunReporter
 
+_AGAIN = 0x80
+"""Set in the byte the handler passes on for a signal that is not the first (signal numbers are
+below it)."""
+
 
 @contextmanager
-def signal_guard(cancel: threading.Event, reporter: RunReporter, then: str) -> Iterator[None]:
+def signal_guard(
+    cancel: threading.Event,
+    reporter: RunReporter,
+    then: str,
+    *,
+    interrupt: threading.Event | None = None,
+) -> Iterator[None]:
     """While the block runs, the first SIGINT or SIGTERM sets ``cancel`` and is noted in the run
     log (``received <NAME>: <then>``, written before the block is left); a second one raises
-    ``KeyboardInterrupt`` for an immediate stop. Only the main thread may install handlers;
-    on any other thread the block simply runs.
+    ``KeyboardInterrupt`` for an immediate stop and is noted too (``received <NAME> again:
+    stopping now``). Only the main thread may install handlers; on any other thread the block
+    simply runs.
+
+    ``interrupt`` is set by the second signal before the exception is raised. The exception
+    reaches the main thread only; the event is for what other threads do for the block, which the
+    main thread would otherwise wait for on its way out (the episodes of a rollout, the engine
+    call that serves them).
 
     The handler does not write the log line itself. It runs on the main thread, between two
     instructions of whatever that thread is doing; if that is a write of the reporter, the
@@ -30,13 +46,19 @@ def signal_guard(cancel: threading.Event, reporter: RunReporter, then: str) -> I
 
     def handler(signum: int, _frame: object) -> None:
         if cancel.is_set():
+            if interrupt is not None:
+                interrupt.set()
+            os.write(wake_w, bytes([signum | _AGAIN]))
             raise KeyboardInterrupt(signal.Signals(signum).name)
         cancel.set()
         os.write(wake_w, bytes([signum]))
 
     def announce() -> None:
         while (received := os.read(wake_r, 1)) != b"\0":  # the block writes a zero when it ends
-            reporter.log(f"received {signal.Signals(received[0]).name}: {then}")
+            name = signal.Signals(received[0] & ~_AGAIN).name
+            reporter.log(
+                f"received {name} again: stopping now" if received[0] & _AGAIN else f"received {name}: {then}"
+            )
 
     announcer = threading.Thread(target=announce, name="monorl-signal-log", daemon=True)
     announcer.start()

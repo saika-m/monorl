@@ -63,11 +63,22 @@ _END = object()
 
 class ComponentLoop:
     def __init__(
-        self, config: RunConfig, reporter: RunReporter, *, cancel: threading.Event, resume: bool
+        self,
+        config: RunConfig,
+        reporter: RunReporter,
+        *,
+        cancel: threading.Event,
+        resume: bool,
+        interrupt: threading.Event | None = None,
     ) -> None:
+        """``cancel`` is set by the first signal: the loop stops after the step in progress.
+        ``interrupt`` is set by the second, which also raises ``KeyboardInterrupt`` on the main
+        thread: the episodes that other threads run for the loop abort instead of being waited
+        for (:func:`~monorl.core.signals.signal_guard`)."""
         self.config = config
         self.reporter = reporter
         self.cancel = cancel
+        self.interrupt = interrupt
         self.resume = resume
         self.policy_version = 0
         self.engine_lock = threading.Lock()
@@ -209,7 +220,17 @@ class ComponentLoop:
     def _teardown(self) -> None:
         if self._sinks is not None:
             self._sinks.close()
-        for engine in getattr(self, "engines", []):
+        engines = getattr(self, "engines", [])
+        for engine in engines:
+            # A call that is still generating has lost its caller (to an interrupt or a failure),
+            # and shutdown() would wait for it to end.
+            cancel = getattr(engine, "cancel", None)
+            if cancel is not None:
+                try:
+                    cancel()
+                except Exception:  # noqa: BLE001 - best-effort teardown
+                    pass
+        for engine in engines:
             shutdown = getattr(engine, "shutdown", None)
             if shutdown is not None:
                 try:
@@ -286,7 +307,7 @@ class ComponentLoop:
             for step in steps:
                 if self.cancel.is_set():
                     return
-                yield self._rollout_step(step)
+                yield self._rollout_step(step, abort=self.interrupt)
             return
 
         # The producer may hold at most ``ahead + 1`` generated-but-untrained steps: the one the
@@ -774,7 +795,9 @@ class ComponentLoop:
                 )
                 for i, s in enumerate(self._eval_samples)
             ]
-            trajectories, failed = self._run_specs(specs, self.eval_sampling, what=f"eval step {step}")
+            trajectories, failed = self._run_specs(
+                specs, self.eval_sampling, abort=self.interrupt, what=f"eval step {step}"
+            )
             speculation = self._speculation_metrics()
         self._score(trajectories)
         log_cfg = config.logging
