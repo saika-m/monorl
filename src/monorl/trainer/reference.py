@@ -2,8 +2,9 @@
 
 Runs on CPU/MPS/CUDA. Logprobs are computed as ``log_softmax(logits / rollout.temperature)`` so
 they are directly comparable with the rollout engines' temperature-scaled sampling logprobs
-(importance ratio 1 on-policy). The loss is any callable with the
-``monorl.algorithms.policy_loss`` signature; by default that function is imported lazily.
+(importance ratio 1 on-policy); ``algorithm.name: sft`` samples nothing and uses temperature 1.
+The loss is any callable with the ``monorl.algorithms.policy_loss`` signature; by default that
+function is imported lazily.
 
 Value baseline
 --------------
@@ -235,7 +236,10 @@ class ReferenceTrainer:
         self.config = config
         self.max_seq_len = config.trainer.max_seq_len
         self.device = resolve_device(config.trainer.device)
-        self.temperature = config.rollout.temperature if config.rollout.temperature > 0 else 1.0
+        # RL log-probs are those of the distribution the rollouts were sampled from. sft has no
+        # rollouts: it fits the model's own distribution, as the sft of every other backend does.
+        sampled = not config.is_sft and config.rollout.temperature > 0
+        self.temperature = config.rollout.temperature if sampled else 1.0
         self._loss_fn = loss_fn
         self._step = 0
         self.rank, self.world_size = _resolve_rank(rank, world_size)

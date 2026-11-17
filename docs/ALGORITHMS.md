@@ -216,8 +216,8 @@ loss_t = (1 - eps) * nll_t + eps * (-mean over the vocabulary v of logp_theta(v)
 loss   = agg(loss_t over the trained tokens)
 ```
 
-`sft_loss`, with `eps = sft_label_smoothing`. `logp_theta` is the same temperature-scaled
-log-softmax as in the RL loss, so `rollout.temperature` (default 1.0) applies. Apart from
+`sft_loss`, with `eps = sft_label_smoothing`. `logp_theta` is the plain `log_softmax(logits)`:
+SFT samples nothing, so `rollout.temperature` is not applied. Apart from
 `loss_agg`, `num_epochs` and the three fields below, no `algorithm.*` field is read.
 `loss_agg: rollout` reduces like `sequence` here, because the SFT batch has no loss weights.
 

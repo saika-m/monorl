@@ -6,6 +6,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM
 
+from monorl.config.schema import RunConfig
 from monorl.core.interfaces import Trainer
 from monorl.rollout.hf_engine import HFRolloutEngine
 from monorl.trainer.reference import ReferenceTrainer
@@ -229,6 +230,29 @@ def test_gradient_checkpointing(tiny_model_dir: Path, tokenizer, lora: bool) -> 
     metrics = trainer.train_step(batch)
     assert metrics["grad_norm"] > 0
     assert target_logprob(trainer, batch) > before
+
+
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
+def test_sft_fits_the_distribution_the_model_has_whatever_the_sampling_temperature(
+    tiny_model_dir: Path, tokenizer, label_smoothing: float
+) -> None:
+    """sft has no rollouts whose sampling distribution the log-probs must match: the loss is the
+    plain cross-entropy that the other backends' sft computes, not that of logits / temperature."""
+    batch = make_batch(tokenizer)
+
+    def trainer(algorithm: dict, temperature: float) -> ReferenceTrainer:
+        config = make_config(tiny_model_dir).to_dict()
+        config["algorithm"] = algorithm
+        config["rollout"]["temperature"] = temperature
+        return ReferenceTrainer(RunConfig.from_dict(config))
+
+    sft = {"name": "sft", "sft_label_smoothing": label_smoothing}
+    cold, plain = (trainer(sft, t).train_step(batch)["loss/sft"] for t in (0.5, 1.0))
+    assert cold == pytest.approx(plain, rel=1e-6)
+    # RL log-probs do follow the sampling temperature: they are the sampler's
+    reinforce = {"name": "reinforce"}
+    cold, plain = (target_logprob(trainer(reinforce, t), batch) for t in (0.5, 1.0))
+    assert abs(cold - plain) > 0.05
 
 
 def test_default_loss_fn_is_monorl_algorithms(tiny_model_dir: Path, tokenizer) -> None:
