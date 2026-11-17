@@ -9,8 +9,10 @@ from typing import Any
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
-from monorl.core.reporting import RunReporter
+from monorl.config.schema import RunConfig
+from monorl.core.reporting import CONFIG_FILE, RunReporter
 from monorl.core.types import Trajectory
+from monorl.orchestrator.sinks import MetricSinks
 
 #: TRL log keys → contract metric names (``docs/ARCHITECTURE.md``).
 METRIC_MAP: dict[str, str] = {
@@ -86,13 +88,16 @@ def map_metrics(logs: dict[str, Any], *, sft: bool = False) -> dict[str, float]:
 
 
 class ReporterCallback(TrainerCallback):
-    """Writes ``metrics.jsonl``/``status.json`` and mirrors TRL checkpoints as ``step-<n>`` entries."""
+    """Writes ``metrics.jsonl``/``status.json``, sends every metrics row to the sinks of
+    ``logging.wandb_project`` and ``logging.tensorboard`` as well, and mirrors TRL checkpoints as
+    ``step-<n>`` entries."""
 
     def __init__(self, reporter: RunReporter, *, sft: bool = False, label: str = "GRPOTrainer") -> None:
         self.reporter = reporter
         self.sft = sft
         self.label = label
         self.last_metrics: dict[str, float] = {}
+        self._sinks: MetricSinks | None = None
 
     def on_train_begin(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kw: Any
@@ -100,6 +105,10 @@ class ReporterCallback(TrainerCallback):
         self.reporter.set_status(
             "running", f"{self.label}: {state.max_steps} steps", step=int(state.global_step)
         )
+        # The config of the run, as run() wrote it to the run directory before it started the backend.
+        config_file = self.reporter.run_dir / CONFIG_FILE
+        if self._sinks is None and config_file.exists():
+            self._sinks = MetricSinks(RunConfig.from_yaml(config_file), self.reporter.run_dir, self.reporter)
 
     def on_log(
         self,
@@ -116,6 +125,20 @@ class ReporterCallback(TrainerCallback):
         if phase == "train":
             self.last_metrics.update(metrics)
         self.reporter.log_metrics(int(state.global_step), metrics, phase=phase)
+        if self._sinks is not None:
+            self._sinks.log(int(state.global_step), metrics)  # under the names of metrics.jsonl
+
+    def on_train_end(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kw: Any
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Closes the metric sinks. ``Trainer.train`` calls no callback when it raises, so a run
+        that fails or is interrupted needs this call from whoever called ``train``."""
+        if self._sinks is not None:
+            self._sinks.close()
+            self._sinks = None
 
     def on_save(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kw: Any
