@@ -13,7 +13,7 @@ const REWARD_HINTS: Record<string, string> = {
   math_verify: "Symbolic equivalence via math-verify; robust to formatting.",
   code_exec: "Runs tests against generated code in a sandbox (params: timeout).",
   length: "Length shaping (params: target, penalty).",
-  llm_judge: "LLM-as-judge via an OpenAI-compatible API (params: model, base_url, rubric).",
+  llm_judge: "LLM-as-judge via an OpenAI-compatible API (params: model, base_url, rubric; retries with max_attempts).",
   reward_model: "Scores with a sequence-classification reward model (params: name_or_path).",
   composite: "Nested weighted combination (params: rewards).",
 };

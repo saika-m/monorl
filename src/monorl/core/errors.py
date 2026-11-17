@@ -32,8 +32,8 @@ class WeightSyncError(MonorlError):
 
 
 class GenerationCancelled(MonorlError):
-    """A ``RolloutEngine.generate`` call was aborted through the engine's ``cancel()`` before it
-    finished."""
+    """A ``RolloutEngine.generate`` call was aborted before it finished: through the engine's
+    ``cancel()``, or because the engine was shut down under it."""
 
 
 class GenerationFailed(MonorlError):
