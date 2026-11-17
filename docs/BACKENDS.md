@@ -105,9 +105,15 @@ updated in the same session. Options that would make the sampled distribution di
 recorded logprobs (vLLM's lossy rejection samplers, SGLang accept thresholds below 1.0, `min_p`
 with drafting on either) are config errors.
 
-Every engine implements `generate(prompts, params) -> list[list[Completion]]` with exactly
-`params.n` completions per prompt and per-token logprobs; the turns of concurrent episodes
-reach it as batches ([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)). A completion that
+Every engine implements `generate(prompts, params, *, max_new_tokens=None)` and returns
+`list[list[Completion]]` with exactly `params.n` completions per prompt and per-token logprobs;
+the turns of concurrent episodes reach it as batches
+([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)). `max_new_tokens` is a generation cap per
+prompt (the room a turn has left in the context budget) that takes the place of
+`params.max_new_tokens`. A row of the `hf` engine leaves the batch at its cap, vLLM gets one
+`SamplingParams` per prompt and SGLang one `sampling_params` dict per request, in process and
+over `POST /generate`; the vLLM server client sends one `/v1/completions` request per distinct
+cap, all at once. A completion that
 ends on one of `rollout.stop` keeps the stop string in its text on every engine — vLLM and
 SGLang cut it by
 default, so the adapters send `include_stop_str_in_output=True` / `no_stop_trim=True` — which is

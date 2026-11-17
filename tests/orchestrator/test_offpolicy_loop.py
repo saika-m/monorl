@@ -31,8 +31,10 @@ class TopKEngine(fakes.FakeEngine):
         self.top_requests: list[int] = []
         super().__init__(config, replica, **kwargs)
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
-        out = super().generate(prompts, params)
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
+        out = super().generate(prompts, params, max_new_tokens=max_new_tokens)
         self.top_requests.append(params.top_logprobs)
         for group in out:
             for c in group:

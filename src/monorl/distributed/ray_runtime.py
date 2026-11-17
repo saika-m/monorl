@@ -224,8 +224,13 @@ class RolloutEngineActor:
         return self.engine
 
     # RolloutEngine surface
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
-        return self._engine().generate(prompts, params)
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
+        return self._engine().generate(prompts, params, max_new_tokens=max_new_tokens)
 
     def update_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         with self._update(None) as engine:
@@ -446,10 +451,17 @@ class RayRolloutEngine:
     def _all(self, method: str, *args: Any) -> list[Any]:
         return [getattr(a, method).remote(*args) for a in self.actors]
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         import ray
 
-        return ray.get(self._all("generate", list(prompts), params))[0]
+        caps = None if max_new_tokens is None else list(max_new_tokens)
+        return ray.get(self._all("generate", list(prompts), params, caps))[0]
 
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         import ray

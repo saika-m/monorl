@@ -55,6 +55,7 @@ from monorl.core.types import (
     SamplingParams,
     SpeculationStats,
     TopLogprobs,
+    prompt_caps,
 )
 from monorl.mtp import (
     WIRE_PREFIX,
@@ -234,6 +235,10 @@ class _FinishRecorder(StoppingCriteria):
     ``generate`` pads finished rows with ``pad_token_id`` (often equal to EOS), so the number of
     real tokens cannot be recovered from the output alone; this records it during the loop.
 
+    A row also finishes at a cap of its own: ``caps[row]`` is the most tokens the call may generate
+    for it, where ``generate`` itself knows one ``max_new_tokens`` for all its rows. Such a row is
+    not in ``stopped``, which holds the rows that ended with EOS or a stop string.
+
     ``generate`` also keeps computing every row until the last one has finished. With ``slack`` set
     the recorder reports all rows as finished as soon as the next forward pass would bring the
     finished rows the call has computed above ``slack`` (0: as soon as a row finishes), which makes
@@ -242,13 +247,22 @@ class _FinishRecorder(StoppingCriteria):
     """
 
     def __init__(
-        self, rows: int, eos_ids: list[int], stop: StopStringCriteria | None, *, slack: int | None = None
+        self,
+        caps: Sequence[int],
+        eos_ids: list[int],
+        stop: StopStringCriteria | None,
+        *,
+        slack: int | None = None,
     ) -> None:
+        rows = len(caps)
+        self.caps = torch.tensor(caps)
         self.eos_ids = eos_ids
         self.stop = stop
         self.slack = slack
         self.num_tokens: list[int | None] = [None] * rows
         """Tokens the call had generated when the row finished; ``None`` for a row that has not."""
+        self.stopped: set[int] = set()
+        """The finished rows that ended with EOS or a stop string, not at their cap."""
         self.cut = False
         self._unfinished = rows
         self._idle = 0  # finished rows in the forward passes of the call, the next one included
@@ -273,13 +287,17 @@ class _FinishRecorder(StoppingCriteria):
         last = input_ids[:, -1]
         if self._eos_tensor is None or self._eos_tensor.device != last.device:
             self._eos_tensor = torch.tensor(self.eos_ids, device=last.device)
+            self.caps = self.caps.to(last.device)
         is_eos = torch.isin(last, self._eos_tensor)
         is_stop = self.stop(input_ids, scores) if self.stop is not None else torch.zeros_like(is_eos)
-        done = is_eos | is_stop
+        ended = is_eos | is_stop
+        done = ended | (self.caps <= self._step)
         for i in torch.nonzero(done, as_tuple=False).flatten().tolist():
             if self.num_tokens[i] is None:
                 self.num_tokens[i] = self._step
                 self._unfinished -= 1
+                if ended[i]:
+                    self.stopped.add(i)
         self._idle += len(self.num_tokens) - self._unfinished
         if self._unfinished and (self.slack is None or self._idle <= self.slack):
             return done
@@ -395,11 +413,18 @@ class HFRolloutEngine:
         """``AutoProcessor`` for VLM checkpoints (shared with the batch builder), else ``None``."""
         return self._processor
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if not prompts:
             return []
         if params.n < 1:
             raise ValueError("SamplingParams.n must be >= 1")
+        caps = prompt_caps(params, len(prompts), max_new_tokens)
         switch = _CancelSwitch()
         with self._calls_lock:
             self._calls.add(switch)
@@ -415,7 +440,7 @@ class HFRolloutEngine:
                     raise RuntimeError("engine is asleep; call wake_up() before generate()")
                 switch.check()  # cancelled while encoding or waiting for another generate
                 with self._seeded(params.seed):
-                    return self._generate_locked(encoded, params, switch)
+                    return self._generate_locked(encoded, params, caps, switch)
         finally:
             with self._calls_lock:
                 self._calls.discard(switch)
@@ -615,12 +640,12 @@ class HFRolloutEngine:
 
     @torch.no_grad()
     def _generate_locked(
-        self, encoded: list[_EncodedPrompt], params: SamplingParams, switch: _CancelSwitch
+        self, encoded: list[_EncodedPrompt], params: SamplingParams, caps: list[int], switch: _CancelSwitch
     ) -> list[list[Completion]]:
         greedy = params.temperature <= 0.0
         n = 1 if greedy else params.n
         decode = self._decode_batch if self.mtp_layers is None else self._decode_drafting
-        rows = decode(encoded, params, n, switch)  # row i * n + j = sample j of prompt i
+        rows = decode(encoded, params, caps, n, switch)  # row i * n + j = sample j of prompt i
         results: list[list[Completion]] = []
         for i in range(len(encoded)):
             group = rows[i * n : (i + 1) * n]
@@ -667,17 +692,24 @@ class HFRolloutEngine:
         return rows if self.device.type == "mps" else 0
 
     def _decode_batch(
-        self, encoded: list[_EncodedPrompt], params: SamplingParams, n: int, switch: _CancelSwitch
+        self,
+        encoded: list[_EncodedPrompt],
+        params: SamplingParams,
+        caps: list[int],
+        n: int,
+        switch: _CancelSwitch,
     ) -> list[Completion]:
-        """``n`` completions of every prompt, all rows left-padded into one batch.
+        """``n`` completions of every prompt, of at most ``caps[prompt]`` tokens, all rows
+        left-padded into one batch.
 
         ``generate`` computes every row of its batch until the last one has finished, so the batch
-        is decoded by a chain of ``generate`` calls: a call returns when rows have finished
-        (:meth:`_slack`) and the next one continues the others from the key-value cache the call
-        left behind, the finished rows taken out of it. Every call is handed the whole sequences,
-        so logits processors and stop strings see what they see in a single call. What changes is
-        the batch ``torch.multinomial`` draws for: once a row of the batch has finished, the others
-        get other random numbers than they would have (from the same distribution)."""
+        is decoded by a chain of ``generate`` calls: a call returns when rows have finished, with
+        EOS, a stop string or at their cap (:meth:`_slack`), and the next one continues the others
+        from the key-value cache the call left behind, the finished rows taken out of it. Every
+        call is handed the whole sequences, so logits processors and stop strings see what they see
+        in a single call. What changes is the batch ``torch.multinomial`` draws for: once a row of
+        the batch has finished, the others get other random numbers than they would have (from the
+        same distribution)."""
         input_ids, attention_mask = self._left_pad([e.ids for e in encoded])
         input_ids = input_ids.repeat_interleave(n, dim=0)
         attention_mask = attention_mask.repeat_interleave(n, dim=0)
@@ -689,8 +721,10 @@ class HFRolloutEngine:
         temperature = params.temperature if params.temperature > 0.0 else 1.0
         recording = params.logprobs or params.top_logprobs > 0
         model = self._generating_model()
+        row_caps = [cap for cap in caps for _ in range(n)]
         live = list(range(rows))  # the rows of the batch the next call decodes, in its row order
         num_tokens: list[int | None] = [None] * rows
+        stopped = [False] * rows  # ended with EOS or a stop string, not at the cap
         tokens: list[torch.Tensor] = []  # per call [rows, steps of the call], as are the next three
         logprobs: list[torch.Tensor] = []
         top_ids: list[torch.Tensor] = []
@@ -706,7 +740,8 @@ class HFRolloutEngine:
         while True:
             slack = self._slack(len(live))
             continued = "past_key_values" in model_kwargs  # from a cache that has given up rows
-            finish = _FinishRecorder(len(live), self._eos_ids, stop, slack=slack if continued else None)
+            left = [row_caps[row] - steps for row in live]
+            finish = _FinishRecorder(left, self._eos_ids, stop, slack=slack if continued else None)
             recorder = _LogprobRecorder(temperature, logprobs=params.logprobs, top=params.top_logprobs)
             hooks = [model.register_forward_hook(recorder.observe)] if recording else []
             if slack is not None and not continued:
@@ -715,9 +750,7 @@ class HFRolloutEngine:
                 out = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    generation_config=self._generation_config(
-                        params, params.max_new_tokens - steps, output_logits=False
-                    ),
+                    generation_config=self._generation_config(params, max(left), output_logits=False),
                     stopping_criteria=StoppingCriteriaList([finish, switch]),
                     logits_processor=LogitsProcessorList([recorder] if recording else []),
                     **model_kwargs,
@@ -734,11 +767,12 @@ class HFRolloutEngine:
             if call_top is not None:
                 top_ids.append(of_batch(call_top[0], 0))
                 top_logprobs.append(of_batch(call_top[1], 0.0))
-            for row, finished_at in zip(live, finish.num_tokens, strict=True):
+            for i, (row, finished_at) in enumerate(zip(live, finish.num_tokens, strict=True)):
                 if finished_at is not None:
                     num_tokens[row] = steps + finished_at
+                    stopped[row] = i in finish.stopped
             steps += generated.shape[1]
-            if not finish.cut or steps >= params.max_new_tokens:
+            if not finish.cut:
                 break
             unfinished = [i for i, finished_at in enumerate(finish.num_tokens) if finished_at is None]
             cache = out.past_key_values
@@ -754,27 +788,36 @@ class HFRolloutEngine:
             [e.ids for e in encoded for _ in range(n)],
             torch.cat(tokens, dim=1),
             [steps if finished_at is None else finished_at for finished_at in num_tokens],
-            ["length" if finished_at is None else "stop" for finished_at in num_tokens],
+            ["stop" if row_stopped else "length" for row_stopped in stopped],
             torch.cat(logprobs, dim=1) if params.logprobs else None,
             (torch.cat(top_ids, dim=1), torch.cat(top_logprobs, dim=1)) if params.top_logprobs > 0 else None,
         )
 
     def _decode_drafting(
-        self, encoded: list[_EncodedPrompt], params: SamplingParams, n: int, switch: _CancelSwitch
+        self,
+        encoded: list[_EncodedPrompt],
+        params: SamplingParams,
+        caps: list[int],
+        n: int,
+        switch: _CancelSwitch,
     ) -> list[Completion]:
         """:meth:`_decode_batch` with the MTP layers drafting. Assisted decoding takes one sequence
-        per call, so the rows are decoded one after another; all of them draw from the one random
-        stream the caller seeded, each from where the previous row left it."""
+        per call, so the rows are decoded one after another, each call with the cap of its prompt;
+        all of them draw from the one random stream the caller seeded, each from where the previous
+        row left it."""
         layers = self.mtp_layers
         if layers is None:
             raise RuntimeError("the engine holds no MTP layers to draft with")
         # One row per call: the logits of its steps are small enough to be taken from ``generate``.
-        generation_config = self._generation_config(
-            params, params.max_new_tokens, output_logits=params.logprobs or params.top_logprobs > 0
-        )
+        generation_configs = {
+            cap: self._generation_config(
+                params, cap, output_logits=params.logprobs or params.top_logprobs > 0
+            )
+            for cap in set(caps)
+        }
         stop = StopStringCriteria(self._tokenizer, list(params.stop)) if params.stop else None
         completions: list[Completion] = []
-        for e in encoded:
+        for e, cap in zip(encoded, caps, strict=True):
             if not e.ids:
                 raise ValueError("empty prompt")
             input_ids = torch.tensor([e.ids], dtype=torch.long, device=self.device)
@@ -784,7 +827,7 @@ class HFRolloutEngine:
                 out = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    generation_config=generation_config,
+                    generation_config=generation_configs[cap],
                     stopping_criteria=StoppingCriteriaList([recorder, switch]),
                 )
                 switch.check()  # the sequence was cut short, not finished

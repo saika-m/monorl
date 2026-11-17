@@ -121,6 +121,20 @@ class SamplingParams:
     logprobs (:attr:`Completion.top_logprobs`); 0 disables."""
 
 
+def prompt_caps(params: SamplingParams, prompts: int, max_new_tokens: Sequence[int] | None) -> list[int]:
+    """The generation cap of each of the ``prompts`` prompts of a ``RolloutEngine.generate`` call:
+    ``max_new_tokens[i]`` when the call carries a cap per prompt, ``params.max_new_tokens`` when it
+    does not. A list of another length than the prompts, or a cap below 1, is the caller's error."""
+    if max_new_tokens is None:
+        return [params.max_new_tokens] * prompts
+    caps = [int(cap) for cap in max_new_tokens]
+    if len(caps) != prompts:
+        raise ValueError(f"generate got {len(caps)} max_new_tokens for {prompts} prompts")
+    if caps and min(caps) < 1:
+        raise ValueError(f"max_new_tokens must be >= 1 for every prompt, got {min(caps)}")
+    return caps
+
+
 @dataclass(slots=True)
 class TopLogprobs:
     """The ``k`` most likely next tokens at every generated position of a completion and their

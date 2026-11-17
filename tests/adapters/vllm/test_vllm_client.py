@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +24,8 @@ from monorl.rollout.hf_engine import chat_prompt_ids
 
 
 class FakeServer:
-    """Answers like a monorl vLLM server (vLLM v0.33.0 ``CompletionResponse`` shape)."""
+    """Answers like a monorl vLLM server (vLLM v0.33.0 ``CompletionResponse`` shape): three
+    tokens per completion, or the request's ``max_tokens`` of them (``finish_reason`` ``length``)."""
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
@@ -43,21 +45,22 @@ class FakeServer:
             choices = []
             for p, ids in enumerate(body["prompt"]):
                 for i in range(n):
-                    toks = [p, i, 7]
+                    toks = [p, i, 7][: body["max_tokens"]]
+                    finish = self.finish_reasons[(p * n + i) % len(self.finish_reasons)]
                     choice: dict[str, Any] = {
                         "index": p * n + i,
                         "text": f"text-{p}-{i}",
                         "token_ids": toks,
                         "prompt_token_ids": list(ids),
-                        "finish_reason": self.finish_reasons[(p * n + i) % len(self.finish_reasons)],
+                        "finish_reason": finish if len(toks) == 3 else "length",
                         "logprobs": None,
                     }
                     if body.get("logprobs") is not None:
                         choice["logprobs"] = {
-                            "text_offset": [0, 1, 2],
-                            "token_logprobs": [-(k + 1) / 10 for k in range(3)],
+                            "text_offset": list(range(len(toks))),
+                            "token_logprobs": [-(k + 1) / 10 for k in range(len(toks))],
                             "tokens": [f"t{t}" for t in toks],
-                            "top_logprobs": [None] * 3,
+                            "top_logprobs": [None] * len(toks),
                         }
                     choices.append(choice)
             if self.shuffle:
@@ -144,6 +147,92 @@ def test_completions_request_body_and_parsing(client: VllmServerClient, server: 
     assert out[1][1].token_ids == [1, 1, 7]
     assert out[0][0].logprobs == pytest.approx([-0.1, -0.2, -0.3])
     assert out[0][0].prompt_token_ids == [4, 5] and out[1][0].prompt_token_ids == chat_ids
+
+
+class HeldCompletionServer(httpx.AsyncBaseTransport):
+    """Answers the completion requests like ``server``, but none before ``expect`` of them have
+    arrived, and the latest first."""
+
+    def __init__(self, server: FakeServer, expect: int) -> None:
+        self.server, self.expect = server, expect
+        self.arrived = 0
+        self.answered: list[int] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        if request.url.path != "/v1/completions":
+            return self.server.handler(request)
+        position, self.arrived = self.arrived, self.arrived + 1
+        async with asyncio.timeout(10):  # a client sending one at a time ends here
+            while self.arrived < self.expect:
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0.02 * (self.expect - position))
+        self.answered.append(position)
+        return self.server.handler(request)
+
+
+def test_prompts_are_one_completion_request_per_distinct_cap_in_flight_together(
+    server: FakeServer, vllm_config: RunConfig
+) -> None:
+    """``/v1/completions`` has one ``max_tokens`` per request: the prompts of a call with caps of
+    their own are grouped by cap, the groups are sent at once, and every prompt gets the
+    completions of its own request back."""
+    held = HeldCompletionServer(server, expect=3)
+    vllm_config.rollout.extra = {"mode": "server", "url": "http://vllm.test:8000", "model_name": "policy"}
+    client = VllmServerClient(vllm_config, transport=held)
+    prompts = [[10], [11], [12], [13], [14]]
+    params = SamplingParams(n=2, max_new_tokens=9, temperature=0.5)
+    try:
+        out = client.generate(prompts, params, max_new_tokens=[2, 9, 2, 1, 9])
+        bodies = [json.loads(r.content) for r in server.requests if r.url.path == "/v1/completions"]
+        assert held.answered == [2, 1, 0]  # all three were waiting; answered in another order
+        assert sorted((b["max_tokens"], b["prompt"]) for b in bodies) == [
+            (1, [[13]]),
+            (2, [[10], [12]]),
+            (9, [[11], [14]]),
+        ]
+        assert {(b["n"], b["temperature"], b["logprobs"]) for b in bodies} == {(2, 0.5, 0)}
+        assert [group[0].prompt_token_ids for group in out] == prompts
+        assert [[len(c.token_ids) for c in group] for group in out] == [
+            [2, 2],
+            [3, 3],
+            [2, 2],
+            [1, 1],
+            [3, 3],
+        ]
+        assert [[c.finish_reason for c in group] for group in out] == [
+            ["length"] * 2,
+            ["stop"] * 2,
+            ["length"] * 2,
+            ["length"] * 2,
+            ["stop"] * 2,
+        ]
+        assert [c.text for c in out[2]] == ["text-1-0", "text-1-1"]  # second prompt of its request
+        assert out[4][1].token_ids == [1, 1, 7] and out[3][0].logprobs == pytest.approx([-0.1])
+
+        # caps that are all the same are one request, as a call without caps is
+        server.requests.clear()
+        held.expect = 1
+        client.generate(prompts, params, max_new_tokens=[4] * 5)
+        (body,) = [json.loads(r.content) for r in server.requests]
+        assert body["max_tokens"] == 4 and body["prompt"] == prompts
+    finally:
+        client.shutdown()
+
+
+def test_cancel_disconnects_the_completion_request_of_every_cap(loopback) -> None:
+    web, client = loopback
+    web.stall = True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        running = pool.submit(client.generate, [[1], [2]], SamplingParams(n=1), max_new_tokens=[3, 5])
+        assert [web.stalled.get(timeout=5) for _ in range(2)] == ["/v1/completions"] * 2
+        client.cancel()
+        with pytest.raises(GenerationCancelled):
+            running.result(timeout=5)
+    assert [web.disconnects.get(timeout=5) for _ in range(2)] == ["/v1/completions"] * 2
+    web.stall = False
+    out = client.generate([[4, 5]], SamplingParams(n=2))
+    assert [c.text for c in out[0]] == ["text-0-0", "text-0-1"]
 
 
 def test_completions_without_logprobs_and_finish_reasons(

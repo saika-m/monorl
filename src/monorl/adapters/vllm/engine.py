@@ -15,6 +15,10 @@ Built against vLLM v0.33.0:
   drives the same loop itself; between two steps it honours ``cancel()`` with
   ``LLMEngine.abort_request(request_ids, internal=True)`` (``vllm/v1/engine/llm_engine.py``), the
   call upstream uses to roll back a failed enqueue.
+* ``sampling_params`` of ``LLM.generate`` / ``LLM.enqueue`` is one ``SamplingParams`` for every
+  prompt or a sequence with one per prompt (``OfflineInferenceMixin._params_to_seq``, which
+  rejects a sequence of another length): prompts with caps of their own get a ``SamplingParams``
+  with their ``max_tokens``, in the same call.
 * ``vllm/inputs/llm.py`` ``TokensPrompt(prompt_token_ids=..., multi_modal_data={"image": [...]})``;
   multimodal chats are tokenised with the model's ``AutoProcessor`` chat template (same recipe as
   ``monorl.rollout.hf_engine``) so the ids carry the image placeholder tokens vLLM expands.
@@ -65,7 +69,7 @@ from monorl.adapters.vllm.common import (
 )
 from monorl.config.schema import RunConfig
 from monorl.core.errors import BackendUnavailable, ConfigError, GenerationCancelled
-from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats
+from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats, prompt_caps
 from monorl.mtp import checkpoint_key, is_wire_name
 
 log = logging.getLogger(__name__)
@@ -205,11 +209,18 @@ class VllmEngine:
         """The underlying ``vllm.LLM`` (for weight-sync strategies that need ``collective_rpc``)."""
         return self._llm
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if not prompts:
             return []
         from vllm.inputs import TokensPrompt
 
+        caps = prompt_caps(params, len(prompts), max_new_tokens)
         cancelled = threading.Event()
         with self._calls_lock:
             self._calls.add(cancelled)
@@ -218,7 +229,9 @@ class VllmEngine:
             encoded = [encode_prompt(self._tokenizer, processor, p) for p in prompts]
             ids = [e[0] for e in encoded]
             vllm_prompts = [TokensPrompt(**tokens_prompt_kwargs(p_ids, images)) for p_ids, images in encoded]
-            sp = self._vllm.SamplingParams(**sampling_kwargs(params))
+            # One SamplingParams per distinct cap, shared by its prompts as upstream shares a single one.
+            by_cap = {cap: self._vllm.SamplingParams(**sampling_kwargs(params, cap)) for cap in set(caps)}
+            sp = by_cap[caps[0]] if len(by_cap) == 1 else [by_cap[cap] for cap in caps]
             with self._lock:
                 if cancelled.is_set():  # while encoding or waiting for another generate
                     raise GenerationCancelled("generation cancelled")

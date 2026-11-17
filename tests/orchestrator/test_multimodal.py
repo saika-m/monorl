@@ -167,9 +167,11 @@ class _RecordingEngine:
     def tokenizer(self) -> Any:
         return self.inner.tokenizer
 
-    def generate(self, prompts: Any, params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Any, params: SamplingParams, *, max_new_tokens: Any = None
+    ) -> list[list[Completion]]:
         self.prompt_kinds.extend("chat" if p and isinstance(p[0], dict) else "ids" for p in prompts)
-        return self.inner.generate(prompts, params)
+        return self.inner.generate(prompts, params, max_new_tokens=max_new_tokens)
 
 
 def _image_sample() -> Sample:

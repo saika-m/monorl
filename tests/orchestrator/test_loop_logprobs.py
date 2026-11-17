@@ -25,8 +25,10 @@ class FlagEngine(fakes.FakeEngine):
         self.logprobs_shipped = 0
         super().__init__(config, replica, **kwargs)
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
-        out = super().generate(prompts, params)
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
+        out = super().generate(prompts, params, max_new_tokens=max_new_tokens)
         with self._lock:
             self.requests.append((params.temperature, params.logprobs))
             for completion in (c for group in out for c in group):

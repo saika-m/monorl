@@ -14,7 +14,7 @@ from typing import Any
 import torch
 
 from monorl.core.batch import TrainBatch
-from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats
+from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats, prompt_caps
 
 SHAPES = {"model.embed.weight": (8, 4), "model.layers.0.proj.weight": (4, 4)}
 
@@ -45,19 +45,26 @@ class FakeEngine:
         done, self.completions = self.completions, 0
         return SpeculationStats(steps=done, drafted=done, accepted=done, emitted=2 * done)
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         tag = f"w={weight_sum(self.weights):.6f}"
         self.completions += len(prompts) * params.n
         return [
             [
                 Completion(
                     text=f"{tag} p={i} n={k}",
-                    token_ids=[i, k],
-                    logprobs=[0.0, 0.0] if params.logprobs else None,
+                    token_ids=[i, k][:cap],
+                    logprobs=[0.0, 0.0][:cap] if params.logprobs else None,
+                    finish_reason="stop" if cap >= 2 else "length",
                 )
                 for k in range(params.n)
             ]
-            for i, _ in enumerate(prompts)
+            for i, cap in enumerate(prompt_caps(params, len(prompts), max_new_tokens))
         ]
 
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:

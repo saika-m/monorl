@@ -68,6 +68,18 @@ class RolloutEngine(Protocol):
     ``Completion.text`` (``finish_reason == "stop"``): environments parse closing tags such as
     ``</tool_call>`` from it, and a chat re-rendered from the text has to match the sampled tokens.
 
+    ``max_new_tokens`` gives every prompt of the call a generation cap of its own: with it,
+    ``max_new_tokens[i]`` (at least 1) takes the place of ``params.max_new_tokens`` for prompt
+    ``i``, for each of its ``params.n`` completions. An engine never generates past a prompt's
+    cap, and a completion that the cap ends has ``finish_reason == "length"``: the cap is what
+    keeps a prompt and its completion inside a context budget when the prompts of a call have
+    different lengths (the turns of multi-turn episodes). It is an argument of the call and not a
+    field of :class:`SamplingParams` because it belongs to the prompts: the parameters stay one
+    value that every prompt of the call shares, so callers batch the prompts that agree on them
+    (:class:`~monorl.rollout.BatchingEngine`, the episode runner), and an engine that does not
+    know the argument rejects the call instead of generating past the caps.
+    :func:`~monorl.core.types.prompt_caps` resolves the cap of every prompt.
+
     Optional capability (duck-typed, not a protocol member): ``cancel() -> None`` aborts the
     ``generate`` calls that are in flight — they raise
     :class:`~monorl.core.errors.GenerationCancelled` instead of returning — without shutting the
@@ -86,7 +98,13 @@ class RolloutEngine(Protocol):
     every update carries all weights.
     """
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]: ...
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]: ...
 
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Hot-swap policy weights (HF parameter names, merged LoRA). Names that start with

@@ -7,7 +7,8 @@ follows the multi-turn loop from its docstring; an :class:`~monorl.core.interfac
 Turn batching (``rollout.turn_batching``). ``lockstep``: the episodes of an engine take their
 turns together. Environment work (``reset``, ``step``, rendering the next prompt) runs on a thread
 pool; once every running episode of the engine has its next prompt, the prompts go to the engine
-as one ``generate`` call per distinct :class:`SamplingParams`, in the order of the specs. Which
+as one ``generate`` call, in the order of the specs (the turns differ in nothing but the tokens
+they may still generate, which the call carries per prompt). Which
 prompts share a call, and in which order, therefore never depends on timing, and neither does the
 set of running episodes: a finished episode's place is taken by the next spec before the next
 call. A run with a fixed seed repeats as long as its environments and engines are deterministic.
@@ -43,7 +44,8 @@ one processor pass per turn and forgoes prefix caching. Tool schemas cannot be p
 rejected.
 
 Context budget (``max_context_tokens``): no prompt plus completion of a turn may exceed it. A
-turn's generation is capped to the room that is left; an episode whose next prompt leaves no room
+turn's generation is capped to the room that is left (a cap of its prompt in the engine call, see
+``max_new_tokens`` of :meth:`RolloutEngine.generate`); an episode whose next prompt leaves no room
 ends there with what it has (``Trajectory.info["context_exhausted"]``, ``done=False``); a first
 prompt that does not fit is a failure of the episode. Multimodal prompts are tokenised by the
 engine, so the budget is not applied to them.
@@ -59,7 +61,6 @@ there and left out of the result.
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import logging
 import threading
 from collections import deque
@@ -80,7 +81,6 @@ from monorl.core.types import (
     Turn,
     messages_have_media,
 )
-from monorl.rollout.batching import params_key
 from monorl.rollout.render import chat_prompt_ids, continue_prompt_ids
 
 log = logging.getLogger(__name__)
@@ -98,8 +98,9 @@ ENVIRONMENT_THREADS = 64
 """Threads for the environment work of episodes that take their turns in lockstep: between two
 engine calls an episode needs one only for its ``step`` and its next prompt."""
 
-_Request = tuple[PromptInput, SamplingParams]
-"""What an episode asks the engine for: one prompt and the sampling parameters of that turn."""
+_Request = tuple[PromptInput, int]
+"""What an episode asks the engine for: one prompt and the most tokens that turn may generate
+(the ``max_new_tokens`` of the episodes' sampling parameters, or less under a context budget)."""
 
 
 @dataclass(slots=True)
@@ -145,10 +146,16 @@ def run_episode(
     )[0]
 
 
-def _ask(spec: EpisodeSpec, prompts: Sequence[PromptInput], params: SamplingParams) -> list[Completion]:
-    """One completion per prompt from the spec's engine; ``spec`` names the call in errors."""
+def _ask(
+    spec: EpisodeSpec, prompts: Sequence[PromptInput], params: SamplingParams, caps: Sequence[int]
+) -> list[Completion]:
+    """One completion per prompt from the spec's engine, of at most ``caps[i]`` tokens for prompt
+    ``i``; ``spec`` names the call in errors."""
     try:
-        outputs = spec.engine.generate(prompts, params)
+        if all(cap == params.max_new_tokens for cap in caps):
+            outputs = spec.engine.generate(prompts, params)
+        else:
+            outputs = spec.engine.generate(prompts, params, max_new_tokens=list(caps))
     except GenerationCancelled as e:
         raise EpisodeAborted(f"episode {spec.group_id} aborted during generation") from e
     except Exception as e:
@@ -161,12 +168,14 @@ def _ask(spec: EpisodeSpec, prompts: Sequence[PromptInput], params: SamplingPara
     return [completions[0] for completions in outputs]
 
 
-def _drive(turns: Generator[_Request, Completion, Trajectory], spec: EpisodeSpec) -> Trajectory:
+def _drive(
+    turns: Generator[_Request, Completion, Trajectory], spec: EpisodeSpec, params: SamplingParams
+) -> Trajectory:
     """Run an episode's turns to the end, asking the engine for one completion at a time."""
     try:
-        prompt, params = next(turns)
+        prompt, cap = next(turns)
         while True:
-            prompt, params = turns.send(_ask(spec, [prompt], params)[0])
+            prompt, cap = turns.send(_ask(spec, [prompt], params, [cap])[0])
     except StopIteration as stop:
         return stop.value
 
@@ -195,7 +204,7 @@ def _turns(
         if abort is not None and abort.is_set():
             raise EpisodeAborted(f"episode {spec.group_id} aborted")
         prompt: PromptInput
-        turn_params = params
+        cap = params.max_new_tokens
         multimodal = messages_have_media(messages)
         if multimodal and tools is not None:
             raise MonorlError(
@@ -227,9 +236,8 @@ def _turns(
                         )
                     context_exhausted = True
                     break
-                if room < params.max_new_tokens:
-                    turn_params = dataclasses.replace(params, max_new_tokens=room)
-        completion = yield prompt, turn_params
+                cap = min(cap, room)
+        completion = yield prompt, cap
         if completion.prompt_token_ids is not None:
             prompt_ids = list(completion.prompt_token_ids)
         elif multimodal:
@@ -250,7 +258,7 @@ def _turns(
         )
         messages.extend(result.messages)
         done = bool(result.done)
-        if completion.finish_reason == "length" and turn_params is not params:
+        if completion.finish_reason == "length" and cap < params.max_new_tokens:
             context_exhausted = True  # cut short by the budget, not by rollout.max_new_tokens
         if done or completion.finish_reason in ("length", "error"):
             break
@@ -450,7 +458,7 @@ class _Run:
                         episode.turns = turns
                         result = self._next(turns, None)
                     else:
-                        result = _drive(turns, spec)
+                        result = _drive(turns, spec, self.params)
             if isinstance(result, Trajectory):
                 self._close(episode)
             return result
@@ -516,25 +524,19 @@ class _Run:
         self.outcome.halt.set()
 
     def _generate(self, waiting: Sequence[_Live]) -> None:
-        """One engine call per distinct sampling parameters for the episodes that wait for their
-        turn (in spec order); every episode goes back to its environment with its completion."""
-        calls: dict[tuple[Any, ...], list[_Live]] = {}
-        for episode in waiting:
-            assert episode.request is not None
-            calls.setdefault(params_key(episode.request[1]), []).append(episode)
-        for episodes in calls.values():
-            first = episodes[0]
-            assert first.request is not None
-            try:
-                completions = _ask(
-                    first.spec, [e.request[0] for e in episodes if e.request is not None], first.request[1]
-                )
-            except (EpisodeAborted, GenerationFailed) as e:
-                self._fatal(first.index, e)
-                return
-            for episode, completion in zip(episodes, completions, strict=True):
-                episode.request = None
-                self._work(episode, completion)
+        """One engine call for the episodes that wait for their turn (in spec order), each prompt
+        with the cap of its turn; every episode goes back to its environment with its completion."""
+        requests = [episode.request for episode in waiting if episode.request is not None]
+        try:
+            completions = _ask(
+                waiting[0].spec, [prompt for prompt, _ in requests], self.params, [cap for _, cap in requests]
+            )
+        except (EpisodeAborted, GenerationFailed) as e:
+            self._fatal(waiting[0].index, e)
+            return
+        for episode, completion in zip(waiting, completions, strict=True):
+            episode.request = None
+            self._work(episode, completion)
 
 
 def run_episodes(

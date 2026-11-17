@@ -217,17 +217,18 @@ class ChatServer:
         if request.url.path == "/v1/chat/completions":
             n = body["n"]
             choices = []
+            cap = body["max_completion_tokens"]  # two tokens per completion, or as many as it allows
             for i in reversed(range(n)):
                 choice: dict[str, Any] = {
                     "index": i,
                     "message": {"role": "assistant", "content": f"chat-{i}"},
-                    "token_ids": [i, 5],
-                    "finish_reason": "stop",
+                    "token_ids": [i, 5][:cap],
+                    "finish_reason": "stop" if cap >= 2 else "length",
                     "logprobs": None,
                 }
                 if body.get("logprobs"):
                     choice["logprobs"] = {
-                        "content": [{"token": "a", "logprob": -0.5}, {"token": "b", "logprob": -0.25}]
+                        "content": [{"token": "a", "logprob": -0.5}, {"token": "b", "logprob": -0.25}][:cap]
                     }
                 choices.append(choice)
             return httpx.Response(
@@ -293,6 +294,28 @@ def test_client_routes_image_prompts_through_chat_completions(
         -0.2,
     ]  # text prompt took /v1/completions
     assert out[2][1].token_ids == [1, 5]
+
+
+def test_an_image_prompt_with_a_cap_of_its_own_asks_for_that_many_tokens(
+    vllm_config: RunConfig, image_path: Path
+) -> None:
+    vllm_config.rollout.extra = {"mode": "server", "url": "http://vllm.test:8000", "model_name": "policy"}
+    server = ChatServer()
+    client = VllmServerClient(vllm_config, transport=httpx.MockTransport(server.handler))
+    try:
+        out = client.generate(
+            [_chat(image_path), [1, 2, 3], _chat(image_path)],
+            SamplingParams(n=2, logprobs=True, max_new_tokens=4),
+            max_new_tokens=[1, 3, 4],
+        )
+    finally:
+        client.shutdown()
+    bodies = [(r.url.path, json.loads(r.content)) for r in server.requests]
+    assert [b["max_completion_tokens"] for path, b in bodies if path == "/v1/chat/completions"] == [1, 4]
+    assert [b["max_tokens"] for path, b in bodies if path == "/v1/completions"] == [3]
+    assert [[c.token_ids for c in group] for group in out] == [[[0], [1]], [[0, 0], [0, 1]], [[0, 5], [1, 5]]]
+    assert [c.finish_reason for c in out[0]] == ["length"] * 2 and out[0][0].logprobs == [-0.5]
+    assert [c.finish_reason for c in out[2]] == ["stop"] * 2
 
 
 # -- server mode: concurrent chat requests, images encoded once ----------------------------------

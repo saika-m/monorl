@@ -93,7 +93,13 @@ class StateEngine(FakeEngine):
             if name == MTP_NAME:
                 tensor.zero_()
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         return [[Completion(text=json.dumps(fingerprint(self.held)), token_ids=[])] for _ in prompts]
 
 

@@ -12,7 +12,9 @@ Endpoints used (vLLM v0.33.0 unless noted):
   ``SamplingParams.top_logprobs = k``: ``logprobs=k`` and ``return_tokens_as_token_ids=true`` →
   ``choices[i].logprobs.top_logprobs`` (``{"token_id:<id>": logprob}`` per position). The server
   must allow that many: ``--max-logprobs`` ≥ ``k`` (``k + 1`` for the chat endpoint; default 20)
-  and ``--logprobs-mode processed_logprobs``.
+  and ``--logprobs-mode processed_logprobs``. A request has one ``max_tokens`` for all its
+  prompts (``CompletionRequest.max_tokens``), so the text prompts of a ``generate`` call go out
+  as one request per distinct cap, in flight together.
 * ``POST /v1/chat/completions`` (``vllm/entrypoints/openai/chat_completion/protocol.py``) for
   prompts with image parts: ``messages`` with ``image_url`` data URLs, ``logprobs=true,
   top_logprobs=0`` and ``return_token_ids=true``. The chat endpoint's logprob entries only carry
@@ -74,7 +76,7 @@ from monorl.adapters.vllm.common import (
 )
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, GenerationCancelled
-from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats
+from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats, prompt_caps
 from monorl.mtp import checkpoint_key, is_wire_name
 
 log = logging.getLogger(__name__)
@@ -134,8 +136,10 @@ class VllmServerClient:
     server holds of an update at a time, unless a single tensor is larger) and
     ``image_cache_bytes`` (bound on the image data URLs kept for re-sending, default 256 MiB).
 
-    Prompts with images are one chat request each, sent together: a server-side error of any of
-    them fails the call with that request's error and drops the others.
+    Text prompts are one completion request per distinct generation cap (one request, unless
+    the call carries caps per prompt) and prompts with images one chat request each. The requests
+    of a kind are sent together: a server-side error of any of them fails the call with that
+    request's error and drops the others.
 
     ``cancel()`` disconnects the completion requests in flight, which makes the server abort
     their generation, and fails the ``generate`` calls waiting for the lock; all of them raise
@@ -207,10 +211,20 @@ class VllmServerClient:
     def url(self) -> str:
         return self._url
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if not prompts:
             return []
-        text_idx = [i for i, p in enumerate(prompts) if not is_media_prompt(p)]
+        caps = prompt_caps(params, len(prompts), max_new_tokens)
+        text_idx: dict[int, list[int]] = {}  # generation cap -> its text prompts
+        for i, p in enumerate(prompts):
+            if not is_media_prompt(p):
+                text_idx.setdefault(caps[i], []).append(i)
         media_idx = [i for i, p in enumerate(prompts) if is_media_prompt(p)]
         result: list[list[Completion] | None] = [None] * len(prompts)
         call = _GenerateCall()
@@ -220,31 +234,38 @@ class VllmServerClient:
             with self._lock:
                 self._wake(_ALL_TAGS)
                 if text_idx:
-                    ids = [prompt_token_ids(self._tokenizer, prompts[i]) for i in text_idx]
-                    body: dict[str, Any] = {
-                        "model": self._model_name,
-                        "prompt": ids,
-                        "return_token_ids": True,
-                        **sampling_kwargs(params),
+                    ids = {
+                        cap: [prompt_token_ids(self._tokenizer, prompts[i]) for i in indices]
+                        for cap, indices in text_idx.items()
                     }
-                    if params.top_logprobs > 0:
-                        body["return_tokens_as_token_ids"] = True
-                    resp = self._post("/v1/completions", call=call, json=body)
-                    grouped = completions_from_choices(
-                        resp.json()["choices"],
-                        ids,
-                        params.n,
-                        want_logprobs=params.logprobs,
-                        top_logprobs=params.top_logprobs,
-                    )
-                    for i, comps in zip(text_idx, grouped, strict=True):
-                        result[i] = comps
+                    bodies: list[dict[str, Any]] = []
+                    for cap, cap_ids in ids.items():
+                        body: dict[str, Any] = {
+                            "model": self._model_name,
+                            "prompt": cap_ids,
+                            "return_token_ids": True,
+                            **sampling_kwargs(params, cap),
+                        }
+                        if params.top_logprobs > 0:
+                            body["return_tokens_as_token_ids"] = True
+                        bodies.append(body)
+                    responses = self._run(self._post_each("/v1/completions", bodies), call)
+                    for (cap, indices), resp in zip(text_idx.items(), responses, strict=True):
+                        grouped = completions_from_choices(
+                            resp.json()["choices"],
+                            ids[cap],
+                            params.n,
+                            want_logprobs=params.logprobs,
+                            top_logprobs=params.top_logprobs,
+                        )
+                        for i, comps in zip(indices, grouped, strict=True):
+                            result[i] = comps
                 if media_idx:
                     bodies = [
                         {
                             "model": self._model_name,
                             "messages": chat_completion_messages(prompts[i], self._images),  # type: ignore[arg-type]
-                            **chat_completion_kwargs(params),
+                            **chat_completion_kwargs(params, caps[i]),
                         }
                         for i in media_idx
                     ]
@@ -387,15 +408,12 @@ class VllmServerClient:
         self._post("/wake_up", params=[("tags", t) for t in pending])
         self._sleeping_tags.difference_update(pending)
 
-    def _post(self, path: str, *, call: _GenerateCall | None = None, **kwargs: Any) -> httpx.Response:
-        return self._request("POST", path, call=call, **kwargs)
+    def _post(self, path: str, **kwargs: Any) -> httpx.Response:
+        return self._request("POST", path, **kwargs)
 
-    def _request(
-        self, method: str, path: str, *, call: _GenerateCall | None = None, **kwargs: Any
-    ) -> httpx.Response:
-        """Send a request on the client's event loop and wait for the response. With ``call`` the
-        request belongs to that ``generate`` call and :meth:`cancel` can abandon it."""
-        return self._run(self._send(method, path, **kwargs), call)
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Send a request on the client's event loop and wait for the response."""
+        return self._run(self._send(method, path, **kwargs), None)
 
     def _run(self, sending: Coroutine[Any, Any, _T], call: _GenerateCall | None) -> _T:
         """Run ``sending`` on the client's event loop and wait for its result. With ``call`` it

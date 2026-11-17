@@ -12,7 +12,7 @@ from typing import Any
 import fakes
 import pytest
 
-from monorl.core.types import Completion, Sample, SamplingParams, StepResult
+from monorl.core.types import Completion, Sample, SamplingParams, StepResult, prompt_caps
 from monorl.orchestrator.episodes import EpisodeFailure, EpisodeSpec, run_episodes
 from monorl.rollout import BatchingEngine
 
@@ -28,23 +28,30 @@ class OrderSensitiveEngine:
         self.batches: list[list[str]] = []
         self._lock = threading.Lock()
 
-    def generate(self, prompts: Any, params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Any, params: SamplingParams, *, max_new_tokens: Any = None
+    ) -> list[list[Completion]]:
         texts = [fakes.last_user_text(self.tokenizer.decode(list(p))) for p in prompts]
         with self._lock:
             call = len(self.batches)
             self.batches.append(texts)
         time.sleep(self.latency)
         out = []
+        caps = prompt_caps(params, len(prompts), max_new_tokens)
         for row, prompt in enumerate(prompts):
             text = f"call{call} row{row}"
             ids = self.tokenizer.encode(text) + [self.tokenizer.eos_token_id]
+            cut = len(ids) > caps[row]
+            if cut:
+                ids = ids[: caps[row]]
+                text = self.tokenizer.decode(ids, skip_special_tokens=True)
             out.append(
                 [
                     Completion(
                         text=text,
                         token_ids=ids,
                         logprobs=[-0.1] * len(ids),
-                        finish_reason="stop",
+                        finish_reason="length" if cut else "stop",
                         prompt_token_ids=list(prompt),
                     )
                 ]

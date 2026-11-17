@@ -390,9 +390,9 @@ class Engine:
         base = 1000 + (seed if seed is not None else i * 10 + k)
         n_tokens = min(s.output_len, int(sp.get("max_new_tokens", s.output_len) or s.output_len))
         token_ids = [base + t for t in range(n_tokens)]
-        if s.finish == "stop":
+        if s.finish == "stop" and n_tokens == s.output_len:
             finish: Any = {"type": "stop", "matched": token_ids[-1]}
-        elif s.finish == "length":
+        elif s.finish in ("stop", "length"):  # cut by the request's max_new_tokens, or scripted
             finish = {"type": "length", "length": n_tokens}
         elif s.finish == "abort":
             finish = {"type": "abort", "message": "aborted"}

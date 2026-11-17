@@ -48,9 +48,12 @@ them and the extension points. Setup, checks, testing rules and conventions are 
 
 ### Component protocols — `src/monorl/core/interfaces.py`
 Read the file. Key points:
-- `RolloutEngine.generate(prompts, params) -> list[list[Completion]]`: exactly `params.n`
-  completions per prompt, order preserved; prompts are chats **or** raw token ids; when
-  `params.logprobs` is true every completion carries per-token logprobs under the sampling policy.
+- `RolloutEngine.generate(prompts, params, *, max_new_tokens=None) -> list[list[Completion]]`:
+  exactly `params.n` completions per prompt, order preserved; prompts are chats **or** raw token
+  ids; when `params.logprobs` is true every completion carries per-token logprobs under the
+  sampling policy. `max_new_tokens` is an optional generation cap per prompt, in place of
+  `params.max_new_tokens`: the turns of episodes with different room left in their context budget
+  share a call, and no engine generates past a prompt's cap.
   Optional, duck-typed capabilities: `cancel()` (abort the calls in flight) and
   `speculation_stats() -> SpeculationStats | None` (drafting counters since the previous call,
   for engines that decode speculatively).

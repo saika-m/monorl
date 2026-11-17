@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -114,6 +115,37 @@ def test_generate_mixed_prompts_preserve_order(engine):
     assert [len(g) for g in groups] == [3, 3, 3]
     assert [c.text.split("-")[1] for g in groups for c in g] == ["0"] * 3 + ["1"] * 3 + ["2"] * 3
     assert groups[0][0].prompt_token_ids == [1, 2, 3] and groups[2][0].prompt_token_ids == [9]
+
+
+def test_prompts_with_caps_of_their_own_are_one_call_with_sampling_params_per_request(engine):
+    """``Engine.async_generate`` takes one ``sampling_params`` dict per request: the prompts of a
+    call differ in ``max_new_tokens`` and in nothing else, and none generates past its own."""
+    params = SamplingParams(n=2, max_new_tokens=7, temperature=0.5)
+    groups = engine.generate([[1, 2], [3], [4]], params, max_new_tokens=[1, 7, 2])
+    calls = [call for call in fake_of(engine).calls if call.method == "async_generate"]
+    assert len(calls) == 1 and calls[0].kwargs["input_ids"] == [[1, 2], [3], [4]]
+    sent = calls[0].kwargs["sampling_params"]
+    assert [sp["max_new_tokens"] for sp in sent] == [1, 7, 2]
+    assert {(sp["n"], sp["temperature"]) for sp in sent} == {(2, 0.5)}
+    # the fake's answers have three tokens
+    assert [[len(c.token_ids) for c in g] for g in groups] == [[1, 1], [3, 3], [2, 2]]
+    assert [[c.finish_reason for c in g] for g in groups] == [["length"] * 2, ["stop"] * 2, ["length"] * 2]
+    assert [[len(c.logprobs) for c in g] for g in groups] == [[1, 1], [3, 3], [2, 2]]
+    assert [g[0].prompt_token_ids for g in groups] == [[1, 2], [3], [4]]
+
+    # with a seed a prompt is n requests: each of them has the cap of its prompt
+    groups = engine.generate([[1, 2], [3]], dataclasses.replace(params, seed=42), max_new_tokens=[1, 2])
+    call = fake_of(engine).calls[-1]
+    assert call.kwargs["input_ids"] == [[1, 2], [1, 2], [3], [3]]
+    assert [(sp["max_new_tokens"], sp["sampling_seed"]) for sp in call.kwargs["sampling_params"]] == [
+        (1, 42),
+        (1, 43),
+        (2, 42),
+        (2, 43),
+    ]
+    assert [[len(c.token_ids) for c in g] for g in groups] == [[1, 1], [2, 2]]
+    with pytest.raises(ValueError, match="1 max_new_tokens for 2 prompts"):
+        engine.generate([[1, 2], [3]], params, max_new_tokens=[4])
 
 
 def test_generate_with_seed_fans_out_requests(engine):

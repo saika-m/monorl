@@ -129,7 +129,7 @@ def test_stop_string_sets_finish_reason(engine: HFRolloutEngine) -> None:
 
 
 def test_finish_recorder_counts_the_tokens_up_to_eos() -> None:
-    rec = _FinishRecorder(3, eos_ids=[2], stop=None)
+    rec = _FinishRecorder([9] * 3, eos_ids=[2], stop=None)
     ids = torch.tensor([[5, 2], [5, 6], [2, 2]])
     assert rec(ids[:, :1], None).tolist() == [False, False, True]
     assert rec(ids, None).tolist() == [True, False, True]
@@ -139,7 +139,7 @@ def test_finish_recorder_counts_the_tokens_up_to_eos() -> None:
 
 
 def test_finish_recorder_ends_the_call_for_the_rows_that_go_on() -> None:
-    rec = _FinishRecorder(3, eos_ids=[2], stop=None, slack=0)
+    rec = _FinishRecorder([9] * 3, eos_ids=[2], stop=None, slack=0)
     ids = torch.tensor([[5, 7, 2], [5, 2, 2], [6, 6, 2]])
     assert rec(ids[:, :1], None).tolist() == [False, False, False]
     assert rec(ids[:, :2], None).tolist() == [True, True, True]  # one row finished, two go on
@@ -154,7 +154,7 @@ def test_finish_recorder_lets_finished_rows_cost_what_ending_the_call_costs() ->
     """With a slack of 4 forward passes of a row, a call of 4 rows goes on for 4 steps after one row
     has finished, or for 2 after two have, and is then ended for the others."""
     for finished, steps_after in ((1, 4), (2, 2)):
-        rec = _FinishRecorder(4, eos_ids=[2], stop=None, slack=4)
+        rec = _FinishRecorder([9] * 4, eos_ids=[2], stop=None, slack=4)
         ids = torch.tensor([[2]] * finished + [[5]] * (4 - finished))
         verdicts = [rec(ids, None).tolist()]
         while not rec.cut:
@@ -167,7 +167,7 @@ def test_finish_recorder_lets_finished_rows_cost_what_ending_the_call_costs() ->
 
 
 def test_finish_recorder_without_slack_runs_to_the_last_row() -> None:
-    rec = _FinishRecorder(2, eos_ids=[2], stop=None)
+    rec = _FinishRecorder([9] * 2, eos_ids=[2], stop=None)
     ids = torch.tensor([[2, 2, 2], [5, 5, 2]])
     assert [rec(ids[:, :k], None).tolist() for k in (1, 2, 3)] == [[True, False], [True, False], [True, True]]
     assert not rec.cut and rec.num_tokens == [1, 3]

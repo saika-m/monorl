@@ -6,6 +6,7 @@ reasons, token counts, stop strings, seeds, the distribution that is sampled fro
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -119,6 +120,70 @@ def test_rows_that_outlive_others_keep_logprobs_reasons_and_counts(
     assert [[(c.token_ids, c.logprobs) for c in g] for g in again] == [
         [(c.token_ids, c.logprobs) for c in g] for g in out
     ]
+
+
+def test_rows_with_caps_of_their_own_end_there_and_leave_the_batch(engine: HFRolloutEngine) -> None:
+    """One call, a generation cap per prompt (the turns of episodes with different room left in
+    their context budget). The random model never ends a row itself here, so every row ends at the
+    cap of its prompt, and from then on is in no forward pass."""
+    caps = [3, 20, 9, 1]
+    prompts = [CHATS[0], CHATS[1], CHATS[1], CHATS[0]]
+    params = SamplingParams(n=2, max_new_tokens=20, temperature=1.0, seed=6, top_logprobs=3)
+    with _forward_rows(engine.model) as rows:
+        out = engine.generate(prompts, params, max_new_tokens=caps)
+    assert [[len(c.token_ids) for c in group] for group in out] == [[cap] * 2 for cap in caps]
+    assert rows == [8] + [6] * 2 + [4] * 6 + [2] * 11  # pass t: the rows with a token t + 1
+    for chat, cap, group in zip(prompts, caps, out, strict=True):
+        for c in group:
+            assert c.finish_reason == "length"
+            assert c.prompt_token_ids == chat_prompt_ids(engine.tokenizer, chat)
+            assert c.text == engine.tokenizer.decode(c.token_ids, skip_special_tokens=True)
+            assert len(c.top_logprobs) == cap
+            capped = dataclasses.replace(params, max_new_tokens=cap)
+            _assert_row(c, _teacher_forced(engine.model, c, 1.0), capped, engine._eos_ids)
+    # the caps alone say where a row ends: they are those of the parameters when all are equal
+    uniform = engine.generate(prompts[:2], dataclasses.replace(params, max_new_tokens=5))
+    assert engine.generate(prompts[:2], params, max_new_tokens=[5, 5]) == uniform
+    with pytest.raises(ValueError, match="2 max_new_tokens for 4 prompts"):
+        engine.generate(prompts, params, max_new_tokens=[3, 4])
+    with pytest.raises(ValueError, match=">= 1"):
+        engine.generate(prompts[:2], params, max_new_tokens=[3, 0])
+
+
+@pytest.mark.parametrize("greedy", [False, True], ids=["sampled", "greedy"])
+def test_rows_end_at_their_cap_or_before_it(engine: HFRolloutEngine, greedy: bool) -> None:
+    """Rows that end with EOS next to rows that end at caps of their own: each ends at whichever
+    comes first, with the reason for it, and is computed no further."""
+    caps = [2, 24, 6, 12]
+    prompts = [CHATS[0], CHATS[1], CHATS[1], CHATS[0]]
+    params = SamplingParams(n=1 if greedy else 3, max_new_tokens=24, seed=9, top_logprobs=2)
+    eos: Iterable[int] = set(range(0, len(engine.tokenizer), EVERY))
+    whole: list[Completion] = []
+    if greedy:
+        # The random model repeats a token for some steps. The first other token of the second row
+        # ends a row: that one long before its cap, the third (the same prompt) at its cap.
+        params.temperature, params.repetition_penalty = 0.0, 1.5
+        whole = [group[0] for group in engine.generate(prompts, params)]
+        ending_token = next(token for token in whole[1].token_ids if token != whole[1].token_ids[0])
+        eos, caps[2] = {ending_token}, whole[1].token_ids.index(ending_token) + 1
+    ending = _ending(engine, eos)
+    with _forward_rows(engine.model) as rows:
+        out = ending.generate(prompts, params, max_new_tokens=caps)
+    completions = [c for group in out for c in group]
+    assert rows == _needed_rows(completions)
+    reasons = set()
+    for cap, group in zip(caps, out, strict=True):
+        for c in group:
+            assert len(c.token_ids) <= cap
+            capped = dataclasses.replace(params, max_new_tokens=cap)
+            _assert_row(c, _teacher_forced(engine.model, c, params.temperature or 1.0), capped, eos)
+            reasons.add((c.finish_reason, len(c.token_ids) == cap))
+    assert ("length", True) in reasons and ("stop", False) in reasons
+    if greedy:  # the tokens of the batch in which no row ends, as far as the row goes
+        assert [c.token_ids for c in completions] == [
+            c.token_ids[: len(row.token_ids)] for c, row in zip(whole, completions, strict=True)
+        ]
+        assert (completions[2].finish_reason, len(completions[2].token_ids)) == ("stop", caps[2])
 
 
 def test_greedy_rows_are_those_of_a_batch_in_which_no_row_ends(engine: HFRolloutEngine) -> None:
@@ -317,6 +382,14 @@ def test_rows_of_a_vlm_end_at_different_steps(
     for chat, group in zip(prompts, out, strict=True):
         for c in group:
             _assert_row(c, _vlm_teacher_forced(vlm_engine, chat, c), params, eos)
+    # ... and so do rows that end at a cap of their own, which stay in the batch like the others
+    caps = [2, 16, 5]
+    out = vlm_engine.generate(prompts, params, max_new_tokens=caps)
+    for chat, cap, group in zip(prompts, caps, out, strict=True):
+        for c in group:
+            assert len(c.token_ids) == cap and c.finish_reason == "length"
+            capped = dataclasses.replace(params, max_new_tokens=cap)
+            _assert_row(c, _vlm_teacher_forced(vlm_engine, chat, c), capped, vlm_engine._eos_ids)
 
 
 def _vlm_teacher_forced(engine: HFRolloutEngine, chat: list[dict], c: Completion) -> torch.Tensor:

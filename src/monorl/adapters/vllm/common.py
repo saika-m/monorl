@@ -94,8 +94,9 @@ def map_finish_reason(reason: str | None) -> FinishReason:
     return _FINISH_REASONS.get(reason, "error")
 
 
-def sampling_kwargs(params: SamplingParams) -> dict[str, Any]:
+def sampling_kwargs(params: SamplingParams, max_tokens: int | None = None) -> dict[str, Any]:
     """Keyword arguments for ``vllm.SamplingParams`` (also the ``/v1/completions`` body subset).
+    ``max_tokens`` is the cap of the prompts they are for when it is not ``params.max_new_tokens``.
 
     ``logprobs=0`` requests exactly the sampled token's logprob per position; ``None`` disables
     logprob computation entirely; ``params.top_logprobs`` requests that many most likely tokens
@@ -108,7 +109,7 @@ def sampling_kwargs(params: SamplingParams) -> dict[str, Any]:
         logprobs = 0 if params.logprobs else None
     return {
         "n": params.n,
-        "max_tokens": params.max_new_tokens,
+        "max_tokens": params.max_new_tokens if max_tokens is None else max_tokens,
         "temperature": params.temperature,
         "top_p": params.top_p,
         "top_k": 0 if params.top_k < 0 else params.top_k,
@@ -279,8 +280,9 @@ def chat_completion_messages(messages: Sequence[Message], images: ImageUrlCache)
     return out
 
 
-def chat_completion_kwargs(params: SamplingParams) -> dict[str, Any]:
-    """``ChatCompletionRequest`` body subset. ``logprobs=True, top_logprobs=0`` returns exactly the
+def chat_completion_kwargs(params: SamplingParams, max_tokens: int | None = None) -> dict[str, Any]:
+    """``ChatCompletionRequest`` body subset (``max_tokens``: the cap of the request's prompt when
+    it is not ``params.max_new_tokens``). ``logprobs=True, top_logprobs=0`` returns exactly the
     sampled token's logprob per position; ``return_token_ids=True`` adds ``choices[i].token_ids``
     and the response-level ``prompt_token_ids`` (the chat endpoint's logprob entries carry token
     *strings*, so the ids must come from ``return_token_ids``).
@@ -291,7 +293,7 @@ def chat_completion_kwargs(params: SamplingParams) -> dict[str, Any]:
     top = params.top_logprobs
     body: dict[str, Any] = {
         "n": params.n,
-        "max_completion_tokens": params.max_new_tokens,
+        "max_completion_tokens": params.max_new_tokens if max_tokens is None else max_tokens,
         "temperature": params.temperature,
         "top_p": params.top_p,
         "top_k": 0 if params.top_k < 0 else params.top_k,

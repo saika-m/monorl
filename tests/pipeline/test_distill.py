@@ -80,7 +80,7 @@ def test_tool_calling_episode_round_trips_into_sft_on_both_turns(
         [EpisodeSpec(sample=sample, group_id="g", engine=fakes.FakeEngine(config))],
         env_factory=lambda: make_tool_calling_env({"tools": ["calculator"]}, max_turns=4),
         tokenizer=tokenizer,
-        params=SamplingParams(max_new_tokens=64, logprobs=False),
+        params=SamplingParams(max_new_tokens=256, logprobs=False),
         max_parallel=1,
     )
     first, second = trajectory.turns
