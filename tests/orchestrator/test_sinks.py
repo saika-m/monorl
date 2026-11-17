@@ -1,17 +1,35 @@
+"""``MetricSinks``: what W&B and TensorBoard receive next to ``metrics.jsonl``. The tests with
+``packages`` run against fakes of the two packages (``sink_support.py``); the tests at the end run
+against the real ones where they are installed."""
+
 from __future__ import annotations
 
 import builtins
+import importlib.util
+import os
 import sys
-import types
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import fakes
+import numpy as np
 import pytest
-from sink_support import FakeSinkPackages, install_fake_sink_packages, metric_points, tensorboard_points
+import torch
+import yaml
+from sink_support import (
+    FakeSinkPackages,
+    install_fake_sink_packages,
+    metric_points,
+    read_offline_wandb_runs,
+    tensorboard_points,
+)
 
 from monorl.core.reporting import RunReporter
 from monorl.orchestrator import run
 from monorl.orchestrator.sinks import MetricSinks
+
+BOTH = {"wandb_project": "monorl-test", "tensorboard": True}
 
 
 @pytest.fixture
@@ -42,66 +60,45 @@ def test_sinks_are_inactive_when_not_configured(make_config: Any, tmp_path: Path
     sinks.close()
 
 
-def test_wandb_sink_logs_numeric_metrics(
-    make_config: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_every_number_of_a_metrics_row_reaches_both_sinks_under_its_name(
+    make_config: Any, tmp_path: Path, packages: FakeSinkPackages
 ) -> None:
-    logged: list[tuple[dict[str, float], int]] = []
-    inits: list[dict[str, Any]] = []
-
-    class FakeRun:
-        def log(self, data: dict[str, float], step: int) -> None:
-            logged.append((data, step))
-
-        def finish(self) -> None:
-            inits.append({"finished": True})
-
-    fake_wandb = types.ModuleType("wandb")
-
-    def init(**kwargs: Any) -> FakeRun:
-        inits.append(kwargs)
-        return FakeRun()
-
-    fake_wandb.init = init  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
-
-    cfg = make_config(logging={"wandb_project": "monorl-test"})
+    cfg = make_config(logging=BOTH)
     reporter = RunReporter(tmp_path / "r", echo=False)
     sinks = MetricSinks(cfg, reporter.run_dir, reporter)
     assert sinks.active
-    assert inits[0]["project"] == "monorl-test" and inits[0]["name"] == "fake-run"
-    sinks.log(3, {"reward/mean": 0.5, "note": "text"})
-    assert logged == [({"reward/mean": 0.5}, 3)]
+    train = {
+        "reward/mean": 0.5,
+        "loss/policy": np.float32(0.25),  # metrics.jsonl records these three as numbers too
+        "grad_norm": torch.tensor(2.0),
+        "tokens/total": np.int64(3),
+        "loss/kl": float("nan"),
+        "note": "text",
+        "nothing": None,
+    }
+    evaluation = {"eval/reward_mean": 0.25}
+    reporter.log_metrics(3, train)
+    sinks.log(3, train)
+    reporter.log_metrics(3, evaluation, phase="eval")
+    sinks.log(3, evaluation, phase="eval")
     sinks.close()
-    assert inits[-1] == {"finished": True}
 
-
-def test_tensorboard_tags_are_the_metric_names_in_every_phase(
-    make_config: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    scalars: list[tuple[str, float, int]] = []
-
-    class FakeWriter:
-        def __init__(self, log_dir: str, purge_step: int | None = None) -> None:
-            self.log_dir = log_dir
-
-        def add_scalar(self, tag: str, value: float, step: int) -> None:
-            scalars.append((tag, value, step))
-
-        def close(self) -> None:
-            pass
-
-    fake_tensorboard = types.ModuleType("torch.utils.tensorboard")
-    fake_tensorboard.SummaryWriter = FakeWriter  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "torch.utils.tensorboard", fake_tensorboard)
-
-    reporter = RunReporter(tmp_path / "r", echo=False)
-    sinks = MetricSinks(make_config(logging={"tensorboard": True}), reporter.run_dir, reporter)
-    assert sinks.active
-    sinks.log(2, {"reward/mean": 0.5})
-    # evaluation rows carry their eval/ prefix already: the same chart name as in metrics.jsonl and W&B
-    sinks.log(2, {"eval/reward_mean": 0.25}, phase="eval")
-    sinks.close()
-    assert scalars == [("reward/mean", 0.5, 2), ("eval/reward_mean", 0.25, 2)]
+    expected = _last(metric_points(reporter.run_dir))
+    assert set(expected) == {(name, 3) for name in (*train, *evaluation)} - {("note", 3), ("nothing", 3)}
+    (wandb_run,) = packages.runs
+    assert wandb_run.init["project"] == "monorl-test" and wandb_run.init["name"] == "fake-run"
+    assert wandb_run.init["config"] == cfg.to_dict() and wandb_run.init["dir"] == str(reporter.run_dir)
+    assert {(name, 3): value for name, value in wandb_run.history[3].items()} == pytest.approx(
+        expected, nan_ok=True
+    )
+    assert list(wandb_run.history) == [3] and wandb_run.exit_code == 0
+    assert _shown(packages.shown[str(reporter.run_dir / "tensorboard")]) == pytest.approx(
+        expected, nan_ok=True
+    )
+    assert all(writer.closed for writer in packages.writers)
+    log = (reporter.run_dir / "run.log").read_text()
+    assert f"wandb: new run {wandb_run.id} in project monorl-test" in log
+    assert f"tensorboard: events in {reporter.run_dir / 'tensorboard'}" in log
 
 
 def test_missing_optional_packages_are_logged_and_skipped(
@@ -123,6 +120,24 @@ def test_missing_optional_packages_are_logged_and_skipped(
     log = (reporter.run_dir / "run.log").read_text()
     assert "wandb" in log and "not installed" in log
     assert "tensorboard" in log
+
+
+def test_a_wandb_directory_on_the_path_is_not_taken_for_the_package(
+    make_config: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if importlib.util.find_spec("wandb") is not None:
+        pytest.skip("wandb is installed: a directory of that name does not shadow it")
+    # wandb writes ./wandb by default; without the package Python imports that directory as an
+    # empty namespace package, so `import wandb` succeeds.
+    (tmp_path / "cwd" / "wandb").mkdir(parents=True)
+    monkeypatch.syspath_prepend(str(tmp_path / "cwd"))
+    reporter = RunReporter(tmp_path / "r", echo=False)
+    try:
+        sinks = MetricSinks(make_config(logging={"wandb_project": "p"}), reporter.run_dir, reporter)
+    finally:
+        sys.modules.pop("wandb", None)
+    assert not sinks.active
+    assert "`wandb` is not installed; skipping wandb" in (reporter.run_dir / "run.log").read_text()
 
 
 def _run_three_steps_then_resume_to_five(make_config: Any, logging: dict[str, Any]) -> Path:
@@ -149,6 +164,37 @@ def test_tensorboard_shows_every_step_once_after_a_resume(
     assert _shown(packages.shown[str(run_dir / "tensorboard")]) == _last(metric_points(run_dir))
 
 
+def test_a_resumed_run_logs_which_wandb_run_it_writes_to(
+    make_config: Any, packages: FakeSinkPackages
+) -> None:
+    run_dir = _run_three_steps_then_resume_to_five(make_config, {"wandb_project": "p"})
+    first, resumed = packages.runs
+    assert list(first.history) == [1, 2, 3] and list(resumed.history) == [3, 4, 5]
+    log = (run_dir / "run.log").read_text()
+    assert f"wandb: new run {first.id} in project p" in log
+    assert f"wandb: new run {resumed.id} in project p" in log
+
+
+# -- against the real packages --------------------------------------------------------------
+
+
+def _config_with_evaluation(make_config: Any, tmp_path: Path, **overrides: Any) -> Any:
+    eval_file = fakes.write_jsonl(tmp_path / "eval.jsonl", [{"prompt": "xyz", "answer": "XYZ"}])
+    return make_config(data={"eval_uri": str(eval_file)}, **overrides)
+
+
+def test_real_tensorboard_events_hold_every_metric_once(make_config: Any, tmp_path: Path) -> None:
+    pytest.importorskip("tensorboard")
+    cfg = _config_with_evaluation(
+        make_config, tmp_path, trainer={"max_steps": 3, "eval_every": 2}, logging={"tensorboard": True}
+    )
+    run_dir = Path(run(cfg).run_dir)
+    expected = _once(metric_points(run_dir))
+    assert ("eval/reward_mean", 2) in expected
+    # TensorBoard stores float32
+    assert _once(tensorboard_points(run_dir / "tensorboard")) == pytest.approx(expected, rel=1e-6)
+
+
 def test_real_tensorboard_shows_every_step_once_after_a_resume(make_config: Any) -> None:
     pytest.importorskip("tensorboard")
     run_dir = _run_three_steps_then_resume_to_five(make_config, {"tensorboard": True})
@@ -156,3 +202,33 @@ def test_real_tensorboard_shows_every_step_once_after_a_resume(make_config: Any)
     assert _once(tensorboard_points(run_dir / "tensorboard")) == pytest.approx(
         _last(metric_points(run_dir)), rel=1e-6
     )
+
+
+@pytest.fixture
+def offline_wandb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """The real package, offline, with every directory it writes to below ``tmp_path``."""
+    wandb = pytest.importorskip("wandb")
+    for name in [name for name in os.environ if name.startswith("WANDB_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_SILENT", "true")
+    for name in ("WANDB_DIR", "WANDB_CONFIG_DIR", "WANDB_CACHE_DIR", "WANDB_DATA_DIR"):
+        monkeypatch.setenv(name, str(tmp_path / "wandb-home" / name.lower()))
+    yield
+    wandb.teardown()  # stops the service process that wandb.init started
+
+
+def test_real_offline_wandb_run_holds_the_config_and_every_metric(
+    make_config: Any, tmp_path: Path, offline_wandb: None
+) -> None:
+    cfg = _config_with_evaluation(
+        make_config, tmp_path, trainer={"max_steps": 3, "eval_every": 2}, logging={"wandb_project": "p"}
+    )
+    run_dir = Path(run(cfg).run_dir)
+    (offline,) = read_offline_wandb_runs(run_dir)
+    assert (offline["project"], offline["name"], offline["exit_code"]) == ("p", "fake-run", 0)
+    assert offline["config"] == yaml.safe_load((run_dir / "config.yaml").read_text())
+    expected = metric_points(run_dir)
+    assert ("eval/reward_mean", 2) in expected
+    assert offline["history"] == pytest.approx(_last(expected))
+    assert f"wandb: new run {offline['id']} in project p" in (run_dir / "run.log").read_text()

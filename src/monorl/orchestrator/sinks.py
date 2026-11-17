@@ -22,12 +22,20 @@ class MetricSinks:
             try:
                 import wandb
 
+                # A `wandb` directory on sys.path (the package writes ./wandb by default) imports
+                # as an empty namespace package when the package itself is not installed.
+                if not hasattr(wandb, "init"):
+                    raise ImportError("wandb")
                 self._wandb = wandb.init(
                     project=logging.wandb_project,
                     name=config.run_name,
                     dir=str(run_dir),
                     config=config.to_dict(),
                     resume="allow",
+                )
+                reporter.log(
+                    f"wandb: {'resumed' if self._wandb.resumed else 'new'} run {self._wandb.id} in project "
+                    f"{logging.wandb_project}, files in {self._wandb.dir}"
                 )
             except ImportError:
                 reporter.log("logging.wandb_project is set but `wandb` is not installed; skipping wandb")
@@ -39,6 +47,7 @@ class MetricSinks:
 
                 self._tb_dir.mkdir(parents=True, exist_ok=True)
                 self._tb_writer = SummaryWriter
+                reporter.log(f"tensorboard: events in {self._tb_dir}")
             except ImportError:
                 reporter.log("logging.tensorboard is set but `tensorboard` is not installed; skipping")
             except Exception as e:  # noqa: BLE001
@@ -49,13 +58,22 @@ class MetricSinks:
         return self._wandb is not None or self._tb_writer is not None
 
     def log(self, step: int, metrics: dict[str, float], *, phase: str = "train") -> None:
+        """One ``metrics.jsonl`` row: every value the row holds as a number, under the same name in
+        both sinks (a name of another phase than ``train`` gets the ``<phase>/`` prefix unless it
+        has it)."""
         step = int(step)
-        numeric = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
-        if not numeric:
+        named: dict[str, float] = {}
+        for key, value in metrics.items():
+            try:
+                number = float(value)  # as RunReporter.log_metrics converts it
+            except (TypeError, ValueError):
+                continue
+            named[key if phase == "train" or key.startswith(f"{phase}/") else f"{phase}/{key}"] = number
+        if not named:
             return
         if self._wandb is not None:
             try:
-                self._wandb.log(numeric, step=step)
+                self._wandb.log(named, step=step)
             except Exception:  # noqa: BLE001
                 pass
         if self._tb_writer is not None:
@@ -64,10 +82,8 @@ class MetricSinks:
                 # this step and later ones. A resumed run logs the steps after its checkpoint
                 # again, and they would show twice.
                 self._tb = self._tb_writer(log_dir=str(self._tb_dir), purge_step=step)
-            for k, v in numeric.items():
-                # evaluation metrics are named eval/... already
-                tag = k if phase == "train" or k.startswith(f"{phase}/") else f"{phase}/{k}"
-                self._tb.add_scalar(tag, v, step)
+            for tag, number in named.items():
+                self._tb.add_scalar(tag, number, step)
 
     def close(self) -> None:
         if self._tb is not None:
