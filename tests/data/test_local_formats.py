@@ -130,8 +130,9 @@ def test_file_uri_scheme(qa_jsonl: Path) -> None:
 
 
 def test_missing_and_unsupported(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError) as missing:  # which a run reports as a mistake in its config
         _open(tmp_path / "nope.jsonl")
+    assert isinstance(missing.value, DataError) and str(tmp_path / "nope.jsonl") in str(missing.value)
     (tmp_path / "x.txt").write_text("hello")
     with pytest.raises(DataError):
         _open(tmp_path / "x.txt")
