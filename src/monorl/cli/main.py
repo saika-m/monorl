@@ -559,9 +559,13 @@ def bench(ctx: typer.Context) -> None:
 @recipes_app.command("list")
 def recipes_list(as_json: bool = typer.Option(False, "--json")) -> None:
     """List bundled recipes."""
-    from monorl.cli.recipes import list_recipes, recipes_dir
+    from monorl.config.recipes import list_recipes, recipes_dir
 
-    recipes = list_recipes()
+    try:
+        recipes = list_recipes()
+    except ConfigError as e:
+        _fail(str(e))
+        return
     if as_json:
         typer.echo(
             json.dumps(
@@ -590,7 +594,7 @@ def recipes_show(
     as_json: bool = typer.Option(False, "--json", help="Print the validated config as JSON."),
 ) -> None:
     """Print a recipe (validated against RunConfig, or PipelineConfig for `base:` + `stages:` files)."""
-    from monorl.cli.recipes import get_recipe
+    from monorl.config.recipes import get_recipe
 
     try:
         recipe = get_recipe(name)

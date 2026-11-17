@@ -11,8 +11,8 @@ import fakes
 import pytest
 import yaml
 
-from monorl.cli.recipes import recipes_dir
 from monorl.config.pipeline import PipelineConfig, RejectionSampleStage
+from monorl.config.recipes import recipes_dir
 from monorl.config.schema import DataConfig, RunConfig
 from monorl.core.errors import DataError
 from monorl.core.registry import registry

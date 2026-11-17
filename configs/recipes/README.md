@@ -7,10 +7,11 @@ what each shows is in the [root README](../../README.md#recipes), or run `monorl
 ## Conventions
 
 - One file per recipe, `<name>.yaml`. The name is the file stem: `monorl recipes show <name>`.
-  Use the extension `.yaml`: the CLI and the test below look at `*.yaml` only.
+  `.yml` is read too; one name with both extensions is an error (`recipe_files` in
+  `src/monorl/config/recipes.py` is what the CLI, the web UI and the test below list).
 - The file starts with a block of `# ` comment lines. They are the description: joined with
   spaces, up to the first line that is not a comment (`read_description` in
-  `src/monorl/cli/recipes.py`). `monorl recipes list` and the web UI (`GET /api/recipes`) show
+  `src/monorl/config/recipes.py`). `monorl recipes list` and the web UI (`GET /api/recipes`) show
   it. Comments further down are not part of it.
 - Two kinds, told apart by the top-level keys: a file with both `base` and `stages` is a
   pipeline config (`PipelineConfig`, see [docs/PIPELINES.md](../../docs/PIPELINES.md)), anything

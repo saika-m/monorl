@@ -11,8 +11,9 @@ import yaml
 from typer.testing import CliRunner
 
 from monorl.cli.main import app
-from monorl.cli.recipes import list_recipes, read_description, recipes_dir
+from monorl.config.recipes import get_recipe, list_recipes, read_description, recipe_files, recipes_dir
 from monorl.config.schema import RunConfig
+from monorl.core.errors import ConfigError
 from monorl.core.types import RunResult
 
 # -- help ---------------------------------------------------------------------------------
@@ -141,7 +142,7 @@ def test_recipes_dir_and_descriptions() -> None:
         assert r.path.read_text().startswith("# ")
 
 
-@pytest.mark.parametrize("recipe", sorted(recipes_dir().glob("*.yaml")), ids=lambda p: p.stem)
+@pytest.mark.parametrize("recipe", recipe_files(recipes_dir()), ids=lambda p: p.stem)
 def test_every_recipe_validates(recipe: Path) -> None:
     from monorl.config.loader import load_yaml
     from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
@@ -187,6 +188,16 @@ def test_recipes_list_and_show(runner: CliRunner) -> None:
     assert "no recipe named" in result.output
 
 
+def test_a_recipe_is_described_by_its_leading_comment_block(tmp_path: Path) -> None:
+    recipe = tmp_path / "r.yaml"
+    recipe.write_text(
+        "#!/usr/bin/env monorl\n\n# GRPO on GSM8K\n#   with a tiny model\n\nrun_name: x\n# trailing comment\n"
+    )
+    assert read_description(recipe) == "GRPO on GSM8K with a tiny model"
+    recipe.write_text("run_name: x\n# not a description\n")
+    assert read_description(recipe) == ""
+
+
 def test_recipes_dir_env_override(runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "custom.yaml").write_text(
         "# Custom recipe.\n# Second line.\nmodel: {name_or_path: x}\ndata: {uri: y}\nrewards: [{type: exact_match}]\n"
@@ -195,6 +206,55 @@ def test_recipes_dir_env_override(runner: CliRunner, tmp_path: Path, monkeypatch
     assert read_description(tmp_path / "custom.yaml") == "Custom recipe. Second line."
     result = runner.invoke(app, ["recipes", "list", "--json"])
     assert [r["name"] for r in json.loads(result.output)] == ["custom"]
+
+
+RECIPE_BODY = "model: {name_or_path: x}\ndata: {uri: y}\nrewards: [{type: exact_match}]\n"
+
+
+def test_yml_recipe_is_listed_and_shown(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "b.yaml").write_text("# Long extension.\n" + RECIPE_BODY)
+    (tmp_path / "a.yml").write_text("# Short extension.\n" + RECIPE_BODY)
+    (tmp_path / "c.yaml").mkdir()
+    (tmp_path / "notes.txt").write_text("ignored")
+    monkeypatch.setenv("MONORL_RECIPES_DIR", str(tmp_path))
+    assert [p.name for p in recipe_files(tmp_path)] == ["a.yml", "b.yaml"]
+
+    result = runner.invoke(app, ["recipes", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.stdout)
+    assert [(r["name"], r["description"]) for r in rows] == [
+        ("a", "Short extension."),
+        ("b", "Long extension."),
+    ]
+
+    for name in ("a", "a.yml"):
+        result = runner.invoke(app, ["recipes", "show", name, "--json"])
+        assert result.exit_code == 0, result.output
+        shown = json.loads(result.stdout)
+        assert shown["name"] == "a" and shown["config"]["model"]["name_or_path"] == "x"
+    assert get_recipe("b.yaml").name == "b"
+
+    result = runner.invoke(app, ["recipes", "show", "a.yaml"])
+    assert result.exit_code == 1
+    assert "available: a, b" in result.output.replace("\n", " ")
+
+
+def test_recipe_with_both_extensions_is_an_error(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "twin.yaml").write_text("# One.\n" + RECIPE_BODY)
+    (tmp_path / "twin.yml").write_text("# Other.\n" + RECIPE_BODY)
+    (tmp_path / "solo.yaml").write_text("# Alone.\n" + RECIPE_BODY)
+    monkeypatch.setenv("MONORL_RECIPES_DIR", str(tmp_path))
+    with pytest.raises(ConfigError, match=r"'twin'.*twin\.yaml and twin\.yml"):
+        recipe_files(tmp_path)
+    for args in (["recipes", "list"], ["recipes", "show", "twin"], ["recipes", "show", "solo"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 1, result.output
+        flat = " ".join(result.output.split())
+        assert "twin.yaml" in flat and "twin.yml" in flat
 
 
 # -- train --------------------------------------------------------------------------------
