@@ -13,18 +13,35 @@ Params:
     normalize: divide the score by ``max_score`` (default ``True`` → reward in ``[0, 1]``).
     temperature (0.0), max_tokens (512), timeout_s (60), max_workers (8),
     extra_body: dict merged into the request body.
-    on_error: ``zero`` (default; score 0 with ``info["error"]``) or ``raise``.
+    max_attempts: requests per judgment (default 4; 1 turns retrying off). A request is repeated
+        after a connection error, a timeout or one of the statuses in :data:`RETRY_STATUS`;
+        any other failure is final at once.
+    retry_backoff_s: longest wait before the first retry (default 1.0). The bound doubles with
+        every retry and the wait is drawn from its upper half, so that the workers of a call do
+        not come back together; a ``Retry-After`` that asks for more is waited out instead.
+    retry_max_wait_s: seconds one judgment may spend waiting between its attempts (default 60).
+        A wait that would go past it ends the judgment with the error it has.
+    on_error: what a judgment that failed for good becomes: ``zero`` (default; score 0 with
+        ``info["error"]``) or ``raise``.
 
-Factory kwargs: ``client=httpx.Client(...)`` injects a transport (tests use ``MockTransport``).
+Factory kwargs: ``client=httpx.Client(...)`` injects a transport (tests use ``MockTransport``);
+``wait=fn(stop, seconds)`` replaces the wait between attempts (``threading.Event.wait``) and
+returns whether to give up.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import random
 import re
-from collections.abc import Sequence
+import threading
+import time
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC
+from email.utils import parsedate_to_datetime
+from functools import partial
 from typing import Any
 
 import httpx
@@ -48,14 +65,40 @@ a final line of the form <score>N</score> where N is an integer from 0 to {max_s
 
 _SCORE_RE = re.compile(r"<score>\s*(-?\d+(?:\.\d+)?)\s*</score>", re.IGNORECASE)
 
+RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+"""Statuses that say "not now": the same request may succeed a moment later."""
+_RETRY_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+
 
 def parse_score(text: str) -> float | None:
     matches = _SCORE_RE.findall(text)
     return float(matches[-1]) if matches else None
 
 
+def retry_after_seconds(response: httpx.Response) -> float:
+    """What ``Retry-After`` asks for, as a number of seconds or an HTTP date; 0.0 without one."""
+    value = response.headers.get("Retry-After", "")
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except ValueError:
+            return 0.0
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        seconds = when.timestamp() - time.time()
+    return seconds if 0.0 < seconds < math.inf else 0.0
+
+
 class LLMJudgeReward:
-    def __init__(self, params: dict[str, Any], *, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        params: dict[str, Any],
+        *,
+        client: httpx.Client | None = None,
+        wait: Callable[[threading.Event, float], bool] | None = None,
+    ) -> None:
         self.name = reward_name(params, "llm_judge")
         base_url = params.get("base_url")
         model = params.get("model")
@@ -82,6 +125,14 @@ class LLMJudgeReward:
         self.on_error = str(params.get("on_error", "zero"))
         if self.on_error not in ("zero", "raise"):
             raise ValueError("llm_judge: on_error must be 'zero' or 'raise'")
+        self.max_attempts = int(params.get("max_attempts", 4))
+        if self.max_attempts < 1:
+            raise ValueError("llm_judge: max_attempts must be at least 1 (1 turns retrying off)")
+        self.retry_backoff_s = float(params.get("retry_backoff_s", 1.0))
+        self.retry_max_wait_s = float(params.get("retry_max_wait_s", 60.0))
+        if not (self.retry_backoff_s >= 0 and self.retry_max_wait_s >= 0):
+            raise ValueError("llm_judge: retry_backoff_s and retry_max_wait_s must not be negative")
+        self._wait = wait or threading.Event.wait
         self.scope = str(params.get("scope", "last"))
         self.reference_key = params.get("reference_key")
 
@@ -112,7 +163,29 @@ class LLMJudgeReward:
         messages.append({"role": "user", "content": user})
         return messages
 
-    def judge(self, trajectory: Trajectory) -> RewardResult:
+    def _retry_delay(self, error: Exception, attempt: int) -> float | None:
+        """Seconds to wait before the request that failed with ``error`` is sent again, ``None``
+        when it is not: the failure is not transient, or ``attempt`` was the last one allowed."""
+        asked = 0.0
+        if isinstance(error, httpx.HTTPStatusError):
+            if error.response.status_code not in RETRY_STATUS:
+                return None
+            asked = retry_after_seconds(error.response)
+        elif not isinstance(error, _RETRY_ERRORS):
+            return None
+        if attempt >= self.max_attempts:
+            return None
+        return max(math.ldexp(self.retry_backoff_s, attempt - 1) * random.uniform(0.5, 1.0), asked)
+
+    def _failed(self, attempts: int, **info: Any) -> RewardResult:
+        if attempts > 1:
+            info["attempts"] = attempts
+        return RewardResult(score=0.0, breakdown={self.name: 0.0}, info=info)
+
+    def judge(self, trajectory: Trajectory, stop: threading.Event | None = None) -> RewardResult:
+        """Score one trajectory. Setting ``stop`` ends a wait between attempts: the judgment then
+        fails with the error of its last attempt instead of trying again."""
+        stop = stop or threading.Event()
         body = {
             "model": self.model,
             "messages": self.build_messages(trajectory),
@@ -120,37 +193,58 @@ class LLMJudgeReward:
             "max_tokens": self.max_tokens,
             **self.extra_body,
         }
-        try:
-            resp = self.client.post("/chat/completions", json=body)
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
-            if self.on_error == "raise":
-                raise
-            return RewardResult(
-                score=0.0, breakdown={self.name: 0.0}, info={"error": f"{type(e).__name__}: {e}"}
-            )
+        attempts = 0
+        waited = 0.0
+        while True:
+            attempts += 1
+            try:
+                # The reply is read in full and its connection is back in the pool before any wait.
+                resp = self.client.post("/chat/completions", json=body)
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"]
+                break
+            except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
+                delay = self._retry_delay(e, attempts)
+                if delay is not None and waited + delay <= self.retry_max_wait_s:
+                    if not self._wait(stop, delay):
+                        waited += delay
+                        continue
+                if self.on_error == "raise":
+                    raise
+                return self._failed(attempts, error=f"{type(e).__name__}: {e}")
         # ``content`` is null when the judge spent its tokens on reasoning, refused, or called a tool.
         raw = parse_score(content) if isinstance(content, str) else None
         if raw is None:
             if self.on_error == "raise":
                 raise ValueError(f"llm_judge: no <score> tag in judge output: {str(content)[:200]!r}")
-            return RewardResult(
-                score=0.0, breakdown={self.name: 0.0}, info={"error": "no_score", "judge_output": content}
-            )
+            return self._failed(attempts, error="no_score", judge_output=content)
         raw = min(max(raw, 0.0), self.max_score)
         score = raw / self.max_score if self.normalize else raw
-        return RewardResult(
-            score=score, breakdown={self.name: score}, info={"raw_score": raw, "judge_output": content}
-        )
+        info = {"raw_score": raw, "judge_output": content}
+        if attempts > 1:
+            info["attempts"] = attempts
+        return RewardResult(score=score, breakdown={self.name: score}, info=info)
 
     def __call__(self, trajectories: Sequence[Trajectory]) -> list[RewardResult]:
         check_trajectories(trajectories)
         if len(trajectories) <= 1 or self.max_workers <= 1:
             return [self.judge(t) for t in trajectories]
+        stop = threading.Event()
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            return list(pool.map(self.judge, trajectories))
+            try:
+                return list(pool.map(partial(self.judge, stop=stop), trajectories))
+            finally:
+                # Left early (an error with on_error: raise, an interrupt): the judgments that wait
+                # for a retry give up at once, so the pool is back after the requests that are on
+                # the wire and not after their backoff.
+                stop.set()
 
 
-def make_llm_judge(params: dict[str, Any], *, client: httpx.Client | None = None, **_: Any) -> LLMJudgeReward:
-    return LLMJudgeReward(params, client=client)
+def make_llm_judge(
+    params: dict[str, Any],
+    *,
+    client: httpx.Client | None = None,
+    wait: Callable[[threading.Event, float], bool] | None = None,
+    **_: Any,
+) -> LLMJudgeReward:
+    return LLMJudgeReward(params, client=client, wait=wait)
