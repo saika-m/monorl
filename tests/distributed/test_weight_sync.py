@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import socket
 from pathlib import Path
 
 import pytest
@@ -30,14 +29,9 @@ from monorl.distributed import (
     CudaIpcWeightSync,
     InProcessWeightSync,
 )
+from tests.ports import reserved_port
 
 HAS_CUDA = torch.cuda.is_available()
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 # -- checkpoint -------------------------------------------------------------------------------
@@ -73,7 +67,7 @@ def test_broadcast_between_two_spawned_cpu_processes(tmp_path: Path):
     seed = 11
     spec = BroadcastGroupSpec(
         master_addr="127.0.0.1",
-        master_port=_free_port(),
+        master_port=reserved_port(),
         world_size=2,
         backend="gloo",
         timeout_s=60,
@@ -107,7 +101,7 @@ def test_broadcast_between_two_spawned_cpu_processes(tmp_path: Path):
 def test_broadcast_sync_sends_what_changed_and_everything_after_a_failure():
     """Rank 0 is this process, the engine lives in another one. Its weights have to be the
     trainer's after every sync that succeeded, whatever was left out of the stream."""
-    spec = BroadcastGroupSpec("127.0.0.1", _free_port(), world_size=2, backend="gloo", timeout_s=60)
+    spec = BroadcastGroupSpec("127.0.0.1", reserved_port(), world_size=2, backend="gloo", timeout_s=60)
     ctx = mp.get_context("spawn")
     here, there = ctx.Pipe()
     proc = ctx.Process(target=broadcast_engine_process, args=(there,))

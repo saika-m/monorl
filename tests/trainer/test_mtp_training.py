@@ -20,9 +20,10 @@ from monorl.core.batch import TrainBatch
 from monorl.core.errors import ConfigError
 from monorl.mtp import WIRE_PREFIX, MtpLayers, MtpLoss, checkpoint_key, is_wire_name
 from monorl.trainer.reference import ReferenceTrainer
+from tests.ports import reserved_port
 from tests.rollout.tiny_mtp import build_tiny_mtp, two_layer_mtp
 from tests.trainer.conftest import make_config
-from tests.trainer.test_distributed_trainer import WORLD_SIZE, _free_port, _shard
+from tests.trainer.test_distributed_trainer import WORLD_SIZE, _shard
 
 LORA = pytest.mark.parametrize("lora", [False, True], ids=["full", "lora"])
 PROMPTS = [[1, 5, 9, 17, 33, 21], [1, 40, 41, 42], [1, 7, 7, 300, 12, 90, 2000], [1, 77, 78]]
@@ -415,7 +416,7 @@ def test_two_rank_step_matches_single_process(mtp_dir: Path, batch: TrainBatch, 
     torch.save(batch, batch_path)
     mp.spawn(
         _rank_worker,
-        args=(_free_port(), str(mtp_dir), str(batch_path), str(tmp_path)),
+        args=(reserved_port(), str(mtp_dir), str(batch_path), str(tmp_path)),
         nprocs=WORLD_SIZE,
         join=True,
     )

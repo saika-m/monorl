@@ -17,8 +17,9 @@ from monorl.config.schema import RunConfig
 from monorl.core.batch import TrainBatch
 from monorl.core.errors import ConfigError
 from monorl.trainer.reference import VALUE_LR_SCALE, ReferenceTrainer
+from tests.ports import reserved_port
 from tests.trainer.conftest import make_batch, make_config
-from tests.trainer.test_distributed_trainer import WORLD_SIZE, _free_port, _shard
+from tests.trainer.test_distributed_trainer import WORLD_SIZE, _shard
 
 LORA = pytest.mark.parametrize("lora", [False, True], ids=["full", "lora"])
 RETURNS = [1.0, -1.0, 0.5, 2.0]
@@ -235,7 +236,7 @@ def test_two_rank_step_matches_single_process(tiny_model_dir: Path, tokenizer, t
     torch.save(batch, batch_path)
     mp.spawn(
         _rank_worker,
-        args=(_free_port(), str(tiny_model_dir), str(batch_path), str(tmp_path)),
+        args=(reserved_port(), str(tiny_model_dir), str(batch_path), str(tmp_path)),
         nprocs=WORLD_SIZE,
         join=True,
     )
