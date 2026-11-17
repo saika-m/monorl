@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from monorl.core.errors import EnvironmentError_
+from monorl.core.errors import ConfigError, EnvironmentError_
 from monorl.core.interfaces import Environment
 from monorl.core.types import Completion, Sample
 from monorl.envs.remote import (
@@ -285,9 +285,9 @@ def test_http_replicas_pin_each_episode_to_one_server():
 
 
 def test_bad_params():
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         slot_source_for({"transport": "carrier-pigeon"})
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         slot_source_for({"transport": "http"})
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         slot_source_for({"transport": "stdio"})

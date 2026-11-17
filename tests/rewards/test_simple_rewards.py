@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from monorl.config.schema import RewardSpec
+from monorl.core.errors import ConfigError
 from monorl.core.interfaces import RewardFunction
 from monorl.core.registry import registry
 from monorl.core.types import RewardResult
@@ -61,9 +62,9 @@ def test_exact_match_scope_all_and_reference_key(traj):
 
 
 def test_exact_match_rejects_bad_params():
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "exact_match")({"extract": "magic"})
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "exact_match")({"normalize": ["unicode"]})
 
 
@@ -88,7 +89,7 @@ def test_format_flags_and_fullmatch(traj):
     fn = registry.get("reward", "format")({"pattern": r"yes", "flags": ["IGNORECASE"], "fullmatch": True})
     assert fn([traj("YES")])[0].score == 1.0
     assert fn([traj("yes!")])[0].score == 0.0
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "format")({})
 
 
@@ -106,7 +107,7 @@ def test_length_reward_band_and_penalty(traj):
     )
     assert chars([traj("abcdef")])[0].score == pytest.approx(-0.3)
     assert chars([traj("abcdef")])[0].info["length"] == 6
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "length")({"min_tokens": 5, "max_tokens": 2})
 
 

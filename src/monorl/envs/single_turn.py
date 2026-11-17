@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
-
+from monorl.core.params import declare_params
 from monorl.core.types import Completion, Message, Sample, StepResult
+
+declare_params("env", "single_turn", "system_prompt")
 
 
 class SingleTurnEnv:
     max_turns = 1
 
-    def __init__(self, *, system_prompt: str | None = None, **_: Any) -> None:
+    def __init__(self, *, system_prompt: str | None = None) -> None:
         self.system_prompt = system_prompt
         self._sample: Sample | None = None
 

@@ -66,8 +66,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from monorl.core.errors import BackendUnavailable
+from monorl.core.errors import BackendUnavailable, ConfigError
 from monorl.core.home import monorl_home
+from monorl.core.params import checked_params, declare_params
 from monorl.core.types import Completion, Message, Sample, StepResult, ToolCall, message_text
 from monorl.envs.tool_calling import parse_tool_calls
 
@@ -111,14 +112,14 @@ def _str_list(value: Any, key: str) -> list[str]:
         return [value]
     if isinstance(value, Sequence) and all(isinstance(v, str) for v in value):
         return list(value)
-    raise ValueError(f"env.params.{key} must be a list of strings, got {value!r}")
+    raise ConfigError(f"env.params.{key} must be a list of strings, got {value!r}")
 
 
 def resolve_tool_names(tools: Sequence[str], *, tool_modules: Sequence[str] = ()) -> list[str]:
     """Resolve mixed Hermes tool / toolset names to a sorted list of registered tool names.
 
     ``tool_modules`` are imported first so tools they register (``tools.registry.registry.register``)
-    are selectable. Unknown names raise ``ValueError`` listing what exists.
+    are selectable. Unknown names raise :class:`ConfigError` listing what exists.
     """
     _require_hermes()
     for mod in tool_modules:
@@ -137,7 +138,7 @@ def resolve_tool_names(tools: Sequence[str], *, tool_modules: Sequence[str] = ()
         else:
             unknown.append(name)
     if unknown:
-        raise ValueError(
+        raise ConfigError(
             f"env.params.tools: unknown Hermes tool/toolset names {unknown}; "
             f"tools: {sorted(registered)}; toolsets: {sorted(__import__('toolsets').get_toolset_names())}"
         )
@@ -175,7 +176,7 @@ def load_skill_prompts(names: Sequence[str], skills_dir: str | os.PathLike[str] 
         for name in names:
             matches = sorted(p for p in root.glob(f"**/{name}/SKILL.md") if p.is_file())
             if not matches:
-                raise ValueError(f"env.params.skills: skill {name!r} not found under {root}")
+                raise ConfigError(f"env.params.skills: skill {name!r} not found under {root}")
             _front, body = parse_frontmatter(matches[0].read_text(encoding="utf-8"))
             out.append(f"# Skill: {name}\n{body.strip()}")
         return out
@@ -184,7 +185,7 @@ def load_skill_prompts(names: Sequence[str], skills_dir: str | os.PathLike[str] 
     for name in names:
         result = json.loads(skill_view(name, preprocess=False))
         if not result.get("success"):
-            raise ValueError(f"env.params.skills: {result.get('error') or f'skill {name!r} not found'}")
+            raise ConfigError(f"env.params.skills: {result.get('error') or f'skill {name!r} not found'}")
         _front, body = parse_frontmatter(result.get("content") or "")
         out.append(f"# Skill: {name}\n{body.strip()}")
     return out
@@ -200,17 +201,17 @@ def sandbox_overrides(sandbox: Mapping[str, Any] | None) -> tuple[str, dict[str,
     sandbox = dict(sandbox or {})
     backend = str(sandbox.pop("backend", "local") or "local").lower()
     if backend not in SANDBOX_BACKENDS:
-        raise ValueError(
+        raise ConfigError(
             f"env.params.sandbox.backend must be one of {sorted(SANDBOX_BACKENDS)}, got {backend!r}"
         )
     image = sandbox.pop("image", None)
     if sandbox:
-        raise ValueError(f"env.params.sandbox: unknown keys {sorted(sandbox)}; expected backend, image")
+        raise ConfigError(f"env.params.sandbox: unknown keys {sorted(sandbox)}; expected backend, image")
     overrides: dict[str, Any] = {}
     if image:
         key = _IMAGE_KEY_FOR_BACKEND.get(backend)
         if key is None:
-            raise ValueError(f"env.params.sandbox.image is not supported by the {backend!r} backend")
+            raise ConfigError(f"env.params.sandbox.image is not supported by the {backend!r} backend")
         overrides[key] = str(image)
     if backend != "local":
         overrides["env_type"] = backend  # isolation signal: Hermes keys the sandbox by task id
@@ -539,6 +540,25 @@ class HermesEnv:
             self._sample = None
 
 
+declare_params(
+    "env",
+    "hermes",
+    "tools",
+    "tool_modules",
+    "skills",
+    "skills_dir",
+    "hermes_home",
+    "workspace_dir",
+    "sandbox",
+    "max_tool_output_chars",
+    "max_calls_per_turn",
+    "invalid_call_penalty",
+    "system_prompt",
+    "hermes_system_prompt",
+    "model_name",
+)
+
+
 def make_hermes_env(
     params: Mapping[str, Any],
     *,
@@ -546,14 +566,7 @@ def make_hermes_env(
     system_prompt: str | None = None,
     model_name: str | None = None,
 ) -> HermesEnv:
-    known = {
-        "tools", "tool_modules", "skills", "skills_dir", "hermes_home", "workspace_dir", "sandbox",
-        "max_tool_output_chars", "max_calls_per_turn", "invalid_call_penalty", "system_prompt",
-        "hermes_system_prompt", "model_name",
-    }  # fmt: skip
-    unknown = sorted(set(params) - known)
-    if unknown:
-        raise ValueError(f"env 'hermes': unknown params {unknown}; expected {sorted(known)}")
+    params = checked_params("env", "hermes", params, where="env.params")
     return HermesEnv(
         tools=_str_list(params.get("tools"), "tools") or list(DEFAULT_TOOLS),
         tool_modules=_str_list(params.get("tool_modules"), "tool_modules"),

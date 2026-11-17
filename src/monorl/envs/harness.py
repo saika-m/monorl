@@ -92,6 +92,7 @@ Torch-free; the gateway's HTTP stack is imported with the first episode.
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -113,6 +114,7 @@ from monorl.core.errors import (
     EpisodeAborted,
     GenerationFailed,
 )
+from monorl.core.params import checked_params, declare_params
 from monorl.core.types import Sample, SamplingParams, Trajectory
 from monorl.envs.protocol import encode_sample
 from monorl.envs.sandbox import (
@@ -140,19 +142,6 @@ TASK_TESTS_DIR = "/tests"
 TASK_LOGS_DIR = "/logs"
 """Where a task's tests are copied to and where its verifier leaves the reward (Harbor's paths)."""
 
-_PARAMS = (
-    "command",
-    "timeout",
-    "env",
-    "host_env",
-    "verifier",
-    "verifier_timeout",
-    "workdir",
-    "model",
-    "sandbox",
-    "gateway",
-    "fetch_images",
-)
 _PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
 _HOST_VARIABLE_RE = re.compile(r"\$\{([^}:]+)(?::-(.*))?\}")
 _ANSWER_METADATA = ("answer_raw", "response", "assistant_turn")
@@ -763,6 +752,18 @@ class HarnessEnv:
         return proc.returncode, timed_out
 
 
+# ``env.params`` are the arguments of :class:`HarnessEnv`, bar the two that the factory supplies.
+declare_params(
+    "env",
+    "harness",
+    *(
+        name
+        for name in inspect.signature(HarnessEnv.__init__).parameters
+        if name not in ("self", "max_turns", "processor")
+    ),
+)
+
+
 def make_harness_env(
     params: Mapping[str, Any],
     *,
@@ -772,10 +773,8 @@ def make_harness_env(
 ) -> HarnessEnv:
     """:class:`HarnessEnv` from ``env.params`` (module docstring); ``null`` params are unset.
     ``processor`` loads the policy's ``AutoProcessor`` (:func:`policy_processor`)."""
+    params = checked_params("env", "harness", params, where="env.params")
     given = {key: value for key, value in params.items() if value is not None}
-    unknown = sorted(set(given) - set(_PARAMS))
-    if unknown:
-        raise ConfigError(f"unknown env.params for env.type 'harness': {unknown}; expected {list(_PARAMS)}")
     if not given.get("command"):
         raise ConfigError(
             "env.type 'harness' needs env.params.command (the agent's argv list or command string)"

@@ -8,6 +8,7 @@ import threading
 import httpx
 import pytest
 
+from monorl.core.errors import ConfigError
 from monorl.core.registry import registry
 from monorl.orchestrator.metrics import reward_metrics
 from monorl.rewards import CompositeReward
@@ -379,7 +380,7 @@ def test_an_error_that_ends_the_call_ends_the_waits_of_the_other_judgments(traj)
 
 
 def test_llm_judge_requires_endpoint_params():
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         registry.get("reward", "llm_judge")({"model": "m"})
 
 
@@ -395,7 +396,7 @@ def test_llm_judge_requires_endpoint_params():
     ],
 )
 def test_llm_judge_rejects_params_it_cannot_run_with(params, message):
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ConfigError, match=message):
         registry.get("reward", "llm_judge")({"base_url": "http://j", "model": "m", **params})
 
 

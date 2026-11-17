@@ -12,30 +12,52 @@ Params:
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import declare_params
 from monorl.core.types import RewardResult, Trajectory
-from monorl.rewards.base import check_trajectories, response_text, reward_name
+from monorl.rewards.base import (
+    check_trajectories,
+    response_scope,
+    response_text,
+    reward_name,
+    reward_params,
+)
+
+declare_params(
+    "reward", "format", "name", "patterns", "pattern", "require_all", "flags", "fullmatch", "scope"
+)
 
 
 class FormatReward:
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: Mapping[str, Any]) -> None:
+        params = reward_params("format", params)
         self.name = reward_name(params, "format")
         patterns = params.get("patterns")
         if patterns is None and "pattern" in params:
             patterns = [params["pattern"]]
         if not patterns:
-            raise ValueError("format reward needs params.patterns (list of regexes)")
+            raise ConfigError("format reward needs params.patterns (list of regexes)")
         if isinstance(patterns, str):
             patterns = [patterns]
         flags = 0
         for flag_name in params.get("flags", ["DOTALL"]):
-            flags |= getattr(re, str(flag_name).upper())
-        self.patterns = [re.compile(p, flags) for p in patterns]
+            flag = getattr(re, str(flag_name).upper(), None)
+            if not isinstance(flag, re.RegexFlag):
+                raise ConfigError(
+                    f"format reward: params.flags takes names of `re` flags (DOTALL, IGNORECASE, "
+                    f"MULTILINE, ...), got {flag_name!r}"
+                )
+            flags |= flag
+        try:
+            self.patterns = [re.compile(p, flags) for p in patterns]
+        except (re.error, TypeError) as e:
+            raise ConfigError(f"format reward: params.patterns holds an invalid regex: {e}") from e
         self.require_all = bool(params.get("require_all", True))
         self.fullmatch = bool(params.get("fullmatch", False))
-        self.scope = str(params.get("scope", "last"))
+        self.scope = response_scope(params, "format")
 
     def score_text(self, text: str) -> tuple[float, list[bool]]:
         hits = [bool(p.fullmatch(text) if self.fullmatch else p.search(text)) for p in self.patterns]
@@ -54,5 +76,5 @@ class FormatReward:
         return out
 
 
-def make_format(params: dict[str, Any], **_: Any) -> FormatReward:
+def make_format(params: Mapping[str, Any], **_: Any) -> FormatReward:
     return FormatReward(params)

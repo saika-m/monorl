@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from monorl.config.schema import RunConfig
+from monorl.core.errors import ConfigError
 from monorl.core.interfaces import Environment
 from monorl.core.registry import registry
 from monorl.core.types import Completion, Sample
@@ -114,3 +115,40 @@ def test_make_openenv(run_config_dict, monkeypatch):
 def test_hermes_name_resolves_through_adapter_provider():
     pytest.importorskip("monorl.adapters.hermes")
     assert callable(registry.get("env", "hermes"))
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"type": "single_turn"},
+        {"type": "tool_calling", "params": {"tools": ["calculator"]}},
+        {"type": "remote", "params": {"transport": "stdio", "command": ["no-such-env-server"]}},
+        {"type": "harness", "params": {"command": ["true"]}},
+        {"type": "openenv", "params": {"env_class": "sample_envs.ReverseEnv"}},
+        {"type": "hermes"},
+    ],
+    ids=lambda env: env["type"],
+)
+def test_every_built_in_environment_refuses_a_parameter_it_does_not_read(run_config_dict, env):
+    """Also for a caller that hands the factory params no schema has seen (a backend's bridge)."""
+    cfg = _config(run_config_dict, env)
+    cfg.env.params["no_such_key"] = 1
+    with pytest.raises(ConfigError) as raised:
+        make_env(cfg)
+    assert str(raised.value).startswith(
+        f"env.params.no_such_key: unknown key; the {env['type']} environment takes: "
+    )
+
+
+def test_a_misspelt_environment_parameter_is_refused_with_the_one_it_resembles():
+    with pytest.raises(ConfigError, match=r"env\.params\.max_turn: unknown key; did you mean max_turns\?"):
+        make_tool_calling_env({"tools": ["calculator"], "max_turn": 3}, max_turns=4)
+    with pytest.raises(
+        ConfigError, match=r"env\.params\.tool_module: unknown key; did you mean tool_modules\?"
+    ):
+        make_tool_calling_env({"tool_module": ["my_tools"]}, max_turns=4)
+
+
+def test_a_tool_module_that_cannot_be_imported_is_a_config_error():
+    with pytest.raises(ConfigError, match=r"env\.params\.tool_modules: cannot import 'no_such_tools_module'"):
+        make_tool_calling_env({"tool_modules": ["no_such_tools_module"]}, max_turns=4)

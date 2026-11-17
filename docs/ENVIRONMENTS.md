@@ -62,7 +62,7 @@ batched by arrival.
 | `env.max_turns` | `1` | turn limit, as described above |
 | `env.retries` | `0` | times a failed episode is restarted with a fresh environment |
 | `env.max_failed_frac` | `0.0` | share of a rollout batch that may fail for good and be left out; above it, and always at `0`, a failed episode fails the run |
-| `env.params` | `{}` | parameters of the chosen type |
+| `env.params` | `{}` | parameters of the chosen type; a built-in type refuses a key it does not take |
 
 With `env.max_failed_frac > 0` a run reports `rollout/failed_episodes`, `rollout/failed_frac` and
 `rollout/groups_incomplete`. The schema rejects `env.max_failed_frac > 0` for `trainer.backend`
@@ -85,11 +85,22 @@ and `nemo_rl` ([BACKENDS.md](BACKENDS.md)), and any type but `single_turn` for
 gateway; it is not stepped but runs the whole episode itself (`EpisodeDriver.run_episode`).
 `remote` drives a server over stdio or http ([Python server](#serving-and-checking-it-over-mep1)).
 
+Each of these types reads the `env.params` keys of its table (`harness`: the table in
+[GATEWAY.md](GATEWAY.md), section 3) and refuses any other when the config is validated, before
+a model is loaded. `env.params.max_turn` with `env.type: tool_calling` is reported as
+`unknown key; did you mean max_turns?`, followed by the keys the type takes. A value a type
+cannot run with (a tool that does not exist, a `remote` without `command` or `url`) is a
+`ConfigError` when the environment is built. A type of your own
+([below](#writing-an-environment-in-python)) takes the `env.params` it likes.
+
 ## `single_turn`
 
 `reset` returns the sample's messages and `step` ends the episode with reward 0, so at least one
-entry in `rewards:` is required. One parameter: `env.params.system_prompt` (default
-`data.system_prompt`), inserted first when the sample has no `system` message; others are ignored.
+entry in `rewards:` is required.
+
+| `env.params` key | Default | Meaning |
+|---|---|---|
+| `system_prompt` | `data.system_prompt` | inserted first when the sample has no `system` message |
 
 ## `tool_calling`
 
@@ -212,6 +223,26 @@ $ PYTHONPATH=$DEMO .venv/bin/python $DEMO/drive_tools.py
 0.0 True []
 ```
 
+## `remote`
+
+The client of an environment server that speaks MEP/1. [ENV_SDK.md](ENV_SDK.md) has the protocol,
+the SDKs and how the number of parallel episodes is chosen. The turn limit is `env.max_turns` if
+set, else the server's.
+
+| `env.params` key | Default | Meaning |
+|---|---|---|
+| `transport` | `stdio` | `stdio`: monorl starts the server and talks to it over its stdin and stdout. `http`: a server that is already running |
+| `command` | required for `stdio` | argv list of the server |
+| `cwd`, `env` | none | `stdio`: working directory of the server process; environment variables added to monorl's own for it |
+| `url` | required for `http` | address of the server |
+| `urls` | none | `http`: addresses of identical replicas, in place of `url`; an episode stays on one of them |
+| `headers` | none | `http`: headers sent with every request |
+| `parallel` | the server's `spec.parallel_episodes` | episodes open at a time on one process or server |
+| `timeout_s` | `60.0` | seconds a request may take |
+| `max_response_bytes` | `67108864` | a response larger than this is not read to its end and fails the episode |
+
+Not run for this section: the table was compared with `src/monorl/envs/remote.py`.
+
 ## `openenv` and `hermes`
 
 Both need an optional dependency (extras `openenv` and `hermes` in `pyproject.toml`), else the
@@ -233,6 +264,7 @@ completion becomes the action, reward and `done` come from the OpenEnv step (a m
 | `action_mode` | `text` | `text`: the action is `{action_field: <completion text>}`. `json`: the completion must contain a JSON object (fenced or bare), which is the action |
 | `action_field` | `text` | field name used in `text` mode |
 | `observation_template` | none | `str.format` template over the observation fields (missing ones are empty). Unset: the value of a lone string field, else the observation as JSON |
+| `observation_to_text` | none | a second name of `observation_template`, read when that is unset |
 | `system_prompt` | `data.system_prompt` | first message |
 | `invalid_action_penalty` | `0.0` | `json` mode: cost of a completion without a JSON object |
 | `reset_kwargs`, `seed` | `{}`, none | extra arguments of `reset` |

@@ -44,7 +44,7 @@ import re
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
 from email.utils import parsedate_to_datetime
@@ -53,8 +53,18 @@ from typing import Any
 
 import httpx
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import declare_params
 from monorl.core.types import RewardResult, Trajectory
-from monorl.rewards.base import check_trajectories, prompt_text, reference_value, response_text, reward_name
+from monorl.rewards.base import (
+    check_trajectories,
+    prompt_text,
+    reference_value,
+    response_scope,
+    response_text,
+    reward_name,
+    reward_params,
+)
 
 DEFAULT_RUBRIC = """You are a strict grader. Evaluate the response to the task below.
 
@@ -113,32 +123,58 @@ def _describe(error: Exception) -> dict[str, Any]:
     return info
 
 
+declare_params(
+    "reward",
+    "llm_judge",
+    "name",
+    "base_url",
+    "model",
+    "rubric",
+    "api_key_env",
+    "system_prompt",
+    "max_score",
+    "normalize",
+    "temperature",
+    "max_tokens",
+    "extra_body",
+    "timeout_s",
+    "max_workers",
+    "max_attempts",
+    "retry_backoff_s",
+    "retry_max_wait_s",
+    "on_error",
+    "scope",
+    "reference_key",
+)
+
+
 class LLMJudgeReward:
     def __init__(
         self,
-        params: dict[str, Any],
+        params: Mapping[str, Any],
         *,
         client: httpx.Client | None = None,
         wait: Callable[[threading.Event, float], bool] | None = None,
     ) -> None:
+        params = reward_params("llm_judge", params)
         self.name = reward_name(params, "llm_judge")
         base_url = params.get("base_url")
         model = params.get("model")
         if not base_url or not model:
-            raise ValueError("llm_judge needs params.base_url and params.model")
+            raise ConfigError("llm_judge needs params.base_url and params.model")
         self.model = str(model)
         self.rubric = str(params.get("rubric", DEFAULT_RUBRIC))
         try:
             self.rubric.format(prompt="", response="", reference="", max_score=0)
         except (KeyError, IndexError, ValueError, AttributeError) as e:
-            raise ValueError(
+            raise ConfigError(
                 "llm_judge: rubric is a str.format template that may use {prompt}, {response}, "
                 f"{{reference}} and {{max_score}}; write a literal brace as {{{{ or }}}} ({type(e).__name__}: {e})"
             ) from None
         self.system_prompt = params.get("system_prompt")
         self.max_score = float(params.get("max_score", 10))
         if not 0 < self.max_score < math.inf:
-            raise ValueError("llm_judge: max_score must be a number above 0")
+            raise ConfigError("llm_judge: max_score must be a number above 0")
         self.normalize = bool(params.get("normalize", True))
         self.temperature = float(params.get("temperature", 0.0))
         self.max_tokens = int(params.get("max_tokens", 512))
@@ -146,19 +182,19 @@ class LLMJudgeReward:
         self.extra_body = dict(params.get("extra_body", {}))
         self.on_error = str(params.get("on_error", "zero"))
         if self.on_error not in ("zero", "raise"):
-            raise ValueError("llm_judge: on_error must be 'zero' or 'raise'")
+            raise ConfigError(f"llm_judge: on_error must be 'zero' or 'raise', got {self.on_error!r}")
         self.max_attempts = int(params.get("max_attempts", 4))
         if self.max_attempts < 1:
-            raise ValueError("llm_judge: max_attempts must be at least 1 (1 turns retrying off)")
+            raise ConfigError("llm_judge: max_attempts must be at least 1 (1 turns retrying off)")
         self.retry_backoff_s = float(params.get("retry_backoff_s", 1.0))
         self.retry_max_wait_s = float(params.get("retry_max_wait_s", 60.0))
         if not (self.retry_backoff_s >= 0 and self.retry_max_wait_s >= 0):
-            raise ValueError("llm_judge: retry_backoff_s and retry_max_wait_s must not be negative")
+            raise ConfigError("llm_judge: retry_backoff_s and retry_max_wait_s must not be negative")
         self._wait = wait or threading.Event.wait
         # A generator of its own: the process-wide one is seeded by the run and saved with its
         # checkpoints, and a retry must not move it.
         self._jitter = random.Random()
-        self.scope = str(params.get("scope", "last"))
+        self.scope = response_scope(params, "llm_judge")
         self.reference_key = params.get("reference_key")
 
         headers = {"Content-Type": "application/json"}
@@ -281,7 +317,7 @@ class LLMJudgeReward:
 
 
 def make_llm_judge(
-    params: dict[str, Any],
+    params: Mapping[str, Any],
     *,
     client: httpx.Client | None = None,
     wait: Callable[[threading.Event, float], bool] | None = None,

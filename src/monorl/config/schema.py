@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from monorl.config.loader import mask_secrets
 from monorl.core.errors import ConfigError
 from monorl.core.home import DEFAULT_RUN_ROOT
+from monorl.core.params import unknown_params
 
 #: A dotted module path, as an import statement takes it.
 _MODULE_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
@@ -479,10 +480,36 @@ class TrainerConfig(_Model):
     )
 
 
+def _check_params(model: type[BaseModel], namespace: str, name: str, params: dict[str, Any]) -> None:
+    """Refuse the keys of a free-form ``params`` mapping that the built-in type ``name`` does not
+    read (:mod:`monorl.core.params`), each as a problem of its own at ``params.<key>``. A type
+    that is not built in takes what it likes."""
+    problems = unknown_params(namespace, name, params)
+    if problems:
+        raise ValidationError.from_exception_data(
+            model.__name__,
+            [
+                # the key stands in for the input: the value may be a secret
+                {
+                    "type": "value_error",
+                    "loc": ("params", *loc),
+                    "input": loc[-1],
+                    "ctx": {"error": ValueError(problem)},
+                }
+                for loc, problem in problems
+            ],
+        )
+
+
 class RewardSpec(_Model):
     type: str = Field(..., description="Reward function name (see /api/system for the list).")
     weight: float = Field(1.0, description="Multiplier when combining several rewards.")
     params: dict[str, Any] = Field(default_factory=dict, description="Parameters of the reward function.")
+
+    @model_validator(mode="after")
+    def _check_params(self) -> RewardSpec:
+        _check_params(RewardSpec, "reward", self.type, self.params)
+        return self
 
 
 class EnvConfig(_Model):
@@ -505,6 +532,11 @@ class EnvConfig(_Model):
         ),
     )
     params: dict[str, Any] = Field(default_factory=dict, description="Environment-specific parameters.")
+
+    @model_validator(mode="after")
+    def _check_params(self) -> EnvConfig:
+        _check_params(EnvConfig, "env", self.type, self.params)
+        return self
 
 
 class ClusterConfig(_Model):

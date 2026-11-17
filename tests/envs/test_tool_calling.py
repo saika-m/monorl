@@ -13,6 +13,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from monorl.core.errors import ConfigError
 from monorl.core.types import Completion, Sample
 from monorl.envs import tool_calling as tc
 from monorl.envs.tool_calling import (
@@ -212,7 +213,7 @@ def test_tool_output_truncation():
 
 
 def test_load_tools_unknown_and_registered(monkeypatch):
-    with pytest.raises(KeyError):
+    with pytest.raises(ConfigError):
         load_tools({"tools": ["nope"]})
 
     mod = types.ModuleType("_monorl_test_tools")

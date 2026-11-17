@@ -42,7 +42,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from monorl.core.errors import EnvironmentError_
+from monorl.core.errors import ConfigError, EnvironmentError_
+from monorl.core.params import checked_params, declare_params
 from monorl.core.types import Completion, Message, Sample, StepResult
 from monorl.envs.protocol import (
     EnvSpec,
@@ -69,10 +70,26 @@ response carries messages, and media in them by reference; a screenshot inlined 
 URL is a few MiB."""
 
 
+declare_params(
+    "env",
+    "remote",
+    "transport",
+    "command",
+    "cwd",
+    "env",
+    "url",
+    "urls",
+    "headers",
+    "parallel",
+    "timeout_s",
+    "max_response_bytes",
+)
+
+
 def _response_limit(params: Mapping[str, Any]) -> int:
     value = params.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"remote env: params.max_response_bytes must be a positive integer, got {value!r}")
+        raise ConfigError(f"remote env: params.max_response_bytes must be a positive integer, got {value!r}")
     return value
 
 
@@ -556,14 +573,16 @@ def _pool_key(params: Mapping[str, Any]) -> tuple[Any, ...]:
 
 
 def slot_source_for(params: Mapping[str, Any]) -> SlotSource:
-    """Shared transport pool for ``params`` (created on first use)."""
+    """Shared transport pool for ``params`` (created on first use). Params the ``remote``
+    environment does not take, or cannot run with, are a :class:`ConfigError`."""
+    params = checked_params("env", "remote", params, where="env.params")
     transport = params.get("transport", "stdio")
     if transport not in ("stdio", "http"):
-        raise ValueError(f"remote env: unknown transport {transport!r}; expected 'stdio' or 'http'")
+        raise ConfigError(f"remote env: unknown transport {transport!r}; expected 'stdio' or 'http'")
     if transport == "http" and not _http_urls(params):
-        raise ValueError("remote env: http transport needs params.url (or params.urls for replicas)")
+        raise ConfigError("remote env: http transport needs params.url (or params.urls for replicas)")
     if transport == "stdio" and not params.get("command"):
-        raise ValueError("remote env: stdio transport needs params.command")
+        raise ConfigError("remote env: stdio transport needs params.command")
     key = _pool_key(params)
     with _POOLS_LOCK:
         source = _POOLS.get(key)

@@ -353,6 +353,10 @@ env:
 | `workdir` | `root`: directory the per-episode directories are created under (default: system temp dir). `template`: directory copied into every fresh working directory. |
 | `model` | Model name the agent is told (default `model.name_or_path`). |
 | `gateway` | `bind`: address the gateway listens on, `port` (default: any free one), `host`: the name the agent reaches this machine under (§1, Reachability). The defaults follow where the agent runs: loopback for processes on this host. |
+| `sandbox` | Where the agent and the verifier run: `{backend: local}` (default, processes on this host) or `{backend: docker, ...}` (a container per episode); the options are in [`SANDBOX.md`](SANDBOX.md). |
+| `fetch_images` | Whether the gateway downloads images an agent sends as `http(s)` URLs. Default: `true` for local processes, `false` in a container ([`SANDBOX.md`](SANDBOX.md), section 2). |
+
+Any other key is refused when the config is validated, with the key it resembles.
 
 Placeholders in `command`, `env` values and `verifier`: `{task_file}`, `{workdir}`,
 `{base_url}`, `{anthropic_base_url}`, `{api_key}`, `{model}`, `{python}` (the interpreter running

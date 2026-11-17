@@ -31,6 +31,15 @@ messages plus the final turn. The reference is `sample.reference` (see [DATA.md]
 with `reference_key: k` (`exact_match`, `math_verify`, `code_exec`, `llm_judge`) `reference[k]` of
 a dict reference holding `k`, else `sample.metadata[k]` when present, else the whole reference.
 
+A built-in reads the parameters of its table below and refuses any other, so that a misspelt key
+cannot change what a run trains on without a word. The config is refused when it is validated,
+before a model is loaded: the message names the key (`rewards.0.params.extrct`), says
+`unknown key`, the key it resembles if there is one (`did you mean extract?`) and the keys the
+reward takes. The members of a `composite` are checked the same way. A value a built-in cannot
+run with (an `extract` that does not exist, a missing `base_url`) is a `ConfigError` when the
+reward is built. A reward function of your own ([below](#writing-a-reward-function)) takes the
+`params` it likes.
+
 `rewards: []` is rejected at validation with `env.type: single_turn` and valid otherwise: the
 environment then supplies the whole reward. Per-turn rewards returned by an environment
 (`Turn.reward`, see [ENVIRONMENTS.md](ENVIRONMENTS.md)) are added in `ComponentLoop._score`
@@ -69,6 +78,7 @@ acceptable answers. Two numbers (after removing `,`, `$`, a trailing `%`) are co
 | `extract` | `last_number` | `last_number`, `boxed` (last `\boxed{}`), `after_hash`, `none` |
 | `normalize` | `[whitespace, case]` | For string comparison: collapse whitespace, lower-case |
 | `numeric_tolerance` | `1e-6` | Absolute tolerance of the numeric comparison |
+| `scope`, `reference_key`, `name` | `last`, unset, `exact_match` | See the section above |
 
 ```yaml
 rewards:
@@ -91,6 +101,7 @@ Returns 1.0 when the response's final answer is mathematically equivalent to the
 | --- | --- | --- |
 | `timeout_s` | `5` | Parse/verify timeout, applied on the main thread only (`signal.alarm`) |
 | `float_rounding`, `numeric_precision`, `strict` | `6`, `15`, `True` | To `math_verify.verify` |
+| `scope`, `reference_key`, `name` | `last`, unset, `math_verify` | See the section above |
 
 ```yaml
 rewards:
@@ -109,9 +120,11 @@ Regex check of the response: 1.0 or 0.0, or a fraction in [0, 1] with `require_a
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `patterns` | required | List of regexes; one string, or the key `pattern`, also works |
+| `patterns` | required | List of regexes; one string also works |
+| `pattern` | unset | One regex, read when `patterns` is unset |
 | `require_all` | `True` | `True`: 1.0 only if every pattern matches. `False`: fraction matched |
 | `flags`, `fullmatch` | `[DOTALL]`, `False` | `re` flag names; `re.fullmatch`, not `re.search` |
+| `scope`, `name` | `last`, `format` | See the section above |
 
 ```yaml
 rewards:
@@ -134,6 +147,7 @@ Returns `base` when the response length is inside `[min_tokens, max_tokens]` and
 | `min_tokens`, `max_tokens` | `0`, unset | Band in `unit`; no upper bound when unset |
 | `penalty_per_token`, `base`, `min_reward` | `0.01`, `1.0`, `0.0` | See the formula above |
 | `unit` | `tokens` | `tokens` (completion token ids), `chars`, or `words` (whitespace split) |
+| `scope`, `name` | `last`, `length` | See the section above |
 
 ```yaml
 rewards:
@@ -160,6 +174,7 @@ accepted by `normalize_tests` in `src/monorl/rewards/code_exec.py`.
 | `timeout_s`, `memory_mb` | `5.0`, `512` | Per test case: wall-clock limit, memory cap (`0`: off) |
 | `language`, `python` | `python`, current interpreter | Fence tag; interpreter used |
 | `mode`, `max_workers` | `fraction`, `min(8, cpu_count)` | `fraction` or `all`; thread count |
+| `scope`, `reference_key`, `name` | `last`, unset, `code_exec` | See the section above |
 
 ```yaml
 rewards:
@@ -195,10 +210,11 @@ the entry below was validated by building the reward from it.
 | `retry_backoff_s` | `1.0` | Longest wait before the first retry, in seconds; doubles per retry |
 | `retry_max_wait_s` | `60` | Seconds a judgment may wait between its attempts in total |
 | `on_error` | `zero` | A judgment that failed for good: `zero` (score 0.0) or `raise` |
+| `scope`, `reference_key`, `name` | `last`, unset, `llm_judge` | See the section above |
 
 The rubric may use `{prompt}`, `{response}`, `{reference}` and `{max_score}` and has to ask for
 the `<score>N</score>` line; a literal brace in it is written `{{` or `}}`. A rubric that does not
-format, a `max_score` of 0 and a `max_attempts` below 1 raise `ValueError` when the reward is
+format, a `max_score` of 0 and a `max_attempts` below 1 raise `ConfigError` when the reward is
 built.
 
 ```yaml
@@ -260,6 +276,7 @@ checkpoint was loaded); the entry below was validated only.
 | `device`, `dtype` | `cpu`, `float32` | Torch device; `float32`, `bfloat16` or `float16` |
 | `batch_size`, `max_length` | `8`, `4096` | Texts per forward pass; truncation length in tokens |
 | `label_index`, `normalize` | `0`, `none` | Logit used as the score; `none` or `sigmoid` |
+| `name` | `reward_model` | See the section above |
 
 ```yaml
 rewards:
@@ -271,6 +288,11 @@ rewards:
 A weighted sum of member rewards as one entry: `params.rewards` (required) is a list shaped like
 top-level `rewards`. As a top-level entry its total is in the breakdown under its `name` and each
 member's score under `<name>/<member key>` (metric `reward/<name>/<member key>`).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `rewards` | required | Member entries, each with `type`, `weight` and `params` |
+| `name` | `composite` | See the section above |
 
 ```yaml
 rewards:

@@ -5,6 +5,10 @@ Names: ``single_turn`` (prompt is the whole episode), ``tool_calling`` (multi-tu
 program that calls the policy through the capture gateway, :mod:`monorl.gateway`). ``openenv``
 and ``hermes`` are adapter-owned (:mod:`monorl.adapters`) and resolved lazily by the registry.
 
+Every built-in type declares the ``env.params`` keys it reads next to the code that reads them
+(:func:`monorl.core.params.declare_params`) and refuses any other: the schema when a config is
+validated, the factory when it is called. A type of a provider takes the params it likes.
+
 ``make_env(config)`` builds a fresh environment for one episode from ``config.env``: a stepped
 :class:`~monorl.core.interfaces.Environment`, or for ``harness`` an
 :class:`~monorl.core.interfaces.EpisodeDriver` that runs the whole episode.
@@ -15,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from monorl.core.interfaces import Environment, EpisodeDriver
+from monorl.core.params import checked_params
 from monorl.core.registry import ensure_providers, registry
 from monorl.envs.harness import HarnessEnv, make_harness_env, policy_processor
 from monorl.envs.protocol import EnvSpec
@@ -40,14 +45,14 @@ def _max_turns_override(config: RunConfig) -> int | None:
 
 
 def _make_single_turn(config: RunConfig, **kwargs: Any) -> SingleTurnEnv:
-    params = dict(config.env.params)
+    params = dict(checked_params("env", "single_turn", config.env.params, where="env.params"))
     params.setdefault("system_prompt", config.data.system_prompt)
     return SingleTurnEnv(**params)
 
 
 def _make_tool_calling(config: RunConfig, **kwargs: Any) -> ToolCallingEnv:
     override = _max_turns_override(config)
-    params = config.env.params
+    params = checked_params("env", "tool_calling", config.env.params, where="env.params")
     return make_tool_calling_env(
         params,
         max_turns=override if override is not None else int(params.get("max_turns", 4)),

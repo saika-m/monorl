@@ -93,12 +93,13 @@ def forget_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _config_file(tmp_path: Path, params: str) -> Path:
+    """A config whose reward is a provider's own type: a built-in takes only the params it reads."""
     path = tmp_path / "cfg.yaml"
     path.write_text(
         "model: {name_or_path: org/model}\n"
         "data: {uri: d.jsonl}\n"
         "rewards:\n"
-        "  - type: exact_match\n"
+        "  - type: my_judge\n"
         f"    params: {params}\n"
     )
     return path

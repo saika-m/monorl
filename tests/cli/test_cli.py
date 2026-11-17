@@ -218,7 +218,7 @@ def test_recipes_show_json_names_the_variable_of_a_secret(
     terminal or a CI log, as it stays out of ``config.yaml``."""
     from monorl.config import loader
 
-    body = RECIPE_BODY.replace("{type: exact_match}", "{type: exact_match, params: {k: '${JUDGE_API_KEY}'}}")
+    body = RECIPE_BODY.replace("{type: exact_match}", "{type: my_judge, params: {k: '${JUDGE_API_KEY}'}}")
     (tmp_path / "judged.yaml").write_text("# Judged.\n" + body)
     monkeypatch.setattr(loader, "_secrets", {})
     monkeypatch.setenv("MONORL_RECIPES_DIR", str(tmp_path))
@@ -389,6 +389,39 @@ def test_train_names_the_file_and_the_key_of_an_invalid_config(
         "rollout.group_size: Input should be a valid integer, unable to parse string as an integer (got 'two')",
         "trainer.max_stps: unknown key; did you mean max_steps?",
     ]
+
+
+def test_train_refuses_a_misspelt_reward_or_environment_parameter_before_it_starts_a_run(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import monorl.orchestrator
+
+    started: list[RunConfig] = []
+    monkeypatch.setattr(monorl.orchestrator, "run", lambda config, *a, **kw: started.append(config))
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "--config",
+            str(cfg_path),
+            "--set",
+            "rewards=[{type: exact_match, params: {extrct: boxed}}]",
+            "--set",
+            "env={type: tool_calling, params: {max_turn: 3}}",
+        ],
+        env={"COLUMNS": "1000"},
+    )
+    assert result.exit_code == 1 and started == []
+    head, reward, env = (line.strip() for line in result.output.strip().splitlines())
+    assert head == f"error: {cfg_path}: invalid RunConfig, 2 problems:"
+    assert reward.startswith(
+        "rewards.0.params.extrct: unknown key; did you mean extract? The exact_match reward takes: name, extract, "
+    )
+    assert env.startswith(
+        "env.params.max_turn: unknown key; did you mean max_turns? The tool_calling environment takes: tools, "
+    )
 
 
 def test_train_given_a_recipe_name_says_where_the_recipe_is(runner: CliRunner) -> None:
@@ -861,6 +894,16 @@ def test_env_serve_param_without_a_value_is_named_as_written(runner: CliRunner) 
     assert result.exit_code == 2, result.output
     assert "--param must look like key=value, got 'max_turns'" in result.output
     assert "params." not in result.output
+
+
+def test_env_serve_refuses_a_param_the_type_does_not_take(runner: CliRunner) -> None:
+    result = runner.invoke(
+        app,
+        ["env", "serve", "tool_calling", "-p", "tools=[calculator]", "-p", "max_turn=3"],
+        env={"COLUMNS": "1000"},
+    )
+    assert result.exit_code == 1, result.output
+    assert "env.params.max_turn: unknown key; did you mean max_turns?" in result.output
 
 
 def test_version_is_the_installed_distributions(runner: CliRunner) -> None:

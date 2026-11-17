@@ -30,20 +30,24 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import psutil
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import declare_params
 from monorl.core.types import RewardResult, Trajectory
 from monorl.rewards.base import (
     check_trajectories,
     extract_code_block,
     reference_value,
+    response_scope,
     response_text,
     reward_name,
+    reward_params,
 )
 
 # Runs inside the child: apply the rlimit when the platform allows it, then execute the file as
@@ -227,15 +231,31 @@ class Sandbox:
             pass
 
 
+declare_params(
+    "reward",
+    "code_exec",
+    "name",
+    "mode",
+    "language",
+    "reference_key",
+    "scope",
+    "max_workers",
+    "timeout_s",
+    "memory_mb",
+    "python",
+)
+
+
 class CodeExecReward:
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: Mapping[str, Any]) -> None:
+        params = reward_params("code_exec", params)
         self.name = reward_name(params, "code_exec")
         self.mode = str(params.get("mode", "fraction"))
         if self.mode not in ("fraction", "all"):
-            raise ValueError(f"code_exec: mode must be 'fraction' or 'all', got {self.mode!r}")
+            raise ConfigError(f"code_exec: params.mode must be 'fraction' or 'all', got {self.mode!r}")
         self.language = str(params.get("language", "python"))
         self.reference_key = params.get("reference_key")
-        self.scope = str(params.get("scope", "last"))
+        self.scope = response_scope(params, "code_exec")
         self.max_workers = int(params.get("max_workers", min(8, os.cpu_count() or 1)))
         self.sandbox = Sandbox(
             timeout_s=float(params.get("timeout_s", 5.0)),
@@ -295,5 +315,5 @@ class CodeExecReward:
         return ref
 
 
-def make_code_exec(params: dict[str, Any], **_: Any) -> CodeExecReward:
+def make_code_exec(params: Mapping[str, Any], **_: Any) -> CodeExecReward:
     return CodeExecReward(params)

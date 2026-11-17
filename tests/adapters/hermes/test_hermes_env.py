@@ -18,6 +18,7 @@ from monorl.adapters.hermes.env import (
     sandbox_overrides,
 )
 from monorl.config.schema import RunConfig
+from monorl.core.errors import ConfigError
 from monorl.core.registry import registry
 from monorl.core.types import Completion, Sample
 
@@ -75,9 +76,11 @@ def test_register_is_idempotent_and_patchset_registered() -> None:
 
 
 def test_unknown_param_and_unknown_tool_are_rejected() -> None:
-    with pytest.raises(ValueError, match="unknown params"):
+    with pytest.raises(
+        ConfigError, match=r"env\.params\.workspace: unknown key; did you mean workspace_dir\?"
+    ):
         make_hermes_env({"workspace": "/tmp"}, max_turns=1)
-    with pytest.raises(ValueError, match="unknown Hermes tool/toolset names"):
+    with pytest.raises(ConfigError, match="unknown Hermes tool/toolset names"):
         resolve_tool_names(["read_file", "no_such_tool"])
 
 
@@ -96,11 +99,11 @@ def test_sandbox_overrides() -> None:
         "docker",
         {"docker_image": "python:3.12", "env_type": "docker"},
     )
-    with pytest.raises(ValueError, match="backend must be one of"):
+    with pytest.raises(ConfigError, match="backend must be one of"):
         sandbox_overrides({"backend": "firecracker"})
-    with pytest.raises(ValueError, match="not supported by the 'local' backend"):
+    with pytest.raises(ConfigError, match="not supported by the 'local' backend"):
         sandbox_overrides({"image": "python:3.12"})
-    with pytest.raises(ValueError, match="unknown keys"):
+    with pytest.raises(ConfigError, match="unknown keys"):
         sandbox_overrides({"cpu": 2})
 
 

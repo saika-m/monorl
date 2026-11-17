@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from monorl.core.errors import EnvironmentError_
+from monorl.core.errors import ConfigError, EnvironmentError_
 from monorl.core.types import Completion, Sample
 from monorl.envs.remote import RemoteEnv, StdioTransport, shutdown_pools, slot_source_for
 
@@ -224,5 +224,5 @@ def test_stdio_response_line_longer_than_the_limit_restarts_the_process(tmp_path
 
 @pytest.mark.parametrize("value", [0, -1, "64MB", 1.5, True])
 def test_max_response_bytes_must_be_a_positive_integer(value):
-    with pytest.raises(ValueError, match="max_response_bytes must be a positive integer"):
+    with pytest.raises(ConfigError, match="max_response_bytes must be a positive integer"):
         slot_source_for({"transport": "http", "url": "http://127.0.0.1:9", "max_response_bytes": value})

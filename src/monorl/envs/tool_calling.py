@@ -42,6 +42,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import checked_params, declare_params
 from monorl.core.types import Completion, Message, Sample, StepResult, ToolCall, message_text
 from monorl.rewards.code_exec import Sandbox
 
@@ -320,9 +322,14 @@ def builtin_tools(params: Mapping[str, Any]) -> dict[str, Tool]:
 
 
 def load_tools(params: Mapping[str, Any]) -> list[Tool]:
-    """Resolve ``params["tools"]`` (names; default: all built-ins) against built-ins + registered tools."""
+    """Resolve ``params["tools"]`` (names; default: all built-ins) against built-ins + registered
+    tools. A module of ``params["tool_modules"]`` that cannot be imported and a name that is no
+    tool are a :class:`ConfigError`."""
     for mod in params.get("tool_modules") or []:
-        importlib.import_module(mod)
+        try:
+            importlib.import_module(mod)
+        except ImportError as e:
+            raise ConfigError(f"env.params.tool_modules: cannot import {mod!r}: {e}") from e
     available = {**builtin_tools(params), **_REGISTRY}
     names = params.get("tools")
     if names is None:
@@ -330,7 +337,10 @@ def load_tools(params: Mapping[str, Any]) -> list[Tool]:
     out: list[Tool] = []
     for name in names:
         if name not in available:
-            raise KeyError(f"unknown tool {name!r}; available: {sorted(available)}")
+            raise ConfigError(
+                f"env.params.tools: unknown tool {name!r}; available: {sorted(available)} "
+                "(a tool of your own is found once its module is listed in env.params.tool_modules)"
+            )
         out.append(available[name])
     return out
 
@@ -516,9 +526,29 @@ class ToolCallingEnv:
         self._sample = None
 
 
+declare_params(
+    "env",
+    "tool_calling",
+    "tools",
+    "tool_modules",
+    "system_prompt",
+    "invalid_call_penalty",
+    "max_calls_per_turn",
+    "max_turns",  # read by the registered factory (monorl.envs) when env.max_turns is not set
+    "python_timeout_s",
+    "python_memory_mb",
+    "max_tool_output_chars",
+    "corpus",
+    "lookup_max_results",
+)
+
+
 def make_tool_calling_env(
     params: Mapping[str, Any], *, max_turns: int, system_prompt: str | None = None
 ) -> ToolCallingEnv:
+    """The environment of ``env.params``; a key that ``tool_calling`` does not take is a
+    :class:`ConfigError`."""
+    params = checked_params("env", "tool_calling", params, where="env.params")
     return ToolCallingEnv(
         tools=load_tools(params),
         max_turns=max_turns,

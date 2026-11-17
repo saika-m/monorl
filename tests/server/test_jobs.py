@@ -427,7 +427,7 @@ def test_a_secret_of_a_recipe_is_in_no_response_and_no_file_of_its_job(
     monkeypatch.setattr(loader, "_secrets", {})
     monkeypatch.setenv("JUDGE_API_KEY", api_key)
     reference = {"api_key": "${JUDGE_API_KEY}"}
-    config_dict["rewards"] = [{"type": "exact_match", "params": reference}]
+    config_dict["rewards"] = [{"type": "my_judge", "params": reference}]  # a provider's reward
     (recipes_dir / "judged.yaml").write_text("# Judged.\n" + yaml.safe_dump(config_dict))
 
     responses = [client.get("/api/recipes")]

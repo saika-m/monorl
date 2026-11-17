@@ -119,18 +119,18 @@ def test_prepare_stages_run_dir(make_config, tmp_path: Path):
 def test_prepare_leaves_a_secret_of_a_reward_in_no_file_of_the_run_directory(
     base_config: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """``api_key: ${OPENAI_API_KEY}`` in the params of ``llm_judge``: no file that ``prepare`` stages
+    """``api_key: ${OPENAI_API_KEY}`` in the ``extra_body`` of ``llm_judge``: no file that ``prepare`` stages
     holds the value, and the reward module names the variable for verl's workers to resolve."""
     from monorl.config import loader
 
     monkeypatch.setattr(loader, "_secrets", {})
     monkeypatch.setenv("OPENAI_API_KEY", "sk-verl-0123456789abcdef")
-    params = {"model": "judge-model", "api_key": "${OPENAI_API_KEY}"}
+    params = {"model": "judge-model", "extra_body": {"api_key": "${OPENAI_API_KEY}"}}
     base_config["rewards"] = [{"type": "llm_judge", "params": params}]
     source = tmp_path / "user-config.yaml"
     source.write_text(yaml.safe_dump(base_config))
     cfg = RunConfig.from_yaml(source)
-    assert cfg.rewards[0].params["api_key"] == "sk-verl-0123456789abcdef"
+    assert cfg.rewards[0].params["extra_body"]["api_key"] == "sk-verl-0123456789abcdef"
 
     run_dir = tmp_path / "run"
     VerlBackend(cfg).prepare(cfg, run_dir)

@@ -8,28 +8,52 @@ policy tokens (``Trajectory.num_response_tokens``). ``scope`` selects last turn 
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from monorl.core.errors import ConfigError
+from monorl.core.params import declare_params
 from monorl.core.types import RewardResult, Trajectory
-from monorl.rewards.base import check_trajectories, response_text, reward_name
+from monorl.rewards.base import (
+    check_trajectories,
+    response_scope,
+    response_text,
+    reward_name,
+    reward_params,
+)
+
+declare_params(
+    "reward",
+    "length",
+    "name",
+    "min_tokens",
+    "max_tokens",
+    "penalty_per_token",
+    "base",
+    "min_reward",
+    "unit",
+    "scope",
+)
 
 
 class LengthReward:
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: Mapping[str, Any]) -> None:
+        params = reward_params("length", params)
         self.name = reward_name(params, "length")
         self.min_len = int(params.get("min_tokens", 0))
         max_len = params.get("max_tokens")
         self.max_len = int(max_len) if max_len is not None else None
         if self.max_len is not None and self.max_len < self.min_len:
-            raise ValueError("length reward: max_tokens must be >= min_tokens")
+            raise ConfigError("length reward: max_tokens must be >= min_tokens")
         self.penalty = float(params.get("penalty_per_token", 0.01))
         self.base = float(params.get("base", 1.0))
         self.min_reward = float(params.get("min_reward", 0.0))
         self.unit = str(params.get("unit", "tokens"))
         if self.unit not in ("tokens", "chars", "words"):
-            raise ValueError(f"length reward: unknown unit {self.unit!r}")
-        self.scope = str(params.get("scope", "last"))
+            raise ConfigError(
+                f"length reward: params.unit must be 'tokens', 'chars' or 'words', got {self.unit!r}"
+            )
+        self.scope = response_scope(params, "length")
 
     def measure(self, trajectory: Trajectory) -> int:
         if self.unit == "tokens":
@@ -57,5 +81,5 @@ class LengthReward:
         return out
 
 
-def make_length(params: dict[str, Any], **_: Any) -> LengthReward:
+def make_length(params: Mapping[str, Any], **_: Any) -> LengthReward:
     return LengthReward(params)
