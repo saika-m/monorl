@@ -17,12 +17,14 @@ The web server and CLI only ever read these files; they never import backend cod
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -159,7 +161,7 @@ class RunReporter:
             self.log(f"removed the lines after step {step}: {counts}")
 
     # -- log -----------------------------------------------------------------------------
-    def log(self, message: str) -> None:
+    def log(self, message: str, *, echo: bool = True) -> None:
         from monorl.config.loader import mask_secrets  # monorl.config imports this package
 
         # A message that quotes a value of the config (an error of a reward, a URL with its key)
@@ -167,8 +169,24 @@ class RunReporter:
         line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {mask_secrets(message)}"
         with self._lock, open(self.run_dir / LOG_FILE, "a") as f:
             f.write(line + "\n")
-        if self._echo:
+        if echo and self._echo:
             print(line, file=sys.stderr, flush=True)
+
+    @contextmanager
+    def capture_logging(self) -> Iterator[None]:
+        """While the block runs, what this process logs under ``monorl`` through :mod:`logging` at
+        WARNING or above is a line of ``run.log``: ``<LEVEL> <logger>: <message>``, with the
+        traceback of the record when it has one. The terminal shows each record once: the line is
+        echoed like any other, unless a handler that was configured elsewhere shows the record
+        already. (With no handler at all, :mod:`logging` prints warnings to stderr itself; the
+        handler of this block takes that place.)"""
+        handler = _RunLogHandler(self)
+        logger = logging.getLogger("monorl")
+        logger.addHandler(handler)
+        try:
+            yield
+        finally:
+            logger.removeHandler(handler)
 
     # -- paths ---------------------------------------------------------------------------
     @property
@@ -181,6 +199,27 @@ class RunReporter:
     @property
     def final_dir(self) -> Path:
         return self.run_dir / FINAL_DIR
+
+
+class _RunLogHandler(logging.Handler):
+    def __init__(self, reporter: RunReporter) -> None:
+        super().__init__(logging.WARNING)
+        self._reporter = reporter
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._reporter.log(self.format(record), echo=not self._handled_elsewhere(record))
+        except Exception:  # noqa: BLE001 - as every logging handler: a log call never raises
+            self.handleError(record)
+
+    def _handled_elsewhere(self, record: logging.LogRecord) -> bool:
+        logger: logging.Logger | None = logging.getLogger(record.name)
+        while logger is not None:
+            if any(h is not self and record.levelno >= h.level for h in logger.handlers):
+                return True
+            logger = logger.parent if logger.propagate else None
+        return False
 
 
 # -- readers used by the server/CLI -------------------------------------------------------

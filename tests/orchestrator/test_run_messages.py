@@ -1,10 +1,15 @@
-"""What a run says when it fails: the message for a mistake of its user, the traceback otherwise."""
+"""What a run says when it fails (the message for a mistake of its user, the traceback otherwise)
+and where the warnings of its components go."""
 
 from __future__ import annotations
 
+import io
+import logging
+import re
 from pathlib import Path
 from typing import Any
 
+import fakes
 import pytest
 
 from monorl.core.reporting import read_status
@@ -103,3 +108,79 @@ def test_a_tokenizer_path_that_does_not_exist_fails_the_run_and_a_hub_id_is_not_
     )
     result = run(make_config(model={"tokenizer_name_or_path": "org/tokenizer"}, trainer={"max_steps": 1}))
     assert result.state == "succeeded"
+
+
+WARNING = "WARNING monorl.rewards.test_warning: reward test_warning: 4 scored"
+
+
+def _warning_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if "reward test_warning" in line]
+
+
+def test_warnings_logged_during_a_run_are_lines_of_its_log_until_it_ends(make_config: Any) -> None:
+    log = logging.getLogger("monorl.rewards.test_warning")
+    log.warning("reward test_warning: before the run")
+    result = run(make_config(rewards=[{"type": "test_warning"}], trainer={"max_steps": 2}))
+    log.warning("reward test_warning: after the run")
+    assert result.state == "succeeded"
+    lines = _log(result).splitlines()
+    warned = [i for i, line in enumerate(lines) if "reward test_warning" in line]
+    assert len(warned) == 2  # one per step, none of before or after
+    for i in warned:
+        assert re.fullmatch(rf"\d{{4}}-\d\d-\d\d \d\d:\d\d:\d\d {re.escape(WARNING)}", lines[i])
+    steps = [i for i, line in enumerate(lines) if re.search(r"\[running\] step \d/2 ", line)]
+    assert warned[0] < steps[0] < warned[1] < steps[1]  # where it happened, not at the end
+
+
+def test_a_failed_run_keeps_its_warnings_and_stops_collecting_them(make_config: Any) -> None:
+    result = run(
+        make_config(
+            rewards=[{"type": "test_warning"}], trainer={"max_steps": 3, "extra": {"fake_fail_at": 2}}
+        )
+    )
+    assert result.state == "failed"
+    logging.getLogger("monorl.rewards.test_warning").warning("reward test_warning: after the run")
+    assert [line[20:] for line in _warning_lines(_log(result))] == [WARNING, WARNING]
+
+
+def test_logging_below_warning_and_outside_monorl_is_not_in_the_log(
+    make_config: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Chatty(fakes.ExactReward):
+        def __call__(self, trajectories: Any) -> Any:
+            logging.getLogger("monorl.rewards.chatty").info("chatty: an info")
+            logging.getLogger("somelibrary").warning("chatty: not ours")
+            logging.getLogger("monorl.rewards.chatty").error("chatty: an error")
+            return super().__call__(trajectories)
+
+    monkeypatch.setattr(fakes, "WarningReward", Chatty)
+    monkeypatch.setattr(logging.getLogger("monorl"), "level", logging.DEBUG)
+    result = run(make_config(rewards=[{"type": "test_warning"}], trainer={"max_steps": 1}))
+    chatty = [line[20:] for line in _log(result).splitlines() if "chatty" in line]
+    assert chatty == ["ERROR monorl.rewards.chatty: chatty: an error"]
+
+
+def test_the_terminal_shows_a_warning_of_a_run_once(
+    make_config: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no logging configured Python prints a warning to stderr itself; during a run its log
+    line is echoed instead. A handler configured by the program shows the record: no echo then."""
+    monkeypatch.delenv("MONORL_REPORTER_ECHO", raising=False)
+    monorl_log = logging.getLogger("monorl")
+    monkeypatch.setattr(monorl_log, "propagate", False)  # away from the handlers pytest installs
+    config = make_config(rewards=[{"type": "test_warning"}], trainer={"max_steps": 1})
+
+    result = run(config)
+    assert [line[20:] for line in _warning_lines(capsys.readouterr().err)] == [WARNING]
+    assert [line[20:] for line in _warning_lines(_log(result))] == [WARNING]
+
+    stream = io.StringIO()
+    own = logging.StreamHandler(stream)
+    monorl_log.addHandler(own)
+    try:
+        result = run(config)
+    finally:
+        monorl_log.removeHandler(own)
+    assert _warning_lines(capsys.readouterr().err) == []
+    assert stream.getvalue() == "reward test_warning: 4 scored\n"
+    assert [line[20:] for line in _warning_lines(_log(result))] == [WARNING, WARNING]  # appended to

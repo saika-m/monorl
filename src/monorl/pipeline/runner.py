@@ -286,14 +286,16 @@ class _StageRunner:
         run_config = build_sampling_config(self.config, index, previous_model=self.previous_model)
         output = Path(stage.output).expanduser() if stage.output else None
         try:
-            outcome = run_rejection_sampling(
-                stage,
-                run_config,
-                run_dir=Path(record.run_dir),
-                cancel=self.cancel,
-                output=output,
-                known_data=known_data_configs(self.config),
-            )
+            # The stage's own reporter is made in the call; this one writes to the same run.log.
+            with RunReporter(record.run_dir).capture_logging():
+                outcome = run_rejection_sampling(
+                    stage,
+                    run_config,
+                    run_dir=Path(record.run_dir),
+                    cancel=self.cancel,
+                    output=output,
+                    known_data=known_data_configs(self.config),
+                )
         except KeyboardInterrupt:
             record.state, record.error, record.finished_at = "cancelled", "interrupted", time.time()
             return
@@ -313,7 +315,8 @@ class _StageRunner:
     def _eval(self, index: int, stage: EvalStage, record: StageRecord) -> None:
         run_config = build_sampling_config(self.config, index, previous_model=self.previous_model)
         try:
-            outcome = run_eval(stage, run_config, run_dir=Path(record.run_dir), cancel=self.cancel)
+            with RunReporter(record.run_dir).capture_logging():
+                outcome = run_eval(stage, run_config, run_dir=Path(record.run_dir), cancel=self.cancel)
         except KeyboardInterrupt:
             record.state, record.error, record.finished_at = "cancelled", "interrupted", time.time()
             return

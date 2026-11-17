@@ -211,6 +211,22 @@ def test_nothing_accepted_fails_stage(make_pipeline: Any) -> None:
     assert "accepted 0" in read_status(result.run_dir)["message"]
 
 
+def test_warnings_of_a_sampling_stage_are_in_the_log_of_that_stage(make_pipeline: Any) -> None:
+    stages = [
+        {"type": "rejection_sample", "name": "rs", "num_samples": 2, "min_reward": 0.0},
+        {"type": "eval", "name": "eval", "max_prompts": 2},
+    ]
+    result = run_pipeline(make_pipeline(stages, rewards=[{"type": "test_warning"}]))
+    assert result.state == "succeeded", result.error
+    for stage, scored in zip(result.stages, ([4, 4, 4], [2]), strict=True):
+        log = (Path(stage["run_dir"]) / "run.log").read_text().splitlines()
+        warnings = [line[20:] for line in log if "reward test_warning" in line]
+        prefix = "WARNING monorl.rewards.test_warning: reward test_warning:"
+        assert warnings == [f"{prefix} {n} scored" for n in scored]
+    pipeline_log = (Path(result.run_dir) / "run.log").read_text()
+    assert "reward test_warning" not in pipeline_log
+
+
 def test_invalid_override_fails_before_running(make_pipeline: Any) -> None:
     stages = [{"type": "train", "name": "bad", "overrides": {"trainer": {"max_steps": "many"}}}]
     result = run_pipeline(make_pipeline(stages))

@@ -88,6 +88,13 @@ def run(
         config = config.model_copy(update={"run_name": default_run_name(config)})
     target = Path(run_dir).expanduser() if run_dir is not None else resolve_run_dir(config)
     reporter = RunReporter(target)
+    with reporter.capture_logging():
+        return _run(config, reporter, resume=resume, cancel=cancel)
+
+
+def _run(
+    config: RunConfig, reporter: RunReporter, *, resume: bool, cancel: threading.Event | None
+) -> RunResult:
     config.to_yaml(reporter.run_dir / CONFIG_FILE)
     if not resume:
         # This run appends to the records of a run that was here before. A line that one did not
