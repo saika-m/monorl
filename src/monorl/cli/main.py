@@ -602,13 +602,29 @@ def env_serve(
         None, "--param", "-p", help="env.params override key=value (repeatable)."
     ),
     parallel: int = typer.Option(8, "--parallel", min=1, help="Concurrent episodes the server accepts."),
+    allowed_host: list[str] | None = typer.Option(
+        None,
+        "--allowed-host",
+        help=(
+            "With --transport http: a DNS name clients may address the server by, besides localhost "
+            "and its IP addresses (repeatable; '*' accepts any). Needed when other machines reach "
+            "the server under a name, as in http://env-1:8080."
+        ),
+    ),
 ) -> None:
     """Expose a Python environment as a MEP/1 server (stdio or http)."""
     if transport not in ("stdio", "http"):
         _fail("--transport must be stdio or http", code=2)
+    if allowed_host and transport != "http":
+        _fail("--allowed-host applies to --transport http; the stdio transport has no Host names", code=2)
     from monorl.core.registry import ensure_providers, registry
+    from monorl.envs.server import allowed_host_names
     from monorl.envs.server import serve as serve_env
 
+    try:
+        allowed_host_names(allowed_host or ())
+    except ValueError as e:
+        _fail(f"--allowed-host: {e}", code=2)
     try:
         if config is not None:
             data = load_yaml(config)
@@ -634,6 +650,7 @@ def env_serve(
         port=port,
         name=env_type,
         parallel_episodes=parallel,
+        allowed_hosts=allowed_host or (),
     )
 
 
