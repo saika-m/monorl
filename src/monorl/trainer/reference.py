@@ -309,9 +309,10 @@ class ReferenceTrainer:
         else:
             self.hf_model = model
             self.model = self._wrap_lora(self.hf_model) if self.lora_enabled else self.hf_model
-        if config.trainer.gradient_checkpointing and not getattr(
-            self.hf_model, "is_gradient_checkpointing", False
-        ):
+        # What `is_gradient_checkpointing` reports, read from the modules: transformers 5.23
+        # deprecates the property.
+        checkpointing = any(getattr(m, "gradient_checkpointing", False) for m in self.hf_model.modules())
+        if config.trainer.gradient_checkpointing and not checkpointing:
             self.hf_model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
