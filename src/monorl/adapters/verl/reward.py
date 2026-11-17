@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from monorl.adapters.verl.data import DATA_SOURCE, decode_reference
+from monorl.config.loader import interpolate_env, mask_secrets
 from monorl.config.schema import RewardSpec, RunConfig
 from monorl.core.types import Completion, Sample, Trajectory, Turn
 
@@ -64,12 +65,14 @@ def trajectory_from_verl(
 
 
 class RewardBridge:
-    """Builds the composite reward once and scores verl samples one at a time."""
+    """Builds the composite reward once and scores verl samples one at a time. ``specs`` are as
+    :func:`write_reward_module` embeds them: a secret is ``${NAME}`` there and read from the
+    environment of verl's process here, like the ones of ``config.yaml``."""
 
     def __init__(self, specs: list[dict[str, Any]], config_path: str | Path | None = None) -> None:
         from monorl.rewards import build_reward
 
-        self.specs = [RewardSpec.model_validate(s) for s in specs]
+        self.specs = [RewardSpec.model_validate(s) for s in interpolate_env(specs)]
         self.config = RunConfig.from_yaml(config_path) if config_path and Path(config_path).exists() else None
         self.reward = build_reward(self.specs, config=self.config)
 
@@ -115,7 +118,7 @@ def write_reward_module(
         raise ValueError("verl backend needs at least one entry in `rewards`")
     path = reward_module_path(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    specs = [spec.model_dump(mode="json") for spec in config.rewards]
+    specs = mask_secrets([spec.model_dump(mode="json") for spec in config.rewards])
     path.write_text(
         _MODULE_TEMPLATE.format(
             specs=repr(specs),
