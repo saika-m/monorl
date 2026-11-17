@@ -285,7 +285,9 @@ def probed_hf_engine(config: Any, *, replica: int = 0, **_: Any) -> RolloutEngin
     from monorl.rollout.hf_engine import HFRolloutEngine
 
     class Probed(HFRolloutEngine):
-        def generate(self, prompts: Any, params: Any) -> list[list[Completion]]:
+        def generate(
+            self, prompts: Any, params: Any, *, max_new_tokens: Any = None
+        ) -> list[list[Completion]]:
             held = fingerprint(dict(self.model.state_dict()))
             return [[Completion(text=json.dumps(held), token_ids=[])] for _ in prompts]
 

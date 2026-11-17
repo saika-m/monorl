@@ -230,6 +230,8 @@ class RolloutEngineActor:
         params: SamplingParams,
         max_new_tokens: Sequence[int] | None = None,
     ) -> list[list[Completion]]:
+        if max_new_tokens is None:  # like every caller: the argument only when a cap differs
+            return self._engine().generate(prompts, params)
         return self._engine().generate(prompts, params, max_new_tokens=max_new_tokens)
 
     def update_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
