@@ -295,15 +295,22 @@ underscores is `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PWD`, `CREDENTIA
 `CREDENTIALS`, in any case: `OPENAI_API_KEY`, `HF_TOKEN` and `DB_PASSWORD` are, `TOKENIZER_PATH`
 and `MONKEY` are not. The components of the run are built with the value; the file names the
 variable, wherever the value occurs inside a string.
-With `api_key: ${DEMO_JUDGE_API_KEY}` added to the reward's `params` of
-`grpo_gsm8k_smollm_cpu.yaml` and the variable set to `sk-demo-0123456789abcdef`, one step leaves
-the value in no file of the run directory, and lines 115 to 118 of `config.yaml` are:
+Run here with a copy of `grpo_gsm8k_smollm_cpu.yaml` that has a second reward, an `llm_judge`
+whose `extra_body` (the mapping it adds to every request, where a key that an endpoint wants in
+the body goes) holds `api_key: ${DEMO_JUDGE_API_KEY}`, with `base_url: http://127.0.0.1:9/v1`
+(nothing listens there, so every judgment failed and scored 0) and `max_attempts: 1`. With the
+variable set to `sk-demo-0123456789abcdef`, one step leaves the value in no file of the run
+directory, and lines 118 to 125 of `config.yaml` are:
 
 ```yaml
+- type: llm_judge
   weight: 1.0
   params:
-    extract: last_number
-    api_key: ${DEMO_JUDGE_API_KEY}
+    base_url: http://127.0.0.1:9/v1
+    model: judge
+    max_attempts: 1
+    extra_body:
+      api_key: ${DEMO_JUDGE_API_KEY}
 ```
 
 The file loads to the same config where the variable is set, which is how `--resume` with this

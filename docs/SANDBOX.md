@@ -142,6 +142,7 @@ it with `env.params.gateway`:
 
 ```yaml
 env:
+  type: harness
   params:
     gateway:
       bind: 172.17.0.1      # Linux: listen on the Docker bridge only instead of every interface
