@@ -616,10 +616,24 @@ def _held_candidate_generator(layers: MtpLayers, generation_config: Any, logits_
             self.logits_processor = logits_processor
             self.is_main_model_prefill = True
             self._drafted = 0
+            self._max_length = generation_config.max_length
 
         def get_candidates(self, input_ids: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+            if self._max_length - input_ids.shape[1] <= 1:
+                # Only the policy's next token can be emitted. Drafting (and verifying) a
+                # continuation here adds work but cannot save a policy forward pass.
+                self._drafted = 0
+                return input_ids, None
             candidates, logits = super().get_candidates(input_ids, *args, **kwargs)
             self._drafted = candidates.shape[1] - input_ids.shape[1]
+            if self.num_mtp_layers > 1 and hasattr(self, "full_seq_last_hidden_states"):
+                # On rejection, upstream appends the newly verified states and reads only
+                # those plus the preceding D states, where D is the MTP depth. Retain that
+                # suffix, not an ever-growing history. Clone so the view releases its backing
+                # allocation rather than keeping the whole prompt/continuation alive.
+                self.full_seq_last_hidden_states = self.full_seq_last_hidden_states[
+                    :, -self.num_mtp_layers :
+                ].clone()
             return candidates, logits
 
         def update_candidate_strategy(
