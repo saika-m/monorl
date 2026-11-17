@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from monorl.config.loader import load_yaml
+from monorl.config.loader import apply_overrides, load_yaml
 from monorl.core.errors import ConfigError
 
 
@@ -58,3 +58,20 @@ def test_a_path_that_is_no_readable_text_file_is_a_config_error(tmp_path: Path) 
     binary.write_bytes(b"\xff\xfe\x00model")
     with pytest.raises(ConfigError, match=re.escape(f"config file {binary} is not UTF-8 text")):
         load_yaml(binary)
+
+
+@pytest.mark.parametrize("override", ["=3", "trainer..max_steps=3", ".trainer=3", "trainer.=3", "trainer"])
+def test_an_override_without_a_key_or_with_an_empty_part_is_refused(override: str) -> None:
+    with pytest.raises(ConfigError, match="override must look like key.path=value") as raised:
+        apply_overrides({"trainer": {"max_steps": 1}}, [override])
+    assert repr(override) in str(raised.value)
+
+
+def test_an_override_into_a_list_says_to_replace_the_list() -> None:
+    data = {"rewards": [{"type": "exact_match", "weight": 1.0}]}
+    with pytest.raises(ConfigError, match=r"rewards is a list.*rewards=\[\.\.\.\]"):
+        apply_overrides(data, ["rewards.0.weight=2"])
+    assert data == {"rewards": [{"type": "exact_match", "weight": 1.0}]}, "the list is left as it was"
+    replaced = apply_overrides(data, ["rewards=[{type: length, weight: 2}]", "model.lora.r=8"])
+    assert replaced["rewards"] == [{"type": "length", "weight": 2}]
+    assert replaced["model"] == {"lora": {"r": 8}}

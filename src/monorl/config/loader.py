@@ -84,18 +84,27 @@ def _coerce(text: str) -> Any:
 
 
 def apply_overrides(data: dict[str, Any], overrides: list[str] | None) -> dict[str, Any]:
-    """``apply_overrides(cfg, ["trainer.max_steps=10", "rewards=[{type: exact_match}]"])``."""
+    """``apply_overrides(cfg, ["trainer.max_steps=10", "rewards=[{type: exact_match}]"])``.
+
+    The dotted key names mappings only: one that leads into a list is a :class:`ConfigError`
+    that says to replace the list, as is a key with an empty part (``=3``, ``trainer..x=1``)."""
     if not overrides:
         return data
     out = dict(data)
     for item in overrides:
-        if "=" not in item:
-            raise ConfigError(f"override must look like key.path=value, got {item!r}")
-        key, _, raw = item.partition("=")
+        key, eq, raw = item.partition("=")
         parts = key.strip().split(".")
+        if not eq or not all(parts):
+            raise ConfigError(f"override must look like key.path=value, got {item!r}")
         node: dict[str, Any] = out
-        for part in parts[:-1]:
+        for depth, part in enumerate(parts[:-1], 1):
             nxt = node.get(part)
+            if isinstance(nxt, list):
+                where = ".".join(parts[:depth])
+                raise ConfigError(
+                    f"override {item!r}: {where} is a list, and an override cannot address the items "
+                    f"of a list; replace the whole list, {where}=[...]"
+                )
             if not isinstance(nxt, dict):
                 nxt = {}
                 node[part] = nxt
