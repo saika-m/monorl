@@ -287,11 +287,11 @@ def builtin_tools(params: Mapping[str, Any]) -> dict[str, Tool]:
         ),
         "python_exec": Tool(
             name="python_exec",
+            # What the policy reads: what a call does and that nothing is kept between calls. Who
+            # the code runs as is for whoever configures the tool (the docstring of python_exec).
             description=(
-                "Execute a Python snippet in a fresh interpreter process and return its stdout/stderr. "
-                "The process runs on the environment's machine as the environment's user, starts in an "
-                "empty directory that is deleted afterwards, and is killed together with what it started "
-                "when the call ends or the time limit passes."
+                "Execute a Python snippet in a fresh interpreter and return its stdout/stderr. Nothing "
+                "is kept between calls: each call starts in an empty directory that is deleted afterwards."
             ),
             parameters={
                 "type": "object",
