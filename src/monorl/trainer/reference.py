@@ -91,6 +91,45 @@ from monorl.rollout.media import auto_model_class, collate_media
 log = logging.getLogger(__name__)
 
 CHECKPOINT_STATE = "trainer_state.pt"
+
+
+def _numpy_rng_state() -> dict[str, Any]:
+    """The state of NumPy's global generator as plain values and a tensor, which
+    ``torch.load(weights_only=True)`` reads back (the array NumPy hands out is not among them)."""
+    state = np.random.get_state(legacy=False)
+    return {
+        "bit_generator": state["bit_generator"],
+        "key": torch.from_numpy(state["state"]["key"].astype(np.int64)),
+        "pos": int(state["state"]["pos"]),
+        "has_gauss": int(state["has_gauss"]),
+        "gauss": float(state["gauss"]),
+    }
+
+
+def _set_numpy_rng_state(state: Any) -> None:
+    """Put NumPy's global generator back to ``state``: what :func:`_numpy_rng_state` returned, or
+    the tuple of ``np.random.get_state()`` that checkpoints held before."""
+    if isinstance(state, dict):
+        state = {
+            "bit_generator": state["bit_generator"],
+            "state": {"key": state["key"].numpy().astype(np.uint32), "pos": state["pos"]},
+            "has_gauss": state["has_gauss"],
+            "gauss": state["gauss"],
+        }
+    np.random.set_state(state)
+
+
+def _load_state(file: Path) -> dict[str, Any]:
+    """Read a checkpoint's trainer state without running code from the file: tensors and plain
+    containers only (``weights_only``), plus what rebuilds a NumPy array, which the generator
+    state of checkpoints written before :func:`_numpy_rng_state` needs. A run directory is not
+    always the owner's alone (a mounted volume, a download), and unpickling whatever it holds
+    would run what the file says."""
+    array = np.zeros(0, dtype=np.uint32)
+    torch.serialization.add_safe_globals([array.__reduce__()[0], np.ndarray, np.dtype, type(array.dtype)])
+    return torch.load(file, map_location="cpu", weights_only=True)
+
+
 CHECKPOINT_MODEL = "model"
 CHECKPOINT_ADAPTER = "adapter"
 #: Learning rate of the value head relative to ``trainer.learning_rate`` (the verl compilation of
@@ -812,7 +851,7 @@ class ReferenceTrainer:
                 "mtp": self.mtp.state_dict() if self.mtp is not None else None,
                 "rng": {
                     "python": random.getstate(),
-                    "numpy": np.random.get_state(),
+                    "numpy": _numpy_rng_state(),
                     "torch": torch.get_rng_state(),
                     "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 },
@@ -845,7 +884,7 @@ class ReferenceTrainer:
                     for name, tensor in saved.state_dict().items():
                         state[name].copy_(tensor.to(device=state[name].device, dtype=state[name].dtype))
                     del saved
-        state = torch.load(path / CHECKPOINT_STATE, map_location="cpu", weights_only=False)
+        state = _load_state(path / CHECKPOINT_STATE)
         if self.value_head is not None:
             if state.get("value_head") is None:
                 raise RuntimeError(
@@ -865,7 +904,7 @@ class ReferenceTrainer:
         self._step = int(state["step"])
         rng = state["rng"]
         random.setstate(rng["python"])
-        np.random.set_state(rng["numpy"])
+        _set_numpy_rng_state(rng["numpy"])
         torch.set_rng_state(rng["torch"])
         if rng.get("cuda") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(rng["cuda"])
