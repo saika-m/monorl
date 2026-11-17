@@ -35,8 +35,8 @@ EXACT = {"optimizer": "sgd", "max_grad_norm": 1e6, "learning_rate": 0.1}
 @pytest.fixture(scope="module")
 def mtp_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """The tiny Mellum with a final norm that is not all ones. The MTP layer normalises the hidden
-    states it reads, so with the builder's unit norms the output of the last decoder layer (what it
-    has to read) and the input of the output head (final norm applied) would train it alike."""
+    states it reads, so with the builder's unit norms the policy's final hidden states (final norm
+    applied: what it has to read) and the output of the last decoder layer would train it alike."""
     out = build_tiny_mtp(tmp_path_factory.mktemp("tiny-mtp"))
     weights = load_file(str(out / "model.safetensors"))
     weights["model.norm.weight"] = torch.linspace(0.25, 4.0, weights["model.norm.weight"].numel())
@@ -125,11 +125,12 @@ def _differ(ours: dict[str, torch.Tensor], theirs: dict[str, torch.Tensor]) -> f
 
 def _loss_of(policy: Any, layers: MtpLayers, batch: TrainBatch) -> MtpLoss:
     """The MTP loss of ``batch`` straight from the layers, for a policy and layers that are given."""
-    last_layer = [policy.config.num_hidden_layers - 1]
     with torch.no_grad():
-        hidden = policy(
-            input_ids=batch.input_ids, attention_mask=batch.attention_mask, output_hidden_states=last_layer
-        ).hidden_states[-1]
+        hidden = layers.last_hidden_states(
+            policy(
+                input_ids=batch.input_ids, attention_mask=batch.attention_mask, **layers.last_hidden_request
+            )
+        )
         return layers.loss(hidden, batch.input_ids, batch.response_mask, detach_trunk=True)
 
 

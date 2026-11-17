@@ -529,11 +529,10 @@ class ReferenceTrainer:
         value_weights_total = 0.0
         mtp_sums = [0.0] * len(mtp_totals)
         mtp_correct = 0
-        # What generation hands to the MTP layers: the output of the last decoder layer, before the final norm.
+        # What generation hands to the MTP layers: the policy's last hidden states, asked for as transformers asks.
         mtp_inputs: dict[str, Any] = {}
         if mtp is not None:
-            num_layers = self.hf_model.config.get_text_config().num_hidden_layers
-            mtp_inputs["output_hidden_states"] = [num_layers - 1]
+            mtp_inputs = mtp.last_hidden_request
         for start in range(0, local_seqs, mbs):
             micro = batch.slice(start, start + mbs).trimmed()
             micro_tokens = int(micro.response_mask.sum().item())
@@ -555,7 +554,7 @@ class ReferenceTrainer:
                     del head_input
                 outputs = self._outputs(self.model, micro, **mtp_inputs)
             logits = outputs.logits
-            last_layer = outputs.hidden_states[-1] if mtp is not None else None
+            last_layer = mtp.last_hidden_states(outputs) if mtp is not None else None
             del outputs
             smoothing = self.config.algorithm.name == "sft" and self.config.algorithm.sft_label_smoothing > 0
             logprobs, entropy, top_logprobs, vocab_mean = sequence_logprobs_and_entropy(
