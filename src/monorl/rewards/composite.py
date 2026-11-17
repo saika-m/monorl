@@ -2,9 +2,11 @@
 
 ``RewardResult.score = Σ weight_i * raw_i``; ``breakdown[key_i] = raw_i`` where ``key_i`` is
 ``params["name"]`` of the member spec, else its ``type`` (duplicates get ``#2``, ``#3``, …).
-A member that is itself a composite also contributes its own breakdown, each entry under
-``key_i/<its key>`` (so ``outer/inner/leaf`` at depth two): metrics become
-``reward/key_i/<its key>`` next to the member's total ``reward/key_i``.
+A member's own breakdown is reported next to its total, each entry under ``key_i/<entry>``
+(metric ``reward/key_i/<entry>``): the members of a member that is itself a composite (so
+``outer/inner/leaf`` at depth two), and whatever a reward function reports besides its score
+(``llm_judge``: ``failed``). The entry a reward function keeps under its own ``name`` is its score
+again and is left out. A name that is taken (a member may be called ``a/b``) gets ``#2``, ``#3``, …
 Member ``info`` dicts are nested under ``info[key_i]``.
 
 As a registered reward (``type: composite``), ``params["rewards"]`` holds the member specs
@@ -46,8 +48,16 @@ class CompositeReward:
         self.members = list(members)
 
     def __call__(self, trajectories: Sequence[Trajectory]) -> list[RewardResult]:
+        # The fourth item is the entry of a member's breakdown that is its score again: the one under
+        # the ``name`` of a reward function (under its key, if the callable has no name), none for a
+        # composite.
         per_member = [
-            (key, weight, fn(trajectories), isinstance(fn, CompositeReward))
+            (
+                key,
+                weight,
+                fn(trajectories),
+                None if isinstance(fn, CompositeReward) else getattr(fn, "name", key),
+            )
             for key, weight, fn in self.members
         ]
         # A member's own key always holds its total; a nested entry gives way to it.
@@ -57,15 +67,15 @@ class CompositeReward:
             total = 0.0
             breakdown: dict[str, float] = {}
             info: dict[str, Any] = {}
-            for key, weight, results, nested in per_member:
+            for key, weight, results, own in per_member:
                 if len(results) != len(trajectories):
                     raise ValueError(
                         f"reward {key!r} returned {len(results)} results for {len(trajectories)} trajectories"
                     )
                 r = results[i]
                 breakdown[key] = float(r.score)
-                if nested:
-                    for inner, score in r.breakdown.items():
+                for inner, score in r.breakdown.items():
+                    if inner != own:
                         breakdown[_unused(f"{key}/{inner}", totals | breakdown.keys())] = float(score)
                 total += weight * float(r.score)
                 if r.info:

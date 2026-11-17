@@ -9,6 +9,8 @@ import httpx
 import pytest
 
 from monorl.core.registry import registry
+from monorl.orchestrator.metrics import reward_metrics
+from monorl.rewards import CompositeReward
 from monorl.rewards.llm_judge import parse_score, retry_after_seconds
 
 
@@ -81,7 +83,7 @@ def test_llm_judge_scores_via_mock_endpoint(traj, monkeypatch):
     )
     results = fn([traj("the correct answer", "42", prompt="What?"), traj("garbage", "42", prompt="What?")])
     assert [r.score for r in results] == [1.0, 0.2]
-    assert results[0].breakdown == {"llm_judge": 1.0}
+    assert results[0].breakdown == {"llm_judge": 1.0, "failed": 0.0}
     assert results[0].info["raw_score"] == 10.0
     assert len(seen) == 2
     req = seen[0]
@@ -139,7 +141,7 @@ def test_a_rate_limit_is_waited_out_and_the_answer_scored(traj, caplog):
     first = httpx.Response(429, headers={"Retry-After": "2"}, text="slow down")
     with caplog.at_level(logging.WARNING):
         result = _judge(_failing_then(first, calls), waits)([traj("a")])[0]
-    assert result.score == 0.7 and result.breakdown == {"llm_judge": 0.7}
+    assert result.score == 0.7 and result.breakdown == {"llm_judge": 0.7, "failed": 0.0}
     assert result.info == {"raw_score": 7.0, "judge_output": "<score>7</score>", "attempts": 2}
     assert len(calls) == 2
     assert waits == [2.0]  # what the server asked for: more than the first backoff of at most 1s
@@ -247,6 +249,37 @@ def test_retries_leave_the_process_wide_random_generator_alone(traj):
     results = _judge(handler, waits, max_workers=2)([traj("a"), traj("b"), traj("c")])
     assert [r.score for r in results] == [0.7] * 3 and len(waits) == 3
     assert random.getstate() == state
+
+
+def test_the_share_of_failed_judgments_of_a_step_is_a_metric(traj):
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = json.loads(request.content)["messages"][-1]["content"]
+        if response == "unreachable":
+            return httpx.Response(503)
+        return _reply("no grade" if response == "ungradable" else f"<score>{response}</score>")
+
+    waits: list[float] = []
+    judge = _judge(handler, waits, name="quality", rubric="{response}", max_attempts=2)
+    fn = CompositeReward([("quality", 2.0, judge)])
+    trajectories = [traj(text) for text in ("10", "0", "unreachable", "ungradable", "5")]
+    results = fn(trajectories)
+    # a grade of 0 and a failure are the same reward, and not the same row
+    assert [r.score for r in results] == [2.0, 0.0, 0.0, 0.0, 1.0]
+    assert [r.breakdown for r in results] == [
+        {"quality": 1.0, "quality/failed": 0.0},
+        {"quality": 0.0, "quality/failed": 0.0},
+        {"quality": 0.0, "quality/failed": 1.0},
+        {"quality": 0.0, "quality/failed": 1.0},
+        {"quality": 0.5, "quality/failed": 0.0},
+    ]
+    for t, res in zip(trajectories, results, strict=True):
+        t.reward, t.reward_breakdown = res.score, res.breakdown
+    metrics = reward_metrics(trajectories)
+    assert metrics["reward/quality"] == 0.3 and metrics["reward/quality/failed"] == 0.4
+
+    # a judge that somebody called "failed" keeps its score under that name
+    [result] = _judge(handler, name="failed", rubric="{response}")([traj("5")])
+    assert result.breakdown == {"failed": 0.5}
 
 
 def test_the_waits_of_a_judgment_stay_within_retry_max_wait_s(traj):

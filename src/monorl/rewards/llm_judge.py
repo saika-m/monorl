@@ -24,8 +24,10 @@ Params:
     on_error: what a judgment that failed for good becomes: ``zero`` (default; score 0 with
         ``info["error"]``) or ``raise``.
 
-A call that scored failures as 0 says so in one warning of this module's logger (``reward <name>:
-N of M judgments failed and scored 0 (...)``): a 0 of that kind is not a grade.
+A 0 for a judgment that failed is not a grade. The breakdown of every judgment therefore has
+``failed`` (1.0 or 0.0) next to the score, which a run reports as ``reward/<name>/failed``, the
+share of failed judgments of a step; and a call that scored failures as 0 says so in one warning
+of this module's logger (``reward <name>: N of M judgments failed and scored 0 (...)``).
 
 Factory kwargs: ``client=httpx.Client(...)`` injects a transport (tests use ``MockTransport``);
 ``wait=fn(stop, seconds)`` replaces the wait between attempts (``threading.Event.wait``) and
@@ -200,10 +202,14 @@ class LLMJudgeReward:
             return None
         return max(math.ldexp(self.retry_backoff_s, attempt - 1) * self._jitter.uniform(0.5, 1.0), asked)
 
-    def _failed(self, attempts: int, **info: Any) -> RewardResult:
+    def _result(self, score: float, attempts: int, info: dict[str, Any]) -> RewardResult:
         if attempts > 1:
             info["attempts"] = attempts
-        return RewardResult(score=0.0, breakdown={self.name: 0.0}, info=info)
+        breakdown = {self.name: score}
+        # On every judgment, so that its mean is the share that failed; a judge named "failed"
+        # keeps its score there.
+        breakdown.setdefault("failed", float("error" in info))
+        return RewardResult(score=score, breakdown=breakdown, info=info)
 
     def judge(self, trajectory: Trajectory, stop: threading.Event | None = None) -> RewardResult:
         """Score one trajectory. Setting ``stop`` ends a wait between attempts: the judgment then
@@ -234,19 +240,16 @@ class LLMJudgeReward:
                         continue
                 if self.on_error == "raise":
                     raise
-                return self._failed(attempts, **_describe(e))
+                return self._result(0.0, attempts, _describe(e))
         # ``content`` is null when the judge spent its tokens on reasoning, refused, or called a tool.
         raw = parse_score(content) if isinstance(content, str) else None
         if raw is None:
             if self.on_error == "raise":
                 raise ValueError(f"llm_judge: no <score> tag in judge output: {str(content)[:200]!r}")
-            return self._failed(attempts, error="no_score", judge_output=content)
+            return self._result(0.0, attempts, {"error": "no_score", "judge_output": content})
         raw = min(max(raw, 0.0), self.max_score)
         score = raw / self.max_score if self.normalize else raw
-        info = {"raw_score": raw, "judge_output": content}
-        if attempts > 1:
-            info["attempts"] = attempts
-        return RewardResult(score=score, breakdown={self.name: score}, info=info)
+        return self._result(score, attempts, {"raw_score": raw, "judge_output": content})
 
     def __call__(self, trajectories: Sequence[Trajectory]) -> list[RewardResult]:
         check_trajectories(trajectories)

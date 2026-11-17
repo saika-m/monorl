@@ -18,8 +18,10 @@ rewards:
 
 `monorl.rewards.build_reward` turns the list into one `CompositeReward` whose score is the sum of
 `weight * score` over the entries; weights are not normalised. Each entry's unweighted score is
-kept in a breakdown under `params.name`, else the `type` (a repeated key gets `#2`, `#3`, ...). An
-unknown `type` passes config validation and raises `RegistryError` when the loop is built.
+kept in a breakdown under `params.name`, else the `type` (a repeated key gets `#2`, `#3`, ...).
+What a reward function reports besides its score is kept next to it under `<key>/<entry>`; of the
+built-ins `llm_judge` does, with `failed`. An unknown `type` passes config validation and raises
+`RegistryError` when the loop is built.
 
 A reward function receives whole `Trajectory` objects. Every built-in accepts `params.name`. All
 except `reward_model` and `composite` accept `scope`: `last` (default) scores the text of the
@@ -239,10 +241,11 @@ print(r.score, r.info)
 # 0.0 {'error': 'HTTPStatusError: 503 Service Unavailable', 'attempts': 3}
 
 fn = judge(reply("Right."), reply("Right. <score>8</score>"), max_workers=1)
-r = fn([seven, seven])[0]
+for r in fn([seven, seven]):
+    print(r.score, r.breakdown, r.info.get("error"))
 # on stderr: reward llm_judge: 1 of 2 judgments failed and scored 0 (1x no_score)
-print(r.score, r.info)
-# 0.0 {'error': 'no_score', 'judge_output': 'Right.'}
+# 0.0 {'llm_judge': 0.0, 'failed': 1.0} no_score
+# 0.8 {'llm_judge': 0.8, 'failed': 0.0} None
 ```
 
 ### `reward_model`
@@ -311,6 +314,10 @@ A judgment that failed for good scores 0.0 with `on_error: zero`; with `raise` t
 propagates and ends the run. The 0.0 is the same number as a grade of 0 in `reward/mean` and
 `reward/<name>`, and it is trained on. What tells them apart:
 
+- `reward/<name>/failed` in `metrics.jsonl` (`eval/reward/<name>/failed` for an evaluation): the
+  share of the step's judgments that failed, 0.0 when none did. Every judgment has `failed`, 1.0
+  or 0.0, in its breakdown next to its score, so a row of `trajectories.jsonl` has it in
+  `reward_breakdown` as `<name>/failed`.
 - One warning per call of the reward, which the loop makes once with all trajectories of a step,
   through Python's `logging` under `monorl.rewards.llm_judge`:
   `reward <name>: N of M judgments failed and scored 0 (<count>x <error>, ...)`, followed by the
@@ -323,13 +330,15 @@ propagates and ends the run. The 0.0 is the same number as a grade of 0 in `rewa
   and `attempts` when the judgment made more than one request, successful or not.
 - `time/reward` grows by the waits.
 
-No metric counts failed judgments. Run here, one step of four episodes on a tiny random model
-against a local endpoint that always answers 503 with `Retry-After: 3`: the run succeeded with
-`reward/mean` 0.0 and `time/reward` 9.07, stderr had
+Run here, one step of four episodes and an evaluation of four on a tiny random model against a
+local endpoint that always answers 503 with `Retry-After: 3`: the run succeeded with
+`reward/mean` 0.0, `reward/llm_judge/failed` and `eval/reward/llm_judge/failed` 1.0 and
+`time/reward` 9.11, stderr had
 `reward llm_judge: 4 of 4 judgments failed and scored 0 (4x HTTPStatusError: 503 Service
-Unavailable)` with the response body after it, `run.log` did not (it did with stderr appended to
-it), and the four rows had `attempts: 4`. Against an endpoint that answered every fourth request
-with 429, all four rewards were the judge's 0.6 and nothing was logged.
+Unavailable)` with the response body after it, once for the step and once for the evaluation,
+`run.log` did not (it did with stderr appended to it), and the rows had `attempts: 4` and
+`llm_judge/failed` 1.0. Against an endpoint that answered every fourth request with 429, all
+rewards were the judge's 0.6, `reward/llm_judge/failed` was 0.0 and nothing was logged.
 
 A judgment that waits keeps its worker thread and nothing else; the other workers go on. When a
 call ends early (an error with `on_error: raise`, a `KeyboardInterrupt`), the waiting judgments
@@ -350,7 +359,9 @@ here with a reward that raises, the run ended `failed` at step 0 with the error 
 ## Metrics
 
 `reward/mean`, `reward/std`, `reward/<name>` per breakdown key (including `reward/env` and
-`reward/overlong_penalty`), `reward/success_rate`, `reward/pass_at_k`, `time/reward`,
+`reward/overlong_penalty`, and `reward/<name>/<entry>` for what a reward function reports besides
+its score, such as `reward/llm_judge/failed`), `reward/success_rate`, `reward/pass_at_k`,
+`time/reward`,
 `eval/reward_mean`, `eval/reward_std`, `eval/reward/<name>`: see [RUNS.md](RUNS.md#metrics).
 
 ## Pipeline backends
@@ -359,8 +370,11 @@ From the adapters' code, not run here. With `trainer.backend: trl` the composite
 TRL reward function (`src/monorl/adapters/trl/rewards.py`) that computes the total as above,
 including `env` and `overlong_penalty`. With `verl` (`src/monorl/adapters/verl/reward.py`) at
 least one entry is required: a generated `<run_dir>/monorl_reward.py` scores one response at a
-time, and the breakdown goes to verl's `reward_extra_info`. With `nemo_rl` (`env_bridge.py` of
-that adapter) the score is added to the final turn's reward. Under `verl` and `nemo_rl` a reward
+time, and the breakdown goes to verl's `reward_extra_info` as `reward/<name>`; verl 0.9.1 takes
+the names from the first response of a batch and reads each of them from every other response
+(`reward_loop.py`, `agent_loop.py`), so an entry has to be in every result or in none, as `failed`
+is. With `nemo_rl` (`env_bridge.py` of that adapter) the score is added to the final turn's reward
+and the breakdown is put into the episode's metadata. Under `verl` and `nemo_rl` a reward
 sees the decoded text of a response and no token ids, so `length` with `unit: tokens` (its
 default) is rejected at validation: use `chars` or `words`. See [BACKENDS.md](BACKENDS.md).
 
@@ -422,6 +436,33 @@ import my_rewards
 my_rewards.register(registry)
 print(registry.get("reward", "keyword")({"keyword": "seven"})([traj("Seven.")])[0])
 # RewardResult(score=1.0, breakdown={'keyword': 1.0}, info={})
+```
+
+A result's `breakdown` holds the score under the function's `name`. Every other entry in it is
+reported next to the score: under `<key>/<entry>` in the breakdown of the episode (the
+`reward_breakdown` of its row), where `<key>` is `params.name`, else the `type`, and as
+`reward/<key>/<entry>` in the metrics, the mean over all episodes of the step, in which an episode
+without the entry counts as 0. A name that a reward of the run already has gets `#2`. Two things
+follow: a function that keeps its score under another name than its `name` reports it twice, and
+under `verl` an entry has to be in every result or in none (see
+[Pipeline backends](#pipeline-backends)). Continuing the session:
+
+```python
+from monorl.rewards import CompositeReward
+
+class Tone:
+    name = "tone"
+
+    def __call__(self, trajs):
+        hedged = [float("maybe" in t.last_response_text.lower()) for t in trajs]
+        parts = [{"tone": 1 - h, "hedged": h} for h in hedged]
+        return [RewardResult(score=part["tone"], breakdown=part) for part in parts]
+
+fn = CompositeReward([("style", 0.5, Tone())])
+for r in fn([traj("Maybe 7?"), traj("It is 7.")]):
+    print(r.score, r.breakdown)
+# 0.0 {'style': 0.0, 'style/hedged': 1.0}
+# 0.5 {'style': 1.0, 'style/hedged': 0.0}
 ```
 
 A reward that belongs in monorl itself is added to `REWARD_NAMES` in
