@@ -75,6 +75,17 @@ def test_memory_limit_enforced():
     assert (ok_status, out.strip()) == ("ok", "fine")
 
 
+def test_memory_limit_counts_the_processes_a_program_starts():
+    """The cap is on the program and everything it starts: a child that takes the memory instead
+    is stopped as well (by its own rlimit on Linux, by the watchdog elsewhere)."""
+    sandbox = Sandbox(timeout_s=20.0, memory_mb=64)
+    child = "x = bytearray(400 * 1024 * 1024)\nfor i in range(0, len(x), 4096):\n    x[i] = 1\nimport time\ntime.sleep(5)"
+    status, _, _ = sandbox.run(
+        f"import subprocess, sys\nraise SystemExit(subprocess.run([sys.executable, '-c', {child!r}]).returncode)"
+    )
+    assert status in ("memory", "error")
+
+
 def test_sandbox_isolation(monkeypatch):
     """The program runs in a throwaway directory that is also its HOME, and sees none of the
     caller's environment."""

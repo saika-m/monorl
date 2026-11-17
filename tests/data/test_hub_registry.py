@@ -1,29 +1,15 @@
 from __future__ import annotations
 
 import itertools
-from pathlib import Path
 
 import pytest
 
 from monorl.config.schema import DataConfig
 from monorl.core.errors import DataError
-from monorl.core.registry import Registry
-from monorl.data import open_source, register
+from monorl.data import open_source
 from monorl.data.browse import browse_uri, preview_uri
 
 GSM8K = "hf://openai/gsm8k"
-
-
-def test_register_and_scheme_guard(qa_jsonl: Path) -> None:
-    reg = Registry()
-    register(reg)
-    assert reg.names("data_source", load_builtins=False) == ["hf", "local", "s3"]
-    src = reg.get("data_source", "local")(DataConfig(uri=str(qa_jsonl), shuffle=False), seed=3)
-    assert len(src) == 12
-    with pytest.raises(DataError, match="cannot open"):
-        reg.get("data_source", "s3")(DataConfig(uri=str(qa_jsonl)))
-    with pytest.raises(DataError, match="cannot open"):
-        reg.get("data_source", "hf")(DataConfig(uri="s3://b/k.jsonl"))
 
 
 def test_builtin_registry_resolves_data_sources() -> None:

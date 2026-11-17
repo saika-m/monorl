@@ -13,7 +13,7 @@ from typing import Any
 import fakes
 import pytest
 
-from monorl.core.types import Completion, Sample, SamplingParams
+from monorl.core.types import Completion, Sample, SamplingParams, prompt_caps
 from monorl.gateway import Gateway, Session, build_trajectory
 from monorl.orchestrator.batching import continuation_parents, trajectory_rows
 from monorl.rollout import BatchingEngine
@@ -43,9 +43,11 @@ class ParamsEngine(fakes.FakeEngine):
         super().__init__(config)
         self.seen: list[SamplingParams] = []
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
         self.seen.append(params)
-        return super().generate(prompts, params)
+        return super().generate(prompts, params, max_new_tokens=max_new_tokens)
 
 
 def _echo_engine(make_config: Callable[..., Any], cls: type = fakes.FakeEngine) -> Any:
@@ -245,11 +247,18 @@ def test_tool_round_trip_with_a_real_chat_template(
             self.tokenizer = tokenizer
             self.script = script
 
-        def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+        def generate(
+            self,
+            prompts: Sequence[Any],
+            params: SamplingParams,
+            *,
+            max_new_tokens: Sequence[int] | None = None,
+        ) -> list[list[Completion]]:
             out = []
-            for prompt in prompts:
+            for prompt, cap in zip(prompts, prompt_caps(params, len(prompts), max_new_tokens), strict=True):
                 text = self.script.pop(0)
                 ids = [*tokenizer(text, add_special_tokens=False)["input_ids"], tokenizer.eos_token_id]
+                assert len(ids) <= cap, "the script does not fit the generation cap of its prompt"
                 out.append([Completion(text, ids, [-0.5] * len(ids), "stop", list(prompt))])
             return out
 
@@ -367,6 +376,35 @@ def test_128_calls_in_flight_reach_the_engine_as_one_batch(
     assert [body["choices"][0]["message"]["content"] for _, body in results] == [f"Q{i}" for i in range(128)]
     assert [c["num_prompts"] for c in fake.calls] == [128]
     assert all(len(s.calls) == 1 for s in sessions)
+
+
+def test_calls_that_ask_for_shorter_completions_share_the_batch_of_the_others(
+    make_config: Callable[..., Any], gateway: Gateway, open_session: Callable[..., Session]
+) -> None:
+    """``max_tokens`` of a request lowers the completion length of its own prompt only: the calls
+    in flight are still one engine call, and every answer ends where its request said."""
+    fake = _echo_engine(make_config)
+    engine = BatchingEngine(fake, max_batch_size=9, max_wait_ms=30_000)  # released by the 9th prompt
+    try:
+        sessions = [open_session(engine) for _ in range(9)]
+
+        def call(i: int) -> tuple[int, Any]:
+            payload: dict[str, Any] = {"messages": [{"role": "user", "content": "abcdefgh"}]}
+            if i:
+                payload["max_tokens"] = i
+            return post(_chat_url(gateway, sessions[i]), payload)
+
+        with ThreadPoolExecutor(max_workers=9) as pool:
+            results = list(pool.map(call, range(9)))
+    finally:
+        engine.shutdown()
+    assert [status for status, _ in results] == [200] * 9
+    assert [c["num_prompts"] for c in fake.calls] == [9]
+    choices = [body["choices"][0] for _, body in results]
+    # the whole answer has eight letters and the end-of-turn token
+    assert [c["message"]["content"] for c in choices] == ["ABCDEFGH", *("ABCDEFGH"[:i] for i in range(1, 9))]
+    assert [c["finish_reason"] for c in choices] == ["stop", *["length"] * 8]
+    assert [body["usage"]["completion_tokens"] for _, body in results] == [9, *range(1, 9)]
 
 
 def test_unserved_requests_get_openai_errors(

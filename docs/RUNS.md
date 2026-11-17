@@ -25,7 +25,10 @@ The component loop runs steps `1..trainer.max_steps`. Each step:
    environment rewards, minus `algorithm.overlong_penalty` when the last completion hit the limit.
 4. Train step: advantages and the token batch are built, then `trainer.train_step` runs
    `algorithm.num_epochs` times on that batch ([ALGORITHMS.md](ALGORITHMS.md)).
-5. Weight sync: the trainer's weights are pushed to every rollout engine.
+5. Weight sync: the trainer's weights are pushed to every rollout engine. After its first sync an
+   engine that takes partial updates (the `hf` engine) is sent only the tensors that changed; the
+   `checkpoint` strategy and the vLLM and SGLang engines get all of them every time
+   ([DISTRIBUTED.md](DISTRIBUTED.md)).
 6. Checkpoint: when `step % trainer.save_every == 0` (default 50).
 7. Report: when `step % logging.log_every == 0` (default 1) or on the last step, one `train` row
    goes to `metrics.jsonl` and up to `logging.trajectories_per_step` episodes go to
@@ -36,12 +39,22 @@ The component loop runs steps `1..trainer.max_steps`. Each step:
 After the last step the policy is exported to `final/`. With `rollout.async_steps_ahead > 0`
 rollouts for later steps are generated while earlier steps train ([DISTRIBUTED.md](DISTRIBUTED.md)).
 
-Repeatability: Python and torch are seeded with `seed` at the start and with `seed + step` at
-every step. A run with one turn per episode on the `hf` engine repeats for the same config and
-seed (two such runs gave identical responses here). Multi-turn runs do not: episodes run on
-threads and their generation requests are batched in arrival order
-(`src/monorl/rollout/batching.py`), so the random draws a turn gets depend on timing (two runs of
-a 3-turn environment with the same seed gave different episodes here).
+Repeatability: Python and torch are seeded with `seed` at the start, and a resumed run continues the
+random streams of the run it resumes ([Resume](#resume) says when that makes it the same run). On
+the `hf` engine a run repeats for the same config and seed. The prompts of a step are a
+function of `(seed, step)`, a single-turn step is one engine call, and with `rollout.turn_batching:
+lockstep` (the default) the turns of concurrent episodes reach the engine in batches that do not
+depend on timing ([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)). Run here: two runs of
+`grpo_remote_env_go_wordle.yaml` (6 turns per episode, 2 steps) gave 16 of 16 identical episodes and
+identical metrics apart from the timings; with `turn_batching: arrival` 4 of 16 were identical. Two
+runs of `grpo_gsm8k_smollm_cpu.yaml` (2 steps, on a busy machine) were identical as well, where
+batching by arrival differed already in the first step: there the order of the rows of a call is the
+order in which the episode threads got to it. What it takes besides: environments and rewards that
+are functions of their inputs (an `llm_judge` is not). What does not repeat, from the code: agent
+harnesses (`harness`, `hermes`), which call the policy when they please, and
+`rollout.async_steps_ahead > 0`, where the weights a rollout sees depend on how far training got.
+`vllm` and `sglang` receive the same batches in the same order; whether they then sample the same
+was not run here.
 
 The SFT loop has no rollouts, rewards, environments or weight sync. Each step encodes
 `trainer.prompts_per_step` dataset samples with their target responses and calls `train_step`
@@ -116,8 +129,59 @@ without `--resume` starts at step 0 and appends to `metrics.jsonl`, `trajectorie
 `--resume` picks the highest-numbered non-empty `checkpoints/step-N/` and restores, through
 `Trainer.load_checkpoint`: the model weights (or the LoRA adapter), optimizer, scheduler, gradient
 scaler, the value head and MTP layers when configured, and the trainer's step counter. The loop
-then seeds Python's and torch's RNG with `seed + N`, pushes the weights to the rollout engines and
-continues at step `N + 1`; prompt batches need no state because they depend only on `(seed, step)`.
+then pushes the weights to the rollout engines, restores its own state from `loop_state.pt` in the
+checkpoint and continues at step `N + 1`; prompt batches need no state because they depend only on
+`(seed, step)`.
+
+The loop writes `loop_state.pt` after the trainer's files and before the directory is renamed from
+`step-N.tmp`. It holds the loop's policy version counter and the state of every global random
+generator of the process at the end of step `N`: Python, NumPy, and torch on the CPU, on every CUDA
+device (once the process uses CUDA) and on MPS. An evaluation puts the generators back as it found
+them, because the checkpoint of a step is written before the step is evaluated. The SFT loop
+writes and restores the same file. It draws no random numbers itself; its trainer does when
+dropout is on (`model.lora.dropout`).
+
+With that, a run that is stopped after step `N` and resumed logs, from step `N + 1` on, the
+episodes and the metrics of the run that was not stopped, timings apart. This holds for runs that
+repeat at all (see Repeatability under [What a run does](#what-a-run-does)) and sample from the
+generators of this process: the `hf` engine with `cluster.mode: local`. Run here, with
+`OMP_NUM_THREADS=2`: `grpo_gsm8k_smollm_cpu.yaml` with `trainer.save_every=2`, `data.limit=8` and
+`rollout.max_new_tokens=32`, once with `trainer.max_steps=4` and once with `trainer.max_steps=2`
+followed by `--resume` with `trainer.max_steps=4`. The 8 rows of steps 3 and 4 in
+`trajectories.jsonl` were identical, and so were the 37 metrics of each of the two steps that are
+not timings (`time/*`, `weight_sync/seconds`). Every reward of those runs was 0, so the updates
+were zero and the runs show the sampling stream only. The same pair with
+`--set 'rewards=[{type: length, params: {unit: chars, max_tokens: 100, penalty_per_token: 0.01}}]'`
+and `trainer.learning_rate=1e-4`, where every step has a gradient (`grad_norm` between 2.2 and
+3.5), was identical in the same way.
+
+The stop must not change the run. Stopping with a signal does not. A smaller `trainer.max_steps`
+does not either under `trainer.scheduler: constant` (the default); with `linear` or `cosine` the
+learning rate of every step depends on `trainer.max_steps`, so the short run is another run (from
+the code, not run here). A run that ends at `trainer.max_steps` has a checkpoint of its last step
+only when `trainer.save_every` divides it. A resume always starts at the last checkpoint: steps
+that ran after it are run again, and their rows are appended a second time.
+
+What does not continue exactly, and is logged as `the run will not continue exactly as the one it
+resumes: <reasons>` where the loop can tell:
+
+- A checkpoint without `loop_state.pt`, written before the loop saved its state: it resumes with
+  Python and torch seeded with `seed + N`, as every resume did then (logged; covered by the tests
+  with fake components).
+- `rollout.async_steps_ahead > 0`: the rollouts that ran ahead of the checkpoint are not saved,
+  and the weights they were sampled from depended on how far training had got. The resumed run
+  samples them again from the weights of the checkpoint (logged).
+- A process with other accelerators than the one that wrote the checkpoint (another number of
+  CUDA devices, no MPS): the generators of the missing devices are not restored (logged; from the
+  code, not run here).
+- Engines that do not sample from the generators of this process (not logged; from the code, not
+  run here): `vllm` is seeded with `seed + replica` whenever it starts and `sglang` seeds itself
+  (`rollout.extra.random_seed`), so a resumed run starts their streams over unless they happen to
+  sample from a generator this process restores, which was not checked; with `cluster.mode: ray`
+  every engine is an actor process whose generators the loop neither seeds nor saves.
+- Whatever does not repeat in the first place: agent harnesses (`harness`, `hermes`), rewards and
+  environments that are not functions of their inputs (an `llm_judge`, a remote environment with a
+  random state of its own).
 
 Not restored: the config (the one given on this command line is used and overwrites `config.yaml`),
 `status.json` (rewritten with a new `started_at` and `pid`) and earlier rows of `metrics.jsonl`
@@ -214,7 +278,8 @@ Written by the reference trainer into `step-N.tmp` and renamed, so a `step-N` di
 complete. Old checkpoints are not deleted. Contents: `model/` (`config.json`,
 `generation_config.json`, `model.safetensors`), or `adapter/` (the PEFT adapter) with
 `model.lora.enabled` (not run here), and `trainer_state.pt`, a `torch.save` dict with `step`,
-`optimizer`, `scheduler`, `scaler`, `value_head`, `mtp` and `rng`.
+`optimizer`, `scheduler`, `scaler`, `value_head`, `mtp` and `rng`. The loop adds `loop_state.pt`
+(its policy version and the state of the process's random generators, see [Resume](#resume)).
 For SmolLM2-135M in fp32 with AdamW one checkpoint is 1.6 GB (514 MB weights, 1.1 GB state).
 
 ### `final/`

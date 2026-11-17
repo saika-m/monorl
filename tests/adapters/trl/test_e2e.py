@@ -96,8 +96,8 @@ class _AlwaysStopEngine(TrainerPolicyEngine):
     """The random tiny model never emits EOS within 8 tokens; mark completions finished so the
     environment's second turn is actually exercised. Tokens, logprobs and prompts stay real."""
 
-    def generate(self, prompts, params):
-        out = super().generate(prompts, params)
+    def generate(self, prompts, params, *, max_new_tokens=None):
+        out = super().generate(prompts, params, max_new_tokens=max_new_tokens)
         for group in out:
             for c in group:
                 c.finish_reason = "stop"

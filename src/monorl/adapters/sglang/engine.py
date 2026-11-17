@@ -7,10 +7,12 @@ Built against SGLang v0.5.23 (``python/sglang/srt/entrypoints/engine.py``):
   ``trust_remote_code``, ``revision``, ``log_level`` … (``srt/arg_groups/fields/``).
 * ``Engine.generate(prompt=None, sampling_params=None, input_ids=None, image_data=None, ...,
   return_logprob=False, logprob_start_len=None, ...)`` → list of ``{"text", "output_ids",
-  "meta_info"}`` dicts, flat and prompt-major when ``n > 1``. ``logprob_start_len=-1`` asks for
-  output-token logprobs only. ``image_data`` is one entry per request (list of PIL images, or
-  ``None`` for text-only requests); ids of multimodal prompts come from the ``AutoProcessor``
-  chat template (``monorl.rollout.media``) and are re-expanded by sglang's multimodal processor.
+  "meta_info"}`` dicts, flat and prompt-major when ``n > 1``. ``sampling_params`` is a list with
+  one dict per request, each with the ``max_new_tokens`` of its prompt. ``logprob_start_len=-1``
+  asks for output-token logprobs only. ``image_data`` is one entry per request (list of PIL
+  images, or ``None`` for text-only requests); ids of multimodal prompts come from the
+  ``AutoProcessor`` chat template (``monorl.rollout.media``) and are re-expanded by sglang's
+  multimodal processor.
 * ``Engine.generate`` blocks in ``Engine.loop.run_until_complete(...)`` on the caller's thread.
   :meth:`SGLangEngine.generate` runs the equivalent coroutine ``Engine.async_generate`` (same
   arguments and result) as a task on that loop instead, so ``cancel()`` can cancel the task from
@@ -68,7 +70,7 @@ from monorl.adapters.sglang.common import (
 )
 from monorl.config.schema import RunConfig
 from monorl.core.errors import BackendUnavailable, GenerationCancelled, WeightSyncError
-from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats
+from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats, prompt_caps
 from monorl.rollout.hf_engine import load_tokenizer
 
 log = logging.getLogger(__name__)
@@ -173,7 +175,13 @@ class SGLangEngine:
     def engine(self) -> Any:
         return self._engine
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if not prompts:
             return []
         call = _GenerateCall()
@@ -183,7 +191,8 @@ class SGLangEngine:
             processor = self._load_processor() if any(is_media_prompt(p) for p in prompts) else None
             encoded = [encode_prompt(self._tokenizer, processor, p) for p in prompts]
             prompt_ids = [ids for ids, _ in encoded]
-            input_ids, sampling = expand_requests(prompt_ids, params)
+            caps = prompt_caps(params, len(prompts), max_new_tokens)
+            input_ids, sampling = expand_requests(prompt_ids, params, caps)
             image_data = expand_image_data([images for _, images in encoded], params)
             kwargs: dict[str, Any] = {}
             if image_data is not None:

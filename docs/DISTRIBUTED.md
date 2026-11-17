@@ -9,7 +9,8 @@ when compiling their native configs.
 ```yaml
 cluster:
   mode: local | ray          # in-process vs Ray actors
-  ray_address: auto          # join an existing cluster (ray start --head) or null to start one
+  ray_address: auto          # join an existing cluster (ray start --head)
+                             # or null to start one
   num_nodes: 1
   gpus_per_node: 8
   placement: auto | colocated | disaggregated
@@ -39,10 +40,15 @@ Without CUDA every placement degrades to CPU/MPS in-process: `mode: local`,
 `monorl bench` measures the pieces the planner has to balance, on the hardware you have:
 
 ```
-monorl bench plan --config RECIPE [--gpus G --gpu-mem-gb M --preset h100|a100|l40s|mps|cpu]   # placement + step-time estimate
-monorl bench sync --config RECIPE [--all | --strategy S] [--fake-params N --engines E]   # weight sync timing
-monorl bench env  (--command CMD... | --url URL) [--parallel 1,8,32] [--episodes N]       # MEP/1 episodes/s
-monorl bench rollout --config RECIPE [--batch-sizes 1,4,16,64] [--prompts N]              # tokens/s per batch size
+# placement + step-time estimate
+monorl bench plan --config RECIPE \
+    [--gpus G --gpu-mem-gb M --preset h100|a100|l40s|mps|cpu]
+# weight sync timing
+monorl bench sync --config RECIPE [--all | --strategy S] [--fake-params N --engines E]
+# MEP/1 episodes/s
+monorl bench env  (--command CMD... | --url URL) [--parallel 1,8,32] [--episodes N]
+# tokens/s per batch size
+monorl bench rollout --config RECIPE [--batch-sizes 1,4,16,64] [--prompts N]
 ```
 
 `plan` prints the same placement the orchestrator would use (`Runtime.placement`) plus a
@@ -89,9 +95,9 @@ After every optimizer step the trainer's weights have to reach every engine repl
 
 | strategy | mechanism | use |
 |---|---|---|
-| `inprocess` | `trainer.export_weights()` streams `(name, tensor)` straight into `engine.update_weights()` | `mode: local`, same process (CPU/MPS/1 GPU) |
-| `cuda_ipc` | tensors stay on the GPU; handles are shared via CUDA IPC with the colocated engine process (vLLM worker extension / SGLang `update_weights_from_tensor`) | colocated multi-process on one node — fastest |
-| `broadcast` | a NCCL (CUDA) / Gloo (CPU) process group spanning trainer and engine ranks; the trainer rank 0 broadcasts each tensor, engines load it in place | disaggregated, multi-node |
+| `inprocess` | `trainer.export_weights()` streams `(name, tensor)` straight into `engine.update_weights()`. After its first sync an engine that takes partial updates (`hf`) is sent only the tensors that changed: with LoRA the merged weights of the adapted modules, not the frozen rest. A sync that failed is followed by a complete one | `mode: local`, same process (CPU/MPS/1 GPU) |
+| `cuda_ipc` | tensors stay on the GPU; handles are shared via CUDA IPC with the colocated engine process (vLLM worker extension / SGLang `update_weights_from_tensor`). Unchanged tensors are left out as with `inprocess`; vLLM and SGLang engines do not take partial updates and get every tensor | colocated multi-process on one node; fastest |
+| `broadcast` | a NCCL (CUDA) / Gloo (CPU) process group spanning trainer and engine ranks; the trainer rank 0 broadcasts each tensor, engines load it in place. Unchanged tensors are left out when every engine takes partial updates | disaggregated, multi-node |
 | `checkpoint` | trainer saves an HF checkpoint to shared storage, engines reload from it | simplest, slowest; any topology, survives engine restarts |
 | `auto` | `inprocess` for local; `cuda_ipc` for colocated Ray; `broadcast` for disaggregated | default |
 
@@ -113,10 +119,10 @@ truncated importance weights, ratio masks and score centering ([`OFF_POLICY.md`]
 disaggregated runs. In colocated runs the engine cannot generate while it sleeps, so async only
 helps with `enable_sleep_mode: false` and enough memory for both.
 
-Episodes within a step are always parallel: `group_size × prompts_per_step` episodes run as
-concurrent tasks against the environment pool (remote MEP/1 servers advertise
-`parallel_episodes`), and their `generate` calls are coalesced by the batching engine so the
-inference backend sees large batches even for multi-turn envs.
+Episodes within a step are always parallel: `group_size × prompts_per_step` episodes run
+against the environment pool (remote MEP/1 servers advertise `parallel_episodes`), and their
+turns are generated in batches, so the inference backend sees large batches even for multi-turn
+envs ([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)).
 
 ## Resuming and cancellation
 

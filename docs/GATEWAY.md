@@ -84,9 +84,10 @@ importance ratios of the policy loss are only right if every token was sampled t
 cannot change it, by accident or otherwise. (A Responses object reports the run's `temperature`
 and `top_p`: what was sampled with.)
 
-Requests that lower the completion length or add stop strings are batched separately from the
-others (the batching proxy never mixes sampling parameters). A stop string the request added is
-cut from the returned text, as the vendors do; the recorded turn keeps it.
+Requests that add stop strings are batched separately from the others (the batching proxy never
+mixes sampling parameters). A request that lowers the completion length stays in the batch of
+the others: an engine call carries a completion length per prompt. A stop string the request
+added is cut from the returned text, as the vendors do; the recorded turn keeps it.
 
 What the policy cannot do is **refused with a 400, not ignored**: `n > 1`, hosted or server tools
 (web search, code interpreter, computer use, MCP, ...), stored conversations and prompt

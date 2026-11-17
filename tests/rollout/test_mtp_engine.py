@@ -167,6 +167,33 @@ def test_a_completion_ends_where_plain_decoding_ends(
     assert 1 < len(ended.token_ids) < len(continuation)
 
 
+def test_every_prompt_is_drafted_for_up_to_its_own_cap(
+    plain: HFRolloutEngine, fitted: HFRolloutEngine
+) -> None:
+    """A call with a generation cap per prompt: a pass of the policy emits two tokens, so an odd
+    cap ends a completion inside what a pass emitted, as it does when the cap is the call's."""
+    caps = [3, 16, 6]
+    params = SamplingParams(n=1, max_new_tokens=16, temperature=0.0, top_logprobs=2)
+    fitted.speculation_stats()
+    got = fitted.generate(PROMPTS, params, max_new_tokens=caps)
+    assert [(len(g[0].token_ids), g[0].finish_reason) for g in got] == [(cap, "length") for cap in caps]
+    _assert_same(got, plain.generate(PROMPTS, params, max_new_tokens=caps))
+    for cap, prompt, group in zip(caps, PROMPTS, got, strict=True):
+        alone = fitted.generate(
+            [prompt], SamplingParams(n=1, max_new_tokens=cap, temperature=0.0, top_logprobs=2)
+        )
+        _assert_same([group], alone)
+    stats = fitted.speculation_stats()
+    assert stats.emitted == 2 * sum(caps) and stats.metrics()["mtp/accept_length"] > 1.5
+
+    sampled = SamplingParams(n=2, max_new_tokens=16, temperature=1.0, seed=3)
+    got = fitted.generate(PROMPTS, sampled, max_new_tokens=caps)
+    assert [[len(c.token_ids) for c in g] for g in got] == [[cap] * 2 for cap in caps]
+    for c in (c for group in got for c in group):
+        reference = _policy_logprobs(fitted, c).gather(1, torch.tensor(c.token_ids)[:, None]).squeeze(1)
+        torch.testing.assert_close(torch.tensor(c.logprobs), reference, rtol=1e-4, atol=1e-5)
+
+
 @pytest.mark.parametrize("top_p", [1.0, 0.5])
 def test_sampled_tokens_and_logprobs_are_the_policys(cold: HFRolloutEngine, top_p: float) -> None:
     prompts = [CHAT, PROMPTS[0]]

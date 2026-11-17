@@ -120,6 +120,46 @@ class TrainBatch:
             extra={k: _slice_extra(v, start, stop) for k, v in self.extra.items()},
         )
 
+    def narrow(self, width: int) -> TrainBatch:
+        """The first ``width`` positions of every sequence: all ``[B, T, ...]`` tensors cut along
+        ``T``, ``extra`` tensors included when their second dimension is ``T``. The batch itself
+        when it is no wider."""
+        full = int(self.input_ids.shape[1])
+        if width >= full:
+            return self
+
+        def cut(t: torch.Tensor | None) -> torch.Tensor | None:
+            return None if t is None else t[:, :width]
+
+        return TrainBatch(
+            input_ids=self.input_ids[:, :width],
+            attention_mask=self.attention_mask[:, :width],
+            response_mask=self.response_mask[:, :width],
+            advantages=self.advantages[:, :width],
+            rewards=self.rewards,
+            group_ids=self.group_ids,
+            old_logprobs=cut(self.old_logprobs),
+            ref_logprobs=cut(self.ref_logprobs),
+            position_ids=cut(self.position_ids),
+            loss_weights=cut(self.loss_weights),
+            behavior_logprobs=cut(self.behavior_logprobs),
+            behavior_top_ids=cut(self.behavior_top_ids),
+            behavior_top_logprobs=cut(self.behavior_top_logprobs),
+            values=cut(self.values),
+            returns=cut(self.returns),
+            value_mask=cut(self.value_mask),
+            meta=self.meta,
+            extra={
+                k: v[:, :width] if isinstance(v, torch.Tensor) and v.ndim >= 2 and v.shape[1] == full else v
+                for k, v in self.extra.items()
+            },
+        )
+
+    def trimmed(self) -> TrainBatch:
+        """Without the columns that are padding in every row: the batch narrowed to its longest
+        sequence. A micro-batch cut from a wider batch seldom needs that batch's width."""
+        return self.narrow(int(self.attention_mask.sum(dim=1).max().item()) if len(self) else 0)
+
     @property
     def num_response_tokens(self) -> int:
         return int(self.response_mask.sum().item())

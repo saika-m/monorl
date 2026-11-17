@@ -5,7 +5,10 @@ Requests are split into per-prompt items. A worker thread takes the oldest item,
 ``max_wait_ms`` for more items with the *same* :class:`SamplingParams` (up to ``max_batch_size``
 prompts), runs ``engine.generate`` once and routes the ``n`` completions of each prompt back to
 its caller in the caller's original order. Items with different params are never mixed; they are
-served in subsequent engine calls.
+served in subsequent engine calls. ``max_new_tokens`` is not part of that: every item keeps the
+cap of its prompt, and items that differ only in it share an engine call, which then carries the
+caps per prompt (``generate(..., max_new_tokens=[...])``, see
+:class:`~monorl.core.interfaces.RolloutEngine`).
 
 ``cancel()`` fails every queued and in-flight request with
 :class:`~monorl.core.errors.GenerationCancelled` at once — the callers do not wait for the engine
@@ -25,7 +28,7 @@ from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
 from monorl.core.errors import GenerationCancelled
-from monorl.core.types import Completion, PromptInput, SamplingParams
+from monorl.core.types import Completion, PromptInput, SamplingParams, prompt_caps
 
 if TYPE_CHECKING:
     import torch
@@ -34,9 +37,13 @@ if TYPE_CHECKING:
 
 
 def params_key(params: SamplingParams) -> tuple[Any, ...]:
-    """Hashable identity of a :class:`SamplingParams` (lists become tuples)."""
+    """Hashable identity of what the prompts of one engine call have to share: every field of a
+    :class:`SamplingParams` (lists become tuples) but ``max_new_tokens``, which a call can carry
+    per prompt."""
     out = []
     for f in fields(params):
+        if f.name == "max_new_tokens":
+            continue
         v = getattr(params, f.name)
         out.append(tuple(v) if isinstance(v, list) else v)
     return tuple(out)
@@ -60,6 +67,8 @@ class _Item:
     index: int
     prompt: PromptInput
     key: tuple[Any, ...]
+    cap: int
+    """Most tokens to generate for ``prompt``."""
 
 
 class BatchingEngine:
@@ -81,16 +90,23 @@ class BatchingEngine:
         self.num_engine_calls = 0
 
     # -- RolloutEngine --------------------------------------------------------------------
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if not prompts:
             return []
+        caps = prompt_caps(params, len(prompts), max_new_tokens)
         req = _Request(params=params, results=[None] * len(prompts), remaining=len(prompts))
         key = params_key(params)
         with self._cv:
             if self._closed:
                 raise RuntimeError("BatchingEngine is shut down")
-            for i, p in enumerate(prompts):
-                self._queue.append(_Item(req, i, p, key))
+            for i, (p, cap) in enumerate(zip(prompts, caps, strict=True)):
+                self._queue.append(_Item(req, i, p, key, cap))
             self._ensure_worker()
             self._cv.notify_all()
         req.done.wait()
@@ -200,7 +216,14 @@ class BatchingEngine:
                 if all(req.done.is_set() for req in requests):
                     return
                 self.num_engine_calls += 1
-                outputs = self.engine.generate([item.prompt for item in batch], batch[0].request.params)
+                prompts = [item.prompt for item in batch]
+                params = batch[0].request.params
+                if all(item.cap == params.max_new_tokens for item in batch):
+                    outputs = self.engine.generate(prompts, params)
+                else:
+                    outputs = self.engine.generate(
+                        prompts, params, max_new_tokens=[item.cap for item in batch]
+                    )
             if len(outputs) != len(batch):
                 raise RuntimeError(f"engine returned {len(outputs)} results for {len(batch)} prompts")
         except BaseException as e:  # noqa: BLE001 - propagate to every waiting caller

@@ -54,6 +54,11 @@ def _checkpoint(model_dir: Path, layers: MtpLayers) -> dict[str, torch.Tensor]:
     }
 
 
+def _hidden(layers: MtpLayers, ids: torch.Tensor) -> torch.Tensor:
+    """What a trainer hands to ``layers.loss`` for ``ids``: the policy's last hidden states."""
+    return layers.last_hidden_states(layers.main_model(input_ids=ids, **layers.last_hidden_request))
+
+
 def _generate(
     policy: Any, prompt: list[int], *, use_mtp: bool, max_new_tokens: int = 16, **config: Any
 ) -> Any:
@@ -116,14 +121,12 @@ def test_the_loss_reaches_only_the_mtp_layers_when_the_trunk_is_detached(
     mask[2, 9:] = 0  # a shorter row, right-padded
     for parameter in layers.parameters():
         parameter.requires_grad_(True)
-    last_layer = [policy.config.num_hidden_layers - 1]
 
     def gradients(detach_trunk: bool) -> tuple[float, float, float]:
         policy.zero_grad()
         for parameter in layers.parameters():
             parameter.grad = None
-        hidden = policy(input_ids=ids, output_hidden_states=last_layer).hidden_states[-1]
-        result = layers.loss(hidden, ids, mask, detach_trunk=detach_trunk)
+        result = layers.loss(_hidden(layers, ids), ids, mask, detach_trunk=detach_trunk)
         assert result.counts == [int(mask[:, 2:].sum())] == layers.target_counts(mask)
         assert float(result.loss.detach()) == pytest.approx(result.sums[0] / result.counts[0], rel=1e-6)
         result.loss.backward()
@@ -137,8 +140,7 @@ def test_the_loss_reaches_only_the_mtp_layers_when_the_trunk_is_detached(
     assert joint == pytest.approx(detached, rel=1e-6)
     assert trunk_joint > 0.0 and own_joint == pytest.approx(own, rel=1e-5)
 
-    hidden = policy(input_ids=ids, output_hidden_states=last_layer).hidden_states[-1]
-    nothing = layers.loss(hidden, ids, torch.zeros_like(ids), detach_trunk=True)
+    nothing = layers.loss(_hidden(layers, ids), ids, torch.zeros_like(ids), detach_trunk=True)
     assert (float(nothing.loss), nothing.targets, nothing.sums) == (0.0, 0, [0.0])
     assert not nothing.loss.requires_grad
 
@@ -154,11 +156,11 @@ def test_parts_of_a_batch_add_up_to_the_batch(policy: Any, layers: MtpLayers) ->
     mask[3, 2:9] = 1  # row 2 has no target at all
     for parameter in layers.parameters():
         parameter.requires_grad_(True)
-    last_layer = [policy.config.num_hidden_layers - 1]
 
     def run(rows: slice, totals: list[int] | None) -> float:
-        hidden = policy(input_ids=ids[rows], output_hidden_states=last_layer).hidden_states[-1]
-        result = layers.loss(hidden, ids[rows], mask[rows], detach_trunk=True, totals=totals)
+        result = layers.loss(
+            _hidden(layers, ids[rows]), ids[rows], mask[rows], detach_trunk=True, totals=totals
+        )
         if result.loss.requires_grad:
             result.loss.backward()
         return float(result.loss.detach())
@@ -182,11 +184,10 @@ def test_every_depth_is_trained_on_what_drafting_computes() -> None:
     assert layers.num_layers == 2 and len(layers.parameters()) == 2 * 15
     prefix = torch.tensor([[1, 5, 9, 17, 33, 21, 64]])
     length = prefix.shape[1]
-    last_layer = [policy.config.num_hidden_layers - 1]
     with torch.no_grad():
         # Drafting after the policy has read all but the last prefix token: depth 0 drafts the
         # token after the prefix, depth 1 the one after that.
-        hidden = policy(input_ids=prefix[:, :-1], output_hidden_states=last_layer).hidden_states[-1]
+        hidden = _hidden(layers, prefix[:, :-1])
         positions = torch.arange(length).unsqueeze(0)
         drafted, draft_logits, _ = mtp_model(
             input_ids=prefix[:, 1:],
@@ -196,7 +197,7 @@ def test_every_depth_is_trained_on_what_drafting_computes() -> None:
             mtp_cache=MtpCache(config=policy.config.get_mtp_config()),
         )
         sequence = torch.cat([prefix, drafted], dim=1)
-        hidden = policy(input_ids=sequence, output_hidden_states=last_layer).hidden_states[-1]
+        hidden = _hidden(layers, sequence)
         for depth in (0, 1):
             target = torch.zeros_like(sequence)
             target[0, length + depth] = 1  # only the token this depth drafted
@@ -378,3 +379,48 @@ def test_the_held_candidate_generator_sets_what_transformers_sets(policy: Any, l
     assert set(vars(upstream)) <= set(vars(held))
     assert held.model_kwargs_overrides == upstream.model_kwargs_overrides
     assert held.num_mtp_layers == upstream.num_mtp_layers
+
+
+def test_the_layers_are_trained_on_the_states_drafting_hands_them(policy: Any, layers: MtpLayers) -> None:
+    """How the policy is asked for the layers' input differs between transformers releases. What
+    a trainer gets through the layers has to be the policy's final hidden states and no other
+    layer's (kept in memory, they would be a batch per decoder layer), and the states the drafter
+    hands to the layers for the same tokens."""
+    prompt = torch.tensor([PROMPTS[0]])
+    with torch.no_grad():
+        final = policy.get_decoder()(input_ids=prompt).last_hidden_state
+        outputs = policy(input_ids=prompt, **layers.last_hidden_request)
+    assert torch.equal(layers.last_hidden_states(outputs), final)
+    assert sum(states is not None for states in outputs.hidden_states) == 1
+
+    handed: list[torch.Tensor] = []
+    hook = layers.model.register_forward_pre_hook(
+        lambda _module, _args, kwargs: handed.append(kwargs["last_hidden_states"]), with_kwargs=True
+    )
+    layers.install_drafting()
+    _generate(policy, PROMPTS[0], use_mtp=True, max_new_tokens=4)
+    hook.remove()
+    torch.testing.assert_close(handed[0], final, rtol=1e-5, atol=1e-6)  # the first draft follows the prompt
+
+    # layers that transformers did not load are asked for with its drafter's default
+    in_memory = MtpLayers.of(*two_layer_mtp())
+    with torch.no_grad():
+        final = in_memory.main_model.get_decoder()(input_ids=prompt).last_hidden_state
+    assert torch.equal(_hidden(in_memory, prompt), final)
+
+    # a forward pass that was not asked returns none: an error, not a loss of nothing
+    with torch.no_grad(), pytest.raises(RuntimeError, match=r"no last hidden states.*last_hidden_request"):
+        layers.last_hidden_states(policy(input_ids=prompt))
+
+
+@pytest.mark.parametrize("version", ["4.46.0", "5.21.1"])
+def test_a_transformers_release_from_before_the_layers_is_refused(
+    version: str, policy: Any, model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pyproject allows such releases. The layers were never run on one, and before 5.21 the
+    loader they are read and written with is incomplete: an error that says which release is
+    needed, not an import error from the middle of loading."""
+    # by name: transformers replaces its entry in sys.modules while a model loads
+    monkeypatch.setattr("transformers.__version__", version)
+    with pytest.raises(ConfigError, match=rf"needs transformers 5\.22 or later; {version} is installed"):
+        MtpLayers(policy, model_dir)

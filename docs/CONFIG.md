@@ -18,7 +18,7 @@ See: [RUNS.md](RUNS.md)
 | Key | Type, default | Description |
 | --- | --- | --- |
 | `run_name` | string or null; default `null` | Defaults to '\<model>-\<algorithm>-\<timestamp>'. |
-| `seed` | integer; default `42` | Seed of the run: Python and torch are seeded with it at the start and with seed + step at every step, and data sources and backends receive it. |
+| `seed` | integer; default `42` | Seed of the run: Python and torch are seeded with it at the start (a resumed run takes the state of the generators from its checkpoint), and data sources and backends receive it. |
 | `providers` | list of string; default `[]` | Modules imported before the run builds its components. Each exposes register(registry) and may add rewards, environments, engines, trainers or other components under names the config can then use. They are imported from the working directory or the Python path. |
 
 ## `model`
@@ -56,7 +56,7 @@ This section is required.
 
 | Key | Type, default | Description |
 | --- | --- | --- |
-| `data.uri` | string; required | Dataset location: 'hf://org/name' (Hub), 's3://bucket/prefix-or-file' (credentials from AWS_* env vars), or a local file/directory (.jsonl/.json/.parquet/.csv/.arrow). |
+| `data.uri` | string; required | Dataset location: 'hf://org/name' (Hub), 's3://bucket/prefix-or-file' (credentials from AWS_* env vars), a local file/directory (.jsonl/.json/.parquet/.csv/.arrow), or the scheme of a data source that a module in `providers` registers. |
 | `data.split` | string; default `train` | Split name for Hub datasets (ignored for files). |
 | `data.hf_config_name` | string or null; default `null` | Hub dataset config/subset name. |
 | `data.format` | `auto`, `chat`, `prompt_answer`, `text`; default `auto` | 'chat': a messages column; 'prompt_answer': prompt + reference answer columns; 'text': a single prompt column; 'auto' sniffs columns. |
@@ -91,7 +91,7 @@ See: [ALGORITHMS.md](ALGORITHMS.md), [CREDIT_ASSIGNMENT.md](CREDIT_ASSIGNMENT.md
 | `algorithm.kl_estimator` | `k1`, `k2`, `k3`; default `k3` | KL estimator (Schulman's k1/k2/k3). |
 | `algorithm.clip_eps` | number, > 0.0; default `0.2` | PPO clipping epsilon (lower bound). |
 | `algorithm.clip_eps_high` | number or null, > 0.0; default `null` | Asymmetric upper clip (DAPO clip-higher). |
-| `algorithm.advantage_norm` | `group`, `batch`, `none`; default `group` | Normalise rewards within the prompt group (GRPO), across the batch, or not at all. |
+| `algorithm.advantage_norm` | `group`, `batch`, `none`; default `group` | grpo and dapo: normalise rewards within the prompt group, across the batch, or not at all. Not read by rloo, ppo or reinforce, except that verl subtracts the group mean under reinforce when this is 'group'. |
 | `algorithm.advantage_std_norm` | boolean; default `true` | Divide by std in group normalisation (False = Dr.GRPO style). |
 | `algorithm.loss_agg` | `token`, `sequence`, `rollout`; default `token` | Average the loss over all response tokens, per training sequence first, or per rollout first ('rollout': every episode counts equally however many sequences its turns form). |
 | `algorithm.entropy_coef` | number, >= 0.0; default `0.0` | Weight of the entropy bonus: entropy_coef * entropy is subtracted from the loss. |
@@ -133,6 +133,7 @@ See: [BACKENDS.md](BACKENDS.md), [DISTRIBUTED.md](DISTRIBUTED.md)
 | `rollout.enable_sleep_mode` | boolean; default `true` | Offload engine memory while training (colocated). |
 | `rollout.async_steps_ahead` | integer, >= 0; default `0` | Generate up to N batches ahead of training (off-policy staleness bound). 0 = synchronous. |
 | `rollout.turn_rendering` | `tokens`, `template`; default `tokens` | How a multi-turn prompt is built. 'tokens': the sampled tokens of earlier turns stay in the context and only new messages are rendered. 'template': the chat template re-renders the whole conversation every turn. |
+| `rollout.turn_batching` | `lockstep`, `arrival`; default `lockstep` | How the turns of concurrent episodes reach an engine. 'lockstep': once every running episode has its next prompt, all of them are generated in one call, in a fixed order, so a run repeats for a fixed seed; an episode waits for the slowest environment step of its round. 'arrival': an episode asks as soon as its environment has answered and requests are batched as they arrive: faster when environment steps are slow and uneven, not repeatable. Agent harnesses that drive their own episodes always run the second way. |
 | `rollout.device` | string or null; default `null` | Device for the 'hf' backend (cpu/mps/cuda); auto if unset. |
 | `rollout.extra` | mapping; default `{}` | Engine-specific options passed through. Keys: see [BACKENDS.md](BACKENDS.md). |
 

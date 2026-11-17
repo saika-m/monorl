@@ -16,7 +16,7 @@ import socket
 import threading
 import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -406,7 +406,10 @@ class FakeLLM:
     """``vllm.LLM`` (vllm/entrypoints/llm.py:62): records constructor kwargs and every call.
 
     ``enqueue`` (:483) is deterministic: completion ``i`` of prompt ``p`` will emit ``script``
-    tokens (``[p, i, 7]``) with logprob ``-(k+1)/10`` and finish reason from ``finish_reasons``.
+    tokens (``[p, i, 7]``) with logprob ``-(k+1)/10`` and finish reason from ``finish_reasons``,
+    or the first ``max_tokens`` of them with finish reason ``length``. ``sampling_params`` is one
+    ``SamplingParams`` or a sequence with one per prompt (``_params_to_seq``,
+    vllm/entrypoints/common/offline.py:253).
     Like upstream it returns the engine's internal request ids (``<counter>-<suffix>``,
     ``InputProcessor.assign_request_id``) while ``RequestOutput.request_id`` is the counter value.
     """
@@ -448,11 +451,23 @@ class FakeLLM:
         self.calls.append(
             ("enqueue", {"prompts": prompts, "sampling_params": sampling_params, "use_tqdm": use_tqdm})
         )
+        if isinstance(sampling_params, Sequence):
+            if len(sampling_params) != len(prompts):
+                raise ValueError(  # VLLMValidationError, a ValueError (vllm/exceptions.py)
+                    f"The lengths of prompts ({len(prompts)}) and params ({len(sampling_params)}) "
+                    "must be the same."
+                )
+            seq_params = list(sampling_params)
+        else:
+            seq_params = [sampling_params] * len(prompts)
         request_ids = []
-        for p, prompt in enumerate(prompts):
+        for p, (prompt, sampling_params) in enumerate(zip(prompts, seq_params, strict=True)):
             comps = []
             for i in range(sampling_params.n):
                 token_ids = [p, i, 7]
+                cut = sampling_params.max_tokens is not None and sampling_params.max_tokens < len(token_ids)
+                if cut:
+                    token_ids = token_ids[: sampling_params.max_tokens]
                 lps = None
                 if sampling_params.logprobs is not None:
                     lps = []
@@ -462,6 +477,8 @@ class FakeLLM:
                             pos[1000 + j] = Logprob(-5.0 - j, rank=2 + j)
                         lps.append(pos)
                 fr = FakeLLM.finish_reasons[(p * sampling_params.n + i) % len(FakeLLM.finish_reasons)]
+                if cut:
+                    fr = "length"
                 comps.append(CompletionOutput(i, f"text-{p}-{i}", token_ids, None, lps, fr))
                 if self.spec_decode is not None:
                     # Two verification passes per completion; one draft token of each pass is accepted.

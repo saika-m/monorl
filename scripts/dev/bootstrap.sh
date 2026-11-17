@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bootstraps a monorl development checkout:
-#   1. .venv (Python 3.12) via uv with the CPU-friendly extras
+#   1. .venv (Python 3.12) via uv with the packages of requirements.lock (`make sync`)
 #   2. Go + C++ example MEP/1 environments → envs/bin
 #   3. web UI → web/dist (served by `monorl serve`)
 #
@@ -8,7 +8,9 @@
 #   --check     print every command that would run, without running anything
 #   --no-envs   skip the Go/C++ environment build
 #   --no-web    skip the web UI build
-#   --extras    comma-separated pyproject extras (default: trl,distributed,dev,openenv,hermes,rewards)
+#   --extras    comma-separated pyproject extras to install instead of the locked environment
+#               (dev,trl,distributed,multimodal,rewards,openenv,hermes); what requirements.lock
+#               pins still comes at that version, anything else is resolved freely
 #   --python    interpreter version for uv venv (default: 3.12)
 set -euo pipefail
 
@@ -18,7 +20,7 @@ cd "${REPO_ROOT}"
 CHECK=0
 BUILD_ENVS=1
 BUILD_WEB=1
-EXTRAS="trl,distributed,dev,openenv,hermes,rewards"
+EXTRAS=""
 PYTHON_VERSION="3.12"
 
 while [[ $# -gt 0 ]]; do
@@ -30,7 +32,7 @@ while [[ $# -gt 0 ]]; do
         --extras=*) EXTRAS="${1#*=}" ;;
         --python) PYTHON_VERSION="$2"; shift ;;
         --python=*) PYTHON_VERSION="${1#*=}" ;;
-        -h|--help) sed -n '2,12p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "bootstrap: unknown option '$1' (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -50,7 +52,11 @@ if [[ ${CHECK} -eq 1 ]]; then
 fi
 
 # --- 1. Python environment --------------------------------------------------------------------
-log "Python: .venv (${PYTHON_VERSION}) with extras [${EXTRAS}]"
+if [[ -n "${EXTRAS}" ]]; then
+    log "Python: .venv (${PYTHON_VERSION}) with extras [${EXTRAS}], versions from requirements.lock"
+else
+    log "Python: .venv (${PYTHON_VERSION}) with the packages of requirements.lock"
+fi
 if ! have uv; then
     if [[ ${CHECK} -eq 1 ]]; then
         warn "uv not found; it would be installed from https://astral.sh/uv/install.sh"
@@ -67,7 +73,12 @@ if [[ -x .venv/bin/python ]]; then
 else
     run uv venv .venv --python "${PYTHON_VERSION}"
 fi
-run uv pip install --python .venv/bin/python -e ".[${EXTRAS}]"
+if [[ -n "${EXTRAS}" ]]; then
+    run uv pip install --python .venv/bin/python --torch-backend cpu --no-build \
+        --constraint requirements.lock --build-constraint requirements.lock -e ".[${EXTRAS}]"
+else
+    run make sync
+fi
 run .venv/bin/python -c 'import monorl, torch, transformers; print("monorl ok · torch", torch.__version__, "· transformers", transformers.__version__)'
 
 # --- 2. Go / C++ example environments -----------------------------------------------------------

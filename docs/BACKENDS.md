@@ -12,27 +12,61 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 
 ## Support matrix
 
-| Framework | Pin | Role | `RunConfig` selector | Runs here on CPU | Modes | Patched |
-|---|---|---|---|---|---|---|
-| transformers | 5.22 | rollout engine | `rollout.backend: hf` | yes | local, ray | – |
-| reference trainer (torch) | – | trainer (full / LoRA via peft) | `trainer.backend: reference` | yes | local, ray | – |
-| vLLM | 0.33.0 | rollout engine | `rollout.backend: vllm` | no (CUDA); `rollout.extra.mode: server` runs here against a remote `python -m monorl.adapters.vllm.server` | colocated (sleep mode), disaggregated, TP/DP, server (HTTP) | worker extension `monorl_update_weights` / `monorl_load_weights_from_path` via `collective_rpc` (vLLM's `GPUWorker` already owns `update_weights`), per-token logprob extraction, `SamplingParams` mapping, `sleep(level)`/`wake_up` journaling, `/update_named_param` + `/load_weights_from_path` mounted on the API server |
-| SGLang | 0.5.23 | rollout engine | `rollout.backend: sglang` | no (CUDA); `rollout.extra.mode: server` runs here against a remote `sglang.launch_server` | colocated (`release/resume_memory_occupation`), disaggregated, server (HTTP) | `sglang.logprob_floats` (float/int coercion in `TokenizerManager.detokenize_logprob_tokens`), `sglang.seeded_parallel_sampling` (`Engine.generate` with `sampling_seed` + `n>1` gets one seed per sample), `sglang.release_memory_guard` / `sglang.resume_memory_guard` (no-op without CUDA or `enable_memory_saver`), `sglang.update_weights_named_tensors` (dict/generator inputs, contiguous detached tensors) |
-| Unsloth | 2026.10.11 (`v0.1.913-beta`) | trainer | `trainer.backend: unsloth` | no (CUDA only) | local | `FastLanguageModel` inside the reference loop; `unsloth.trl.*` patches reconcile Unsloth's TRL rewrites with monorl's TRL patchset. **Pin conflict:** declares `trl<=1.15.0`, `transformers<=5.17.0` vs monorl's trl 1.17.1 / transformers 5.22 — see below |
-| TRL | 1.17.1 | pipeline backend | `trainer.backend: trl` | **yes** | local (`GRPOTrainer`), vLLM server/colocate via `trainer.extra` | `GRPOTrainer` reporter hook → `metrics.jsonl`/`status.json`; env rollouts in place of plain generation |
-| verl | 0.9.1 (`1876b06`) | pipeline backend | `trainer.backend: verl` | no (Ray + CUDA) | ray, FSDP / Megatron workers, colocated | reward manager → monorl rewards; dataset → monorl data source; `python -m monorl.adapters.verl.entry` runs `main_ppo` with the compiled Hydra tree and applies the `Tracking` metrics patch inside the Ray actor |
-| NeMo-RL | git v0.7.0 (`81aa43d`) | pipeline backend | `trainer.backend: nemo_rl` | no (Ray + CUDA; needs `NEMO_RL_HOME`) | ray virtual cluster, DTensor / Megatron | `monorl.adapters.nemo_rl.env_actor.MonorlEnvironment` (`EnvironmentInterface`) bridge to monorl envs; reward bridge; config compiled to `<run_dir>/nemo_rl/nemo_rl.yaml` |
-| OpenEnv | 0.3.0 | environment | `env.type: openenv` | yes (needs a running env server or in-process class) | http / in-process / docker image | typed action/observation ↔ chat messages mapping |
-| Hermes Agent | 0.19.0 | environment | `env.type: hermes` | yes (CPU, tools run locally) | multi-turn agent loop | policy generation routed to the monorl rollout engine; tool execution + skills from Hermes |
-| Go / C++ / any (MEP/1) | – | environment | `env.type: remote` | yes | stdio, http | – (wire protocol, see `src/monorl/envs/protocol.py`) |
-| Ray | 2.59 | placement / worker groups | `cluster.mode: ray` | yes (local Ray) | colocated, disaggregated | – |
+| Framework | Pin | Role | `RunConfig` selector |
+|---|---|---|---|
+| transformers | 5.22, 5.23 | rollout engine | `rollout.backend: hf` |
+| reference trainer (torch) | – | trainer (full / LoRA via peft) | `trainer.backend: reference` |
+| vLLM | 0.33.0 | rollout engine | `rollout.backend: vllm` |
+| SGLang | 0.5.23 | rollout engine | `rollout.backend: sglang` |
+| Unsloth | 2026.10.11 (`v0.1.913-beta`) | trainer | `trainer.backend: unsloth` |
+| TRL | 1.17.1 | pipeline backend | `trainer.backend: trl` |
+| verl | 0.9.1 (`1876b06`) | pipeline backend | `trainer.backend: verl` |
+| NeMo-RL | git v0.7.0 (`81aa43d`) | pipeline backend | `trainer.backend: nemo_rl` |
+| OpenEnv | 0.3.0 | environment | `env.type: openenv` |
+| Hermes Agent | 0.19.0 | environment | `env.type: hermes` |
+| Go / C++ / any (MEP/1) | – | environment | `env.type: remote` |
+| Ray | 2.59 | placement / worker groups | `cluster.mode: ray` |
+
+| Framework | Runs here on CPU | Modes |
+|---|---|---|
+| transformers | yes | local, ray |
+| reference trainer (torch) | yes | local, ray |
+| vLLM | no (CUDA); `rollout.extra.mode: server` runs here against a remote `python -m monorl.adapters.vllm.server` | colocated (sleep mode), disaggregated, TP/DP, server (HTTP) |
+| SGLang | no (CUDA); `rollout.extra.mode: server` runs here against a remote `sglang.launch_server` | colocated (`release/resume_memory_occupation`), disaggregated, server (HTTP) |
+| Unsloth | no (CUDA only) | local |
+| TRL | **yes** | local (`GRPOTrainer`), vLLM server/colocate via `trainer.extra` |
+| verl | no (Ray + CUDA) | ray, FSDP / Megatron workers, colocated |
+| NeMo-RL | no (Ray + CUDA; needs `NEMO_RL_HOME`) | ray virtual cluster, DTensor / Megatron |
+| OpenEnv | yes (needs a running env server or in-process class) | http / in-process / docker image |
+| Hermes Agent | yes (CPU, tools run locally) | multi-turn agent loop |
+| Go / C++ / any (MEP/1) | yes | stdio, http |
+| Ray | yes (local Ray) | colocated, disaggregated |
+
+| Framework | Patched |
+|---|---|
+| transformers | – |
+| reference trainer (torch) | – |
+| vLLM | worker extension `monorl_update_weights` / `monorl_load_weights_from_path` via `collective_rpc` (vLLM's `GPUWorker` already owns `update_weights`), per-token logprob extraction, `SamplingParams` mapping, `sleep(level)`/`wake_up` journaling, `/monorl/update_weights` + `/load_weights_from_path` mounted on the API server |
+| SGLang | `sglang.logprob_floats` (float/int coercion in `TokenizerManager.detokenize_logprob_tokens`), `sglang.seeded_parallel_sampling` (`Engine.generate` with `sampling_seed` + `n>1` gets one seed per sample), `sglang.release_memory_guard` / `sglang.resume_memory_guard` (no-op without CUDA or `enable_memory_saver`), `sglang.update_weights_named_tensors` (dict/generator inputs, contiguous detached tensors) |
+| Unsloth | `FastLanguageModel` inside the reference loop; `unsloth.trl.*` patches reconcile Unsloth's TRL rewrites with monorl's TRL patchset. **Pin conflict:** declares `trl<=1.15.0`, `transformers<=5.17.0` vs monorl's trl 1.17.1 / transformers 5.22 — see below |
+| TRL | `GRPOTrainer` reporter hook → `metrics.jsonl`/`status.json`; env rollouts in place of plain generation |
+| verl | reward manager → monorl rewards; dataset → monorl data source; `python -m monorl.adapters.verl.entry` runs `main_ppo` with the compiled Hydra tree and applies the `Tracking` metrics patch inside the Ray actor |
+| NeMo-RL | `monorl.adapters.nemo_rl.env_actor.MonorlEnvironment` (`EnvironmentInterface`) bridge to monorl envs; reward bridge; config compiled to `<run_dir>/nemo_rl/nemo_rl.yaml` |
+| OpenEnv | typed action/observation ↔ chat messages mapping |
+| Hermes Agent | policy generation routed to the monorl rollout engine; tool execution + skills from Hermes |
+| Go / C++ / any (MEP/1) | – (wire protocol, see `src/monorl/envs/protocol.py`) |
+| Ray | – |
 
 ## Component backends
 
 ### Rollout engines (`rollout.backend`)
 
 * `hf` — transformers `generate` with per-token logprobs, chat template applied by the engine,
-  works for CPU/MPS/CUDA. Used by every CPU recipe and by tests.
+  works for CPU/MPS/CUDA. Used by every CPU recipe and by tests. A batch is decoded by a chain of
+  `generate` calls: when a row finishes, the call ends and the next one continues the others from
+  the key-value cache without it, so no forward pass computes a finished row (run here on
+  SmolLM2-135M, 16 prompts of up to 256 tokens: 4096 row-steps before, about 1640 after). Models
+  with a processor and caches other than the default dynamic one are decoded in one call.
 * `vllm` — `vllm.LLM` (offline) with `enable_sleep_mode` for colocated runs; TP via
   `rollout.tensor_parallel_size`, DP via `rollout.data_parallel_size` (one `LLM` per replica).
   Weight updates arrive through the patched worker extension — `monorl_update_weights` /
@@ -41,8 +75,10 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
   trainer and engine share GPUs. `rollout.extra.mode: server` talks over HTTP to
   `python -m monorl.adapters.vllm.server`, which starts the OpenAI-compatible server with
   `VLLM_SERVER_DEV_MODE=1` (vLLM's own `/sleep`, `/wake_up`, `/is_sleeping`,
-  `/reset_prefix_cache`) plus monorl's `/update_named_param` (raw tensor bytes) and
-  `/load_weights_from_path`.
+  `/reset_prefix_cache`) plus monorl's `/monorl/update_weights` (many tensors per request, raw
+  bytes, at most `rollout.extra.weight_request_bytes` of them, default 64 MiB) and
+  `/load_weights_from_path`. Image prompts are one chat request each, in flight together; an
+  image is encoded to a data URL once per run (`rollout.extra.image_cache_bytes`).
 * `sglang` — `sglang.srt.entrypoints.engine.Engine` (colocate, default) or an httpx client for
   `sglang.launch_server` (`rollout.extra.mode: server`, `url`/`urls`) using `/generate` and
   `/update_weights_from_tensor`; the tensor route only works when trainer and server share a host
@@ -69,10 +105,17 @@ updated in the same session. Options that would make the sampled distribution di
 recorded logprobs (vLLM's lossy rejection samplers, SGLang accept thresholds below 1.0, `min_p`
 with drafting on either) are config errors.
 
-Every engine implements `generate(prompts, params) -> list[list[Completion]]` with exactly
-`params.n` completions per prompt and per-token logprobs; the orchestrator's `BatchingEngine`
-coalesces concurrent episode requests into one engine call. A completion that ends on one of
-`rollout.stop` keeps the stop string in its text on every engine — vLLM and SGLang cut it by
+Every engine implements `generate(prompts, params, *, max_new_tokens=None)` and returns
+`list[list[Completion]]` with exactly `params.n` completions per prompt and per-token logprobs;
+the turns of concurrent episodes reach it as batches
+([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)). `max_new_tokens` is a generation cap per
+prompt (the room a turn has left in the context budget) that takes the place of
+`params.max_new_tokens`. A row of the `hf` engine leaves the batch at its cap, vLLM gets one
+`SamplingParams` per prompt and SGLang one `sampling_params` dict per request, in process and
+over `POST /generate`; the vLLM server client sends one `/v1/completions` request per distinct
+cap, all at once. A completion that
+ends on one of `rollout.stop` keeps the stop string in its text on every engine — vLLM and
+SGLang cut it by
 default, so the adapters send `include_stop_str_in_output=True` / `no_stop_trim=True` — which is
 what lets `tool_calling` parse a closing `</tool_call>` and keeps re-rendered chats token-exact.
 
@@ -88,13 +131,13 @@ flight, and the server aborts on the disconnect (vLLM at once via `with_cancella
 Chat prompts with `{"type": "image", ...}` parts (`data.image_field`, see `docs/ARCHITECTURE.md`
 "Multimodal messages") are supported by every engine; raw-token prompts stay text-only.
 
-| Engine | Mode | How images reach the model | Prompt ids recorded on `Completion` |
-|---|---|---|---|
-| `hf` | in-process | `AutoProcessor` (`monorl.rollout.media`) | processor chat template (placeholders included) |
-| `vllm` | colocate | `TokensPrompt(prompt_token_ids=<processor ids>, multi_modal_data={"image": [PIL…]})`; `rollout.extra.limit_mm_per_prompt` (`{"image": N}` or `N`) → `EngineArgs.limit_mm_per_prompt` | processor chat template |
-| `vllm` | server | `POST /v1/chat/completions` with `image_url` data-URL parts, `logprobs=true, top_logprobs=0`, `return_token_ids=true`; one request per prompt (`n` choices). The chat endpoint's logprob entries carry token *strings*, so ids come from `choices[i].token_ids` and the prompt ids from the response-level `prompt_token_ids` (rendered by the server's chat template) | server `prompt_token_ids` |
-| `sglang` | colocate | `Engine.async_generate(input_ids=<processor ids>, image_data=[[PIL…] or None per request])` run on the engine's loop; sglang's multimodal processor decodes the ids, re-expands the image placeholders and returns the final ids | processor chat template |
-| `sglang` | server | `POST /generate` with `image_data` = per-request lists of `data:image/png;base64,…` URLs (sglang `load_image`) | processor chat template |
+| Engine / Mode | How images reach the model | Prompt ids recorded on `Completion` |
+|---|---|---|
+| `hf` / in-process | `AutoProcessor` (`monorl.rollout.media`) | processor chat template (placeholders included) |
+| `vllm` / colocate | `TokensPrompt(prompt_token_ids=<processor ids>, multi_modal_data={"image": [PIL…]})`; `rollout.extra.limit_mm_per_prompt` (`{"image": N}` or `N`) → `EngineArgs.limit_mm_per_prompt` | processor chat template |
+| `vllm` / server | `POST /v1/chat/completions` with `image_url` data-URL parts, `logprobs=true, top_logprobs=0`, `return_token_ids=true`; one request per prompt (`n` choices). The chat endpoint's logprob entries carry token *strings*, so ids come from `choices[i].token_ids` and the prompt ids from the response-level `prompt_token_ids` (rendered by the server's chat template) | server `prompt_token_ids` |
+| `sglang` / colocate | `Engine.async_generate(input_ids=<processor ids>, image_data=[[PIL…] or None per request])` run on the engine's loop; sglang's multimodal processor decodes the ids, re-expands the image placeholders and returns the final ids | processor chat template |
+| `sglang` / server | `POST /generate` with `image_data` = per-request lists of `data:image/png;base64,…` URLs (sglang `load_image`) | processor chat template |
 
 Text-only models never load a processor (`load_processor` decides from the HF config); a VLM
 prompt against a text-only model is a `ConfigError`. Audio/video parts are not forwarded by the
@@ -132,7 +175,7 @@ vLLM/SGLang adapters yet.
   `monorl.adapters.unsloth.reconcile_trl_patches()` re-applies monorl's TRL patchset to the
   trainer classes Unsloth regenerates, so `trainer.backend: trl` also works with Unsloth imported.
   **Pin conflict:** unsloth 2026.10.11 declares `trl<=1.15.0` and `transformers<=5.17.0`, while
-  monorl's environment pins trl 1.17.1 / transformers 5.22; `pip install unsloth` into the monorl
+  `requirements.lock` has trl 1.17.1 / transformers 5.23.0; `pip install unsloth` into the monorl
   venv therefore downgrades (or refuses) those packages. Run Unsloth in its own environment:
   `make install-unsloth` creates `.venv-unsloth` with `monorl[unsloth,dev]` and the unsloth version
   pinned in `third_party/pins.toml` (uv resolves that to trl 1.15.0 / transformers 5.17.0 for Linux
@@ -208,9 +251,9 @@ Hydra and NeMo-RL yaml, `GRPOConfig` kwargs for TRL).
   micro_batch_size_per_gpu}` over a `messages` parquet (`MultiTurnSFTDataset`, assistant turns
   masked), `model.path`, `optim.{lr,weight_decay,lr_warmup_steps,lr_scheduler_type,clip_grad}`,
   `trainer.{total_training_steps,total_epochs,save_freq,test_freq,default_local_dir,project_name,
-  experiment_name,logger}`, `checkpoint.save_contents` + `hf_model` (so `global_step_<n>/huggingface`
-  is the HF export), launched as `python -m monorl.adapters.verl.entry --sft <overrides>`;
-  `train/loss → loss/sft`, `val/loss → eval/loss`.
+  experiment_name,logger}`, `checkpoint.save_contents` + `hf_model` (so
+  `global_step_<n>/huggingface` is the HF export), launched as `python -m monorl.adapters.verl.entry
+  --sft <overrides>`; `train/loss → loss/sft`, `val/loss → eval/loss`.
 * **NeMo-RL** — git-only (tag `v0.7.0`, commit `81aa43dd`, not on PyPI): set `NEMO_RL_HOME`
   (or `trainer.extra.nemo_rl_home`) to a NeMo-RL checkout, otherwise the backend raises
   `BackendUnavailable`. The adapter compiles `<run_dir>/nemo_rl/nemo_rl.yaml` (DTensor or

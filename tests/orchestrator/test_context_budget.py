@@ -13,7 +13,7 @@ from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, DataError
 from monorl.core.registry import registry
 from monorl.core.reporting import iter_metrics
-from monorl.core.types import Completion, Sample, SamplingParams
+from monorl.core.types import Completion, Sample, SamplingParams, prompt_caps
 from monorl.orchestrator import run
 from monorl.orchestrator.batching import prefix_chain_ok
 from monorl.orchestrator.episodes import (
@@ -23,27 +23,21 @@ from monorl.orchestrator.episodes import (
     run_episode,
     run_episodes,
 )
+from monorl.rollout import BatchingEngine
 
 
 class CappingEngine(fakes.FakeEngine):
-    """Honours ``max_new_tokens`` like a real engine (the fake returns its whole answer) and
-    remembers the limit of every call."""
+    """Remembers the generation cap of every prompt it is called with."""
 
     def __init__(self, config: RunConfig, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)
         self.limits: list[int] = []
 
-    def generate(self, prompts: Any, params: SamplingParams) -> list[list[Completion]]:
-        self.limits.append(params.max_new_tokens)
-        out = super().generate(prompts, params)
-        for group in out:
-            for c in group:
-                if len(c.token_ids) > params.max_new_tokens:
-                    c.token_ids = c.token_ids[: params.max_new_tokens]
-                    c.logprobs = c.logprobs[: params.max_new_tokens]
-                    c.text = self.tokenizer.decode(c.token_ids, skip_special_tokens=True)
-                    c.finish_reason = "length"
-        return out
+    def generate(
+        self, prompts: Any, params: SamplingParams, *, max_new_tokens: Any = None
+    ) -> list[list[Completion]]:
+        self.limits.extend(prompt_caps(params, len(prompts), max_new_tokens))
+        return super().generate(prompts, params, max_new_tokens=max_new_tokens)
 
 
 def _sample(text: str = "abcdef") -> Sample:
@@ -97,6 +91,45 @@ def test_an_episode_ends_when_its_next_prompt_does_not_fit(make_config: Any) -> 
     trajectory = _episode(cfg, engine, budget=second_prompt + 1)
     assert len(trajectory.turns) == 2 and engine.limits == [16, 1]
     assert prefix_chain_ok(trajectory)
+
+
+@pytest.mark.parametrize("turn_batching", ["lockstep", "arrival"])
+def test_episodes_with_different_room_left_share_an_engine_call(make_config: Any, turn_batching: str) -> None:
+    """Eight three-turn episodes on one engine. Their prompts have different lengths, so in the
+    third round five of them have less room left than ``max_new_tokens``, each another amount.
+    The round is still one engine call, which carries the caps per prompt; three of the five
+    answers do not fit their room and are cut there."""
+    cfg = _config(make_config)
+    lengths = [3, 4, 5, 11, 12, 13, 14, 15]
+    rooms = [16, 16, 16, 10, 8, 6, 4, 2]  # 61 - (2 * length + 29) tokens of prompt, at most 16
+    engine = CappingEngine(cfg)
+    proxy = BatchingEngine(engine, max_batch_size=8, max_wait_ms=10_000)  # a call waits for all eight
+    specs = [
+        EpisodeSpec(sample=_sample("abcdefghijklmno"[:n]), group_id=f"g{n}", engine=proxy) for n in lengths
+    ]
+    try:
+        trajectories = run_episodes(
+            specs,
+            env_factory=lambda: fakes.FakeMultiTurnEnv(cfg),
+            tokenizer=engine.tokenizer,
+            params=SamplingParams(n=1, max_new_tokens=16),
+            max_context_tokens=61,
+            turn_batching=turn_batching,  # type: ignore[arg-type]
+        )
+    finally:
+        proxy.shutdown()
+    assert [call["num_prompts"] for call in engine.calls] == [8, 8, 8]  # one call per round
+    assert engine.limits[:16] == [16] * 16
+    assert sorted(engine.limits[16:]) == sorted(rooms)
+    assert turn_batching == "arrival" or engine.limits[16:] == rooms  # in the order of the specs
+    for trajectory, room in zip(trajectories, rooms, strict=True):
+        assert len(trajectory.turns) == 3 and prefix_chain_ok(trajectory)
+        last = trajectory.turns[-1]
+        assert len(last.prompt_token_ids) + room == 61 or room == 16
+        cut = room < 7  # the answer of the third turn has seven tokens
+        assert len(last.completion.token_ids) == min(room, 7)
+        assert last.completion.finish_reason == ("length" if cut else "stop")
+        assert trajectory.info.get("context_exhausted", False) is cut and trajectory.done is not cut
 
 
 def test_a_first_prompt_over_the_budget_fails_the_episode(make_config: Any) -> None:

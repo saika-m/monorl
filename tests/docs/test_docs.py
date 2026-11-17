@@ -7,6 +7,8 @@ import os
 import re
 from pathlib import Path
 
+from monorl.config.recipes import recipe_files
+
 ROOT = Path(__file__).resolve().parents[2]
 #: Not ours (environments, vendored upstream sources, build output).
 PRUNED = {".git", ".venv", ".venv-unsloth", "node_modules", "third_party", "dist", "__pycache__"}
@@ -86,7 +88,7 @@ def test_the_docs_index_lists_every_document() -> None:
 
 def test_the_readme_lists_every_recipe() -> None:
     rows = re.findall(r"(?m)^\| `([a-z0-9_]+)` \|", (ROOT / "README.md").read_text())
-    recipes = {p.stem for p in (ROOT / "configs" / "recipes").glob("*.yaml")}
+    recipes = {p.stem for p in recipe_files(ROOT / "configs" / "recipes")}
     assert recipes - set(rows) == set(), (
         f"recipes missing from the README tables: {sorted(recipes - set(rows))}"
     )

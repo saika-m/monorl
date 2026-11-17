@@ -216,6 +216,7 @@ class EpisodeRollout:
                     turn_rendering=self.config.rollout.turn_rendering,
                     max_context_tokens=self.config.rollout.max_context_tokens,
                     retries=self.config.env.retries,
+                    turn_batching=self.config.rollout.turn_batching,
                 )
             finally:
                 engine.shutdown()

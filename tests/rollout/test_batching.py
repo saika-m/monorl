@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 from collections.abc import Sequence
@@ -9,31 +10,51 @@ import pytest
 
 from monorl.core.errors import GenerationCancelled
 from monorl.core.interfaces import RolloutEngine
-from monorl.core.types import Completion, PromptInput, SamplingParams
+from monorl.core.types import Completion, PromptInput, SamplingParams, prompt_caps
 from monorl.rollout import BatchingEngine, params_key
 
 
 class FakeEngine:
-    """Echoes each prompt as text; records every call (prompt count + params)."""
+    """Echoes each prompt as text, with ``tokens`` tokens (``k`` for completion ``k``) or as many
+    as the prompt's cap allows (``finish_reason`` ``length``); records every call (prompt count +
+    params) and its cap per prompt."""
 
-    def __init__(self, delay: float = 0.02, fail_on: str | None = None) -> None:
+    def __init__(self, delay: float = 0.02, fail_on: str | None = None, tokens: int = 1) -> None:
         self.calls: list[tuple[int, SamplingParams]] = []
+        self.caps: list[list[int]] = []
+        self.tokens = tokens
         self.delay = delay
         self.fail_on = fail_on
         self.lock = threading.Lock()
         self.events: list[str] = []
         self.tokenizer = object()
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
+        caps = prompt_caps(params, len(prompts), max_new_tokens)
         with self.lock:
             self.calls.append((len(prompts), params))
+            self.caps.append(caps)
         time.sleep(self.delay)
         out = []
-        for p in prompts:
+        for p, cap in zip(prompts, caps, strict=True):
             text = p if isinstance(p[0], int) else p[0]["content"]
             if self.fail_on is not None and text == self.fail_on:
                 raise RuntimeError(f"boom {text}")
-            out.append([Completion(text=f"{text}#{k}", token_ids=[k]) for k in range(params.n)])
+            reason = "stop" if self.tokens <= cap else "length"
+            out.append(
+                [
+                    Completion(
+                        text=f"{text}#{k}", token_ids=[k] * min(self.tokens, cap), finish_reason=reason
+                    )
+                    for k in range(params.n)
+                ]
+            )
         return out
 
     def update_weights(self, weights) -> None:
@@ -148,7 +169,13 @@ class BlockingEngine(FakeEngine):
         self.fail_first = fail_first
         self.started = 0
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         self.started += 1
         first = self.started == 1
         self.entered.set()
@@ -156,7 +183,7 @@ class BlockingEngine(FakeEngine):
             raise TimeoutError("BlockingEngine was never released")
         if first and self.fail_first:
             raise RuntimeError("old call failed")
-        return super().generate(prompts, params)
+        return super().generate(prompts, params, max_new_tokens=max_new_tokens)
 
 
 class CancellableEngine(FakeEngine):
@@ -170,14 +197,20 @@ class CancellableEngine(FakeEngine):
         self.cancel_calls = 0
         self._cancelled = threading.Event()
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if self.block:
             self._cancelled.clear()
             self.entered.set()
             if not self._cancelled.wait(10):
                 raise TimeoutError("CancellableEngine was never cancelled")
             raise GenerationCancelled("engine call cancelled")
-        return super().generate(prompts, params)
+        return super().generate(prompts, params, max_new_tokens=max_new_tokens)
 
     def cancel(self) -> None:
         self.cancel_calls += 1
@@ -283,4 +316,49 @@ def test_cancel_during_batching_window_drops_the_waiting_prompts() -> None:
     assert time.monotonic() - t0 < 2.0
     assert [g[0].text for g in out] == ["x#0", "y#0"]
     assert [n for n, _ in fake.calls] == [2]  # "lonely" was never sent to the engine
+    assert _shutdown_returns(proxy)
+
+
+def test_requests_that_differ_only_in_the_generation_cap_share_an_engine_call() -> None:
+    """Turns of episodes near their context budget: the same sampling parameters, another room
+    left for each. They are one engine call, every prompt with its own cap, whether the caller
+    gave the cap per prompt or in the parameters of its request."""
+    fake = BlockingEngine()
+    fake.tokens = 6
+    proxy = BatchingEngine(fake, max_batch_size=8, max_wait_ms=0)
+    params = SamplingParams(n=2, max_new_tokens=16, temperature=0.7)
+    busy, _ = _call_in_threads(proxy, [[chat("busy")]], params)
+    assert fake.entered.wait(5)  # the engine is busy: what is asked for now is queued together
+
+    def ask(i: int) -> list[list[Completion]]:
+        if i == 0:
+            return proxy.generate([chat("a0"), chat("a1")], params, max_new_tokens=[2, 9])
+        if i == 1:
+            return proxy.generate([chat("b")], dataclasses.replace(params, max_new_tokens=4))
+        if i == 2:
+            return proxy.generate([chat("c")], params)
+        return proxy.generate([chat("d")], dataclasses.replace(params, max_new_tokens=4, temperature=0.2))
+
+    with ThreadPoolExecutor(4) as pool:
+        asked = [pool.submit(ask, i) for i in range(4)]
+        _wait_until(lambda: len(proxy._queue) == 5)
+        fake.release.set()
+        a, b, c, d = (future.result(5) for future in asked)
+    busy[0].join(5)
+
+    def said(groups: list[list[Completion]]) -> list[list[tuple[str, int, str]]]:
+        return [[(c.text, len(c.token_ids), c.finish_reason) for c in group] for group in groups]
+
+    assert said(a) == [
+        [("a0#0", 2, "length"), ("a0#1", 2, "length")],
+        [("a1#0", 6, "stop"), ("a1#1", 6, "stop")],
+    ]
+    assert said(b) == [[("b#0", 4, "length"), ("b#1", 4, "length")]]
+    assert said(c) == [[("c#0", 6, "stop"), ("c#1", 6, "stop")]]
+    assert said(d) == [[("d#0", 4, "length"), ("d#1", 4, "length")]]
+    # the four prompts with the same parameters in one call, the other temperature in its own
+    assert sorted(n for n, _ in fake.calls) == [1, 1, 4] and proxy.num_engine_calls == 3
+    assert sorted(map(sorted, fake.caps)) == [[2, 4, 9, 16], [4], [16]]
+    with pytest.raises(ValueError, match="2 max_new_tokens for 1 prompts"):
+        proxy.generate([chat("e")], params, max_new_tokens=[3, 4])
     assert _shutdown_returns(proxy)

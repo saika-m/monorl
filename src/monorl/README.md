@@ -83,9 +83,10 @@ are under `../../docs/`.
 - Outside this repository: a module with `register(registry)`, named in the config's `providers`,
   adds components without touching these files ([REWARDS](../../docs/REWARDS.md),
   [ENVIRONMENTS](../../docs/ENVIRONMENTS.md)).
-- Data source: the loops call `monorl.data.open_source`, which picks the row source from the URI
-  (`data/uri.py`, `open_rows` and the `RowSource` classes in `data/rows.py`). The `data_source`
-  registry names `local`, `hf` and `s3` wrap that function, so a new source is a new `RowSource`.
+- Data source: the loops call `monorl.data.open_source`, which looks up the row source of the
+  URI's scheme in the `data_source` namespace (`open_rows` and `source_name` in `data/rows.py`).
+  A new source is a `RowSource` and a factory registered under its scheme, as `local`, `hf` and
+  `s3` are in `data/__init__.py` ([DATA](../../docs/DATA.md)).
 - Pipeline backend: the name must also be in `PIPELINE_BACKENDS` in `config/schema.py`. Weight
   sync: also in `SYNC_NAMES` in `distributed/placement.py`.
 - Patch: `Patch` and `PatchSet` are dataclasses in `patching/patch.py`, not protocols. The engine's

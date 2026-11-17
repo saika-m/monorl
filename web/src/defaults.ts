@@ -106,6 +106,7 @@ export function defaultRunConfig(): RunConfig {
       enable_sleep_mode: true,
       async_steps_ahead: 0,
       turn_rendering: "tokens",
+      turn_batching: "lockstep",
       device: null,
       extra: {},
     },

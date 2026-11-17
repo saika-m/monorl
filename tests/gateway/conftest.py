@@ -48,7 +48,7 @@ def open_session(gateway: Gateway) -> Iterator[Callable[..., Session]]:
         session = gateway.open_session(
             engine=engine,
             tokenizer=engine.tokenizer,
-            params=params or SamplingParams(n=1, max_new_tokens=32),
+            params=params or SamplingParams(n=1, max_new_tokens=256),
             **options,
         )
         sessions.append(session)

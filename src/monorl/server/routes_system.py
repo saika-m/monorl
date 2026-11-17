@@ -12,6 +12,7 @@ from fastapi import APIRouter, Request
 
 from monorl.config.loader import load_yaml
 from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
+from monorl.config.recipes import read_description, recipe_files
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, RegistryError
 from monorl.server.app import validation_errors
@@ -70,26 +71,9 @@ def config_validate(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "errors": validation_errors(e)}
 
 
-def recipe_description(text: str) -> str:
-    lines: list[str] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("#!"):
-            continue
-        if line.startswith("#"):
-            lines.append(line[1:].strip())
-            continue
-        if line == "" and not lines:
-            continue
-        break
-    return " ".join(part for part in lines if part).strip()
-
-
 def load_recipes(recipes_dir: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    if not recipes_dir.is_dir():
-        return out
-    for path in sorted(recipes_dir.glob("*.yaml")) + sorted(recipes_dir.glob("*.yml")):
+    for path in recipe_files(recipes_dir):
         text = path.read_text()
         try:
             config: Any = load_yaml(path)
@@ -113,7 +97,7 @@ def load_recipes(recipes_dir: Path) -> list[dict[str, Any]]:
             {
                 "name": path.stem,
                 "kind": kind,
-                "description": recipe_description(text),
+                "description": read_description(path),
                 "config": config,
                 "path": str(path),
                 "valid": valid,

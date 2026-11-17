@@ -100,7 +100,7 @@ def test_a_retry_starts_the_episode_again_with_a_fresh_environment(make_config: 
 
 def test_an_engine_failure_is_never_tolerated(make_config: Any, flaky: Any) -> None:
     class BrokenEngine(fakes.FakeEngine):
-        def generate(self, prompts: Any, params: SamplingParams) -> Any:
+        def generate(self, prompts: Any, params: SamplingParams, *, max_new_tokens: Any = None) -> Any:
             raise RuntimeError("CUDA out of memory")
 
     cfg = make_config(env={"type": "flaky"})

@@ -6,10 +6,11 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM
 
+from monorl.config.schema import RunConfig
 from monorl.core.interfaces import Trainer
 from monorl.rollout.hf_engine import HFRolloutEngine
 from monorl.trainer.reference import ReferenceTrainer
-from tests.trainer.conftest import make_batch, make_config, reinforce_loss
+from tests.trainer.conftest import SGD, assert_same_update, exported, make_batch, make_config, reinforce_loss
 
 LORA = pytest.mark.parametrize("lora", [False, True], ids=["full", "lora"])
 
@@ -94,6 +95,81 @@ def test_micro_batching_matches_single_pass(tiny_model_dir: Path, tokenizer) -> 
     assert m1["loss/policy"] == pytest.approx(m4["loss/policy"], abs=1e-5)
     assert m1["grad_norm"] == pytest.approx(m4["grad_norm"], rel=1e-4)
     torch.testing.assert_close(lp1, lp4, atol=1e-5, rtol=0)
+
+
+def test_logprobs_at_chosen_positions_are_those_of_the_full_computation() -> None:
+    """The trainer computes the log-softmax at the response positions only, from the logits of
+    every position or from the rows that predict those positions alone; values and gradients there
+    have to be what the computation over every position gives, and zero elsewhere."""
+    from monorl.algorithms import mean_logprob_all_tokens
+    from monorl.trainer.reference import head_rows, sequence_logprobs_and_entropy
+
+    generator = torch.Generator().manual_seed(0)
+    logits = torch.randn((3, 7, 11), generator=generator, requires_grad=True)
+    input_ids = torch.randint(0, 11, (3, 7), generator=generator)
+    top_ids = torch.randint(0, 11, (3, 7, 2), generator=generator)
+    positions = torch.zeros((3, 7), dtype=torch.long)
+    positions[0, 0:3] = 1  # position 0 has no prefix: it stays 0 even when asked for
+    positions[1, 4:7] = 1
+    wanted = positions.bool()
+    wanted[:, 0] = False
+
+    def compute(source: torch.Tensor, where: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
+        return sequence_logprobs_and_entropy(
+            source, input_ids, 0.7, entropy=True, top_ids=top_ids, positions=where, vocab_mean=True
+        )
+
+    def gradient(values: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        lp, entropy, top, mean = values
+        scalar = (lp * wanted).sum() + 0.3 * (entropy * wanted).sum() + (top * wanted[..., None]).sum()
+        return torch.autograd.grad(scalar + 0.2 * (mean * wanted).sum(), logits, retain_graph=True)[0]
+
+    full = compute(logits, None)
+    torch.testing.assert_close(full[3], mean_logprob_all_tokens(logits, 0.7))  # the sft smoothing term
+    rows = logits[:, :-1][head_rows(positions)]
+    assert rows.shape == (5, 11)
+    for part in (compute(logits, positions), compute(rows, positions)):
+        for whole, chosen in zip(full, part, strict=True):
+            torch.testing.assert_close(chosen[wanted], whole[wanted])
+            assert not chosen[~wanted].any()
+        torch.testing.assert_close(gradient(part), gradient(full), atol=1e-6, rtol=1e-5)
+    with pytest.raises(ValueError, match="5 wanted positions"):
+        compute(rows[:4], positions)
+    assert sequence_logprobs_and_entropy(logits, input_ids, 0.7, entropy=False)[1:] == (None, None, None)
+
+
+def test_a_step_does_not_depend_on_the_padding_of_the_batch(tiny_model_dir: Path, tokenizer) -> None:
+    """Micro-batches are cut to their longest sequence: a batch padded far beyond its sequences has
+    to give the same log-probs (in its own shape) and the same update."""
+    batch = make_batch(tokenizer, batch_size=6)
+    pad = 37
+
+    def widen(tensor: torch.Tensor, value: int = 0) -> torch.Tensor:
+        return torch.nn.functional.pad(tensor, (0, pad), value=value)
+
+    wide = type(batch)(
+        input_ids=widen(batch.input_ids, tokenizer.pad_token_id),
+        attention_mask=widen(batch.attention_mask),
+        response_mask=widen(batch.response_mask),
+        advantages=widen(batch.advantages),
+        rewards=batch.rewards,
+        group_ids=batch.group_ids,
+    )
+    results = []
+    for which in (batch, wide):
+        trainer = ReferenceTrainer(make_config(tiny_model_dir, max_seq_len=128, **SGD))
+        initial = exported(trainer)
+        before = trainer.compute_logprobs(which)
+        assert before.shape == which.input_ids.shape and not before[:, batch.input_ids.shape[1] :].any()
+        which.old_logprobs = before
+        metrics = trainer.train_step(which)
+        weights = exported(trainer)
+        results.append((before[:, : batch.input_ids.shape[1]], metrics, weights))
+    (lp_a, metrics_a, weights_a), (lp_b, metrics_b, weights_b) = results
+    torch.testing.assert_close(lp_a, lp_b, atol=1e-5, rtol=0)
+    for key in ("loss/policy", "loss/entropy", "grad_norm"):
+        assert metrics_a[key] == pytest.approx(metrics_b[key], rel=1e-4, abs=1e-6), key
+    assert_same_update(initial, weights_a, weights_b)
 
 
 def test_truncates_to_max_seq_len(tiny_model_dir: Path, tokenizer) -> None:
@@ -229,6 +305,29 @@ def test_gradient_checkpointing(tiny_model_dir: Path, tokenizer, lora: bool) -> 
     metrics = trainer.train_step(batch)
     assert metrics["grad_norm"] > 0
     assert target_logprob(trainer, batch) > before
+
+
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
+def test_sft_fits_the_distribution_the_model_has_whatever_the_sampling_temperature(
+    tiny_model_dir: Path, tokenizer, label_smoothing: float
+) -> None:
+    """sft has no rollouts whose sampling distribution the log-probs must match: the loss is the
+    plain cross-entropy that the other backends' sft computes, not that of logits / temperature."""
+    batch = make_batch(tokenizer)
+
+    def trainer(algorithm: dict, temperature: float) -> ReferenceTrainer:
+        config = make_config(tiny_model_dir).to_dict()
+        config["algorithm"] = algorithm
+        config["rollout"]["temperature"] = temperature
+        return ReferenceTrainer(RunConfig.from_dict(config))
+
+    sft = {"name": "sft", "sft_label_smoothing": label_smoothing}
+    cold, plain = (trainer(sft, t).train_step(batch)["loss/sft"] for t in (0.5, 1.0))
+    assert cold == pytest.approx(plain, rel=1e-6)
+    # RL log-probs do follow the sampling temperature: they are the sampler's
+    reinforce = {"name": "reinforce"}
+    cold, plain = (target_logprob(trainer(reinforce, t), batch) for t in (0.5, 1.0))
+    assert abs(cold - plain) > 0.05
 
 
 def test_default_loss_fn_is_monorl_algorithms(tiny_model_dir: Path, tokenizer) -> None:

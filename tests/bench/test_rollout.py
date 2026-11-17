@@ -65,8 +65,8 @@ def test_measure_batch_size_respects_time_budget(chat_prompts) -> None:
 
 def test_measure_batch_size_rejects_wrong_group_count(chat_prompts) -> None:
     class Broken(FakeEngine):
-        def generate(self, prompts, params):
-            return super().generate(prompts, params)[:-1]
+        def generate(self, prompts, params, *, max_new_tokens=None):
+            return super().generate(prompts, params, max_new_tokens=max_new_tokens)[:-1]
 
     with pytest.raises(RuntimeError, match="returned 1 groups for 2 prompts"):
         measure_batch_size(Broken(), chat_prompts[:2], SamplingParams(), 2)

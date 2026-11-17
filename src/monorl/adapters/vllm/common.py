@@ -48,9 +48,13 @@ Upstream references (vLLM v0.33.0):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import struct
+import sys
 import threading
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
@@ -90,8 +94,9 @@ def map_finish_reason(reason: str | None) -> FinishReason:
     return _FINISH_REASONS.get(reason, "error")
 
 
-def sampling_kwargs(params: SamplingParams) -> dict[str, Any]:
+def sampling_kwargs(params: SamplingParams, max_tokens: int | None = None) -> dict[str, Any]:
     """Keyword arguments for ``vllm.SamplingParams`` (also the ``/v1/completions`` body subset).
+    ``max_tokens`` is the cap of the prompts they are for when it is not ``params.max_new_tokens``.
 
     ``logprobs=0`` requests exactly the sampled token's logprob per position; ``None`` disables
     logprob computation entirely; ``params.top_logprobs`` requests that many most likely tokens
@@ -104,7 +109,7 @@ def sampling_kwargs(params: SamplingParams) -> dict[str, Any]:
         logprobs = 0 if params.logprobs else None
     return {
         "n": params.n,
-        "max_tokens": params.max_new_tokens,
+        "max_tokens": params.max_new_tokens if max_tokens is None else max_tokens,
         "temperature": params.temperature,
         "top_p": params.top_p,
         "top_k": 0 if params.top_k < 0 else params.top_k,
@@ -205,11 +210,49 @@ def limit_mm_per_prompt(extra: dict[str, Any]) -> dict[str, int] | None:
 # -- /v1/chat/completions (server mode, multimodal prompts) -------------------------------------
 
 
-def chat_completion_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
-    """monorl chat → OpenAI ``messages``: image parts become ``image_url`` data URLs (the server
-    decodes them; vLLM accepts ``data:image/...;base64`` URLs), text parts stay ``text``."""
-    from monorl.rollout.media import image_data_url, load_image
+DEFAULT_IMAGE_CACHE_BYTES = 256 * 1024 * 1024
 
+
+class ImageUrlCache:
+    """The data URLs of the images a client has sent, most recently used last.
+
+    A conversation is sent again in full on every turn, so without this each of its images is
+    compressed to a PNG once per turn. An entry is keyed by the decoded pixels (mode, size and
+    a digest of the raw bytes), not by the reference: a file that is rewritten, or a URL that
+    starts serving another picture, is loaded afresh on every use and maps to another entry,
+    and the same picture behind two references is encoded once. The URLs held never exceed
+    ``max_bytes`` together (least recently used go first; a single URL above the bound is not
+    kept). Not thread-safe: the client uses it under its lock."""
+
+    def __init__(self, max_bytes: int = DEFAULT_IMAGE_CACHE_BYTES) -> None:
+        self._max_bytes = int(max_bytes)
+        self._urls: OrderedDict[tuple[str, tuple[int, int], bytes], str] = OrderedDict()
+        self._bytes = 0
+
+    def data_url(self, ref: str) -> str:
+        """The PNG data URL of the image behind ``ref`` (anything ``load_image`` accepts)."""
+        from monorl.rollout.media import image_data_url, load_image
+
+        image = load_image(ref)
+        key = (image.mode, image.size, hashlib.blake2b(image.tobytes(), digest_size=20).digest())
+        url = self._urls.get(key)
+        if url is not None:
+            self._urls.move_to_end(key)
+            return url
+        url = image_data_url(image)
+        if len(url) <= self._max_bytes:
+            self._urls[key] = url
+            self._bytes += len(url)
+            while self._bytes > self._max_bytes:
+                _, evicted = self._urls.popitem(last=False)
+                self._bytes -= len(evicted)
+        return url
+
+
+def chat_completion_messages(messages: Sequence[Message], images: ImageUrlCache) -> list[dict[str, Any]]:
+    """monorl chat → OpenAI ``messages``: image parts become ``image_url`` data URLs (the server
+    decodes them; vLLM accepts ``data:image/...;base64`` URLs), text parts stay ``text``.
+    ``images`` encodes them, each distinct picture once for as long as it holds it."""
     out: list[dict[str, Any]] = []
     for m in messages:
         content = m.get("content", "")
@@ -225,7 +268,7 @@ def chat_completion_messages(messages: Sequence[Message]) -> list[dict[str, Any]
                 elif kind == "image":
                     url = str(part.get("image", ""))
                     if not url.startswith("data:"):
-                        url = image_data_url(load_image(url))
+                        url = images.data_url(url)
                     parts.append({"type": "image_url", "image_url": {"url": url}})
                 else:
                     raise ConfigError(f"vLLM server mode supports text and image parts, got {kind!r}")
@@ -237,8 +280,9 @@ def chat_completion_messages(messages: Sequence[Message]) -> list[dict[str, Any]
     return out
 
 
-def chat_completion_kwargs(params: SamplingParams) -> dict[str, Any]:
-    """``ChatCompletionRequest`` body subset. ``logprobs=True, top_logprobs=0`` returns exactly the
+def chat_completion_kwargs(params: SamplingParams, max_tokens: int | None = None) -> dict[str, Any]:
+    """``ChatCompletionRequest`` body subset (``max_tokens``: the cap of the request's prompt when
+    it is not ``params.max_new_tokens``). ``logprobs=True, top_logprobs=0`` returns exactly the
     sampled token's logprob per position; ``return_token_ids=True`` adds ``choices[i].token_ids``
     and the response-level ``prompt_token_ids`` (the chat endpoint's logprob entries carry token
     *strings*, so the ids must come from ``return_token_ids``).
@@ -249,7 +293,7 @@ def chat_completion_kwargs(params: SamplingParams) -> dict[str, Any]:
     top = params.top_logprobs
     body: dict[str, Any] = {
         "n": params.n,
-        "max_completion_tokens": params.max_new_tokens,
+        "max_completion_tokens": params.max_new_tokens if max_tokens is None else max_tokens,
         "temperature": params.temperature,
         "top_p": params.top_p,
         "top_k": 0 if params.top_k < 0 else params.top_k,
@@ -607,25 +651,124 @@ def dtype_from_name(name: str) -> torch.dtype:
         raise ValueError(f"unsupported tensor dtype {name!r}") from e
 
 
-def tensor_to_bytes(tensor: torch.Tensor) -> bytes:
-    """Raw little-endian buffer of ``tensor`` (any dtype, incl. bf16 which numpy lacks)."""
-    flat = tensor.detach().to("cpu").contiguous().reshape(-1)
-    if flat.numel() == 0:
-        return b""
-    return flat.view(torch.uint8).numpy().tobytes()
+# -- weights over HTTP (server mode) -----------------------------------------------------------
+#
+# One request body carries several tensors:
+#
+#   "MRLW" | u32 version | u32 header length | header (JSON, UTF-8) | zero padding | data
+#
+# (integers little-endian). The header is ``{"byteorder": "little", "tensors": [{"name", "dtype",
+# "shape", "mtp"}, ...]}``. Every tensor's raw buffer, in header order, starts at the next multiple
+# of ``_WEIGHTS_ALIGN`` bytes from the start of the body and is zero-padded to one, so a tensor
+# built over the received body is aligned for any dtype and the length of the body follows from
+# the header alone: a body cut short or of another layout is rejected instead of being loaded.
+
+WEIGHTS_MEDIA_TYPE = "application/vnd.monorl.weights"
+WEIGHTS_WIRE_VERSION = 1
+_WEIGHTS_MAGIC = b"MRLW"
+_WEIGHTS_PREFIX = struct.Struct("<4sII")
+_WEIGHTS_ALIGN = 64
+_WEIGHTS_PIECE_BYTES = 1024 * 1024
 
 
-def tensor_from_bytes(data: bytes, dtype: str, shape: Sequence[int]) -> torch.Tensor:
-    """Inverse of :func:`tensor_to_bytes`; copies so the result owns its memory."""
-    torch_dtype = dtype_from_name(dtype)
-    shape = tuple(int(s) for s in shape)
-    numel = math.prod(shape) if shape else 1
-    expected = numel * torch.empty((), dtype=torch_dtype).element_size()
-    if len(data) != expected:
+def _aligned(n: int) -> int:
+    return -(-n // _WEIGHTS_ALIGN) * _WEIGHTS_ALIGN
+
+
+def encode_weights(
+    entries: Sequence[tuple[str, torch.Tensor, bool]],
+) -> tuple[int, Iterator[bytes | memoryview]]:
+    """``(length, pieces)`` of the request body for ``(name, tensor, is_mtp)`` entries.
+
+    ``pieces`` are produced lazily and add up to ``length`` bytes. Tensor data is yielded as
+    views of the tensors' own memory, at most ``_WEIGHTS_PIECE_BYTES`` each, so sending does not
+    hold a second copy of a tensor (one that is not on the CPU or not contiguous is copied while
+    it is being sent, one at a time). Raises ``ValueError`` for a dtype the format lacks."""
+    tensors = [tensor.detach() for _, tensor, _ in entries]
+    meta = [
+        {
+            "name": name,
+            "dtype": dtype_name(dtype_from_name(dtype_name(t.dtype))),
+            "shape": list(t.shape),
+            "mtp": bool(mtp),
+        }
+        for (name, _, mtp), t in zip(entries, tensors, strict=True)
+    ]
+    header = json.dumps({"byteorder": sys.byteorder, "tensors": meta}).encode()
+    prefix = _WEIGHTS_PREFIX.pack(_WEIGHTS_MAGIC, WEIGHTS_WIRE_VERSION, len(header)) + header
+    sizes = [t.numel() * t.element_size() for t in tensors]
+
+    def pieces() -> Iterator[bytes | memoryview]:
+        yield prefix + bytes(_aligned(len(prefix)) - len(prefix))
+        for t, size in zip(tensors, sizes, strict=True):
+            if size:
+                data = memoryview(t.to("cpu").contiguous().reshape(-1).view(torch.uint8).numpy())
+                for start in range(0, size, _WEIGHTS_PIECE_BYTES):
+                    yield data[start : start + _WEIGHTS_PIECE_BYTES]
+            if _aligned(size) != size:
+                yield bytes(_aligned(size) - size)
+
+    return _aligned(len(prefix)) + sum(_aligned(size) for size in sizes), pieces()
+
+
+def decode_weights(
+    body: bytearray,
+) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+    """Inverse of :func:`encode_weights`: ``(weights, mtp_weights)`` as ``(name, tensor)`` lists.
+
+    The tensors are views of ``body`` (no copy): it must be a buffer of its own that nothing
+    else writes to or reuses, and it lives for as long as any of the tensors does. It is a
+    ``bytearray`` because torch may only alias writable memory. Raises ``ValueError`` naming
+    what is wrong with a body that is not one this version wrote in full."""
+    same = "run the same monorl version on the trainer and on the vLLM server"
+    if len(body) < _WEIGHTS_PREFIX.size:
+        raise ValueError(f"weight payload has {len(body)} bytes, fewer than its fixed prefix; {same}")
+    magic, version, header_len = _WEIGHTS_PREFIX.unpack_from(body)
+    if magic != _WEIGHTS_MAGIC:
+        raise ValueError(f"not a monorl weight payload (it starts with {bytes(body[:4])!r}); {same}")
+    if version != WEIGHTS_WIRE_VERSION:
         raise ValueError(
-            f"tensor payload has {len(data)} bytes, expected {expected} for {dtype}{list(shape)}"
+            f"weight payload has wire version {version}, this side reads version "
+            f"{WEIGHTS_WIRE_VERSION}; {same}"
         )
-    if numel == 0:
-        return torch.empty(shape, dtype=torch_dtype)
-    buf = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-    return buf.view(torch_dtype).reshape(shape).clone()
+    header_end = _WEIGHTS_PREFIX.size + header_len
+    if header_end > len(body):
+        raise ValueError(f"weight payload is cut short: its header ends at byte {header_end} of {len(body)}")
+    try:
+        header = json.loads(bytes(body[_WEIGHTS_PREFIX.size : header_end]))
+        byteorder = header["byteorder"]
+        specs = [
+            (
+                str(entry["name"]),
+                dtype_from_name(str(entry["dtype"])),
+                tuple(int(dim) for dim in entry["shape"]),
+                bool(entry["mtp"]),
+            )
+            for entry in header["tensors"]
+        ]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as e:
+        raise ValueError(f"weight payload has a malformed header: {e!r}") from e
+    if byteorder != sys.byteorder:
+        raise ValueError(f"weight payload is {byteorder}-endian, this host is {sys.byteorder}-endian")
+    offset = _aligned(header_end)
+    placed: list[tuple[str, torch.dtype, tuple[int, ...], bool, int]] = []
+    for name, dtype, shape, mtp in specs:
+        if any(dim < 0 for dim in shape):
+            raise ValueError(f"weight payload: tensor {name!r} has shape {list(shape)}")
+        placed.append((name, dtype, shape, mtp, offset))
+        offset += _aligned(math.prod(shape) * dtype.itemsize)
+    if offset != len(body):
+        raise ValueError(
+            f"weight payload has {len(body)} bytes, expected {offset} for the {len(specs)} tensors "
+            "its header lists"
+        )
+    weights: list[tuple[str, torch.Tensor]] = []
+    mtp_weights: list[tuple[str, torch.Tensor]] = []
+    for name, dtype, shape, mtp, start in placed:
+        numel = math.prod(shape)
+        if numel == 0:  # torch.frombuffer rejects a count of 0
+            tensor = torch.empty(shape, dtype=dtype)
+        else:
+            tensor = torch.frombuffer(body, dtype=dtype, count=numel, offset=start).reshape(shape)
+        (mtp_weights if mtp else weights).append((name, tensor))
+    return weights, mtp_weights

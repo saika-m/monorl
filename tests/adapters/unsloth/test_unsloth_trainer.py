@@ -340,6 +340,34 @@ def test_export_weights_dequantises_4bit(
     assert exported["model.layers.0.self_attn.q_proj.weight"].dtype == torch.float32
 
 
+@pytest.mark.parametrize("lora", [True, False], ids=["lora", "full"])
+def test_synced_hf_engine_holds_the_export_after_every_step(
+    tiny_model_dir: Path, fake_cuda: None, fake_unsloth: types.ModuleType, tokenizer: Any, lora: bool
+) -> None:
+    """Weight sync leaves out the tensors that the trainer does not name as trained
+    (``trainable_params``) once the engine holds them; the engine has to end with all of the export."""
+    from monorl.distributed import InProcessWeightSync
+    from monorl.rollout.hf_engine import HFRolloutEngine
+
+    config = unsloth_config(tiny_model_dir, lora=lora)
+    trainer, engine, sync = _build(config), HFRolloutEngine(config), InProcessWeightSync()
+    with torch.no_grad():
+        for parameter in engine.model.parameters():  # not the trainer's: a tensor left out shows
+            parameter.add_(1.0)
+    batch = _make_batch(tokenizer)
+    try:
+        everything = sync.sync(trainer, [engine])["weight_sync/bytes"]
+        for _ in range(2):
+            trainer.train_step(batch)
+            sent = sync.sync(trainer, [engine])["weight_sync/bytes"]
+            assert 0 < sent < everything / 10 if lora else sent == everything
+            state = engine.model.state_dict()
+            for name, tensor in trainer.export_weights():
+                assert torch.equal(state[name], tensor), name
+    finally:
+        engine.shutdown()
+
+
 def test_merge_helpers_on_tiny_tensors() -> None:
     """Pure merge arithmetic on a hand-built LoRA layer: W + scaling * B @ A."""
     from peft import LoraConfig, get_peft_model

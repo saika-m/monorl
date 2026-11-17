@@ -340,11 +340,11 @@ def test_sigterm_during_rejection_stage_cancels_pipeline(
     original = fakes.FakeEngine.generate
     fired = {"done": False}
 
-    def generate(self: Any, prompts: Any, params: Any) -> Any:
+    def generate(self: Any, prompts: Any, params: Any, **caps: Any) -> Any:
         if not fired["done"]:
             fired["done"] = True
             _sigterm_self()  # inside the first chunk: the pipeline's own handler sets cancel
-        return original(self, prompts, params)
+        return original(self, prompts, params, **caps)
 
     monkeypatch.setattr(fakes.FakeEngine, "generate", generate)
     result = run_pipeline(config)

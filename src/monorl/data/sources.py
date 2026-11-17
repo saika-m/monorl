@@ -41,7 +41,6 @@ _SHAREGPT_ROLES = {
 _MESSAGE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name", "weight")
 TOOLS_COLUMN = "tools"
 """Column a chat dataset keeps its tool schemas in when ``data.tools_field`` is not set."""
-_JSON_FORMATS = ("jsonl", "json")
 
 
 class _RowFormatMap(dict):
@@ -211,8 +210,7 @@ class SampleMapper:
     media_base: Callable[[str], str | None] | None = None
     """``row_id -> base location`` for relative image paths (``RowSource.media_base``)."""
     null_filled: bool = False
-    """Rows come from a columnar store (parquet, arrow, Hub datasets), where a struct column holds
-    ``null`` for every key a row does not have: such keys are dropped from tool schemas."""
+    """``RowSource.null_filled``: ``null``-valued keys are dropped from tool schemas."""
     dropped: int = 0
     """Rows dropped by the token filter so far (diagnostic)."""
     _resolvers: dict[str | None, MediaResolver] = field(default_factory=dict)
@@ -228,7 +226,7 @@ class SampleMapper:
             tokenizer=tokenizer,
             max_prompt_tokens=config.max_prompt_tokens if tokenizer is not None else None,
             media_base=rows.media_base if rows is not None else None,
-            null_filled=rows is not None and getattr(rows, "format", None) not in _JSON_FORMATS,
+            null_filled=rows is not None and rows.null_filled,
         )
 
     def resolver_for(self, row_id: str) -> MediaResolver:

@@ -96,7 +96,7 @@ def _episodes(
         specs,
         env_factory=lambda: make_env(config),
         tokenizer=engine.tokenizer,
-        params=SamplingParams(n=1, max_new_tokens=32),
+        params=SamplingParams(n=1, max_new_tokens=256),
         max_parallel=4,
         abort=abort,
     )
@@ -259,7 +259,7 @@ def test_agent_without_policy_calls_is_an_environment_error(
 
 def test_engine_failure_is_the_episode_error(make_config: Callable[..., RunConfig], tmp_path: Path) -> None:
     class BrokenEngine(fakes.FakeEngine):
-        def generate(self, prompts: Any, params: SamplingParams) -> Any:
+        def generate(self, prompts: Any, params: SamplingParams, *, max_new_tokens: Any = None) -> Any:
             raise RuntimeError("CUDA out of memory")
 
     config = _config(make_config, ["{python}", str(write_agent(tmp_path, 'chat(task["messages"])\n'))])

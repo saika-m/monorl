@@ -5,18 +5,19 @@ upstream frameworks through **versioned monkeypatches** instead of forks, and ev
 one repo (Python core, adapters, Go/C++ env SDKs, web UI, recipes).
 
 ```
-            ┌──────────────── monorl.orchestrator ────────────────┐
-            │  data → env episodes (parallel) → rewards → advantages → trainer → weight sync  │
-            └───┬──────────┬─────────────┬───────────┬──────────────┬────────────────┘
-          DataSource  Environment   RewardFunction  Trainer      RolloutEngine
-          local/hf/s3 single_turn   exact/format/   reference    hf (transformers)
-                      tool_calling  math/code/      unsloth      vllm (patched)
-                      remote MEP/1  judge/model                  sglang (patched)
-                      (Go, C++, …)
-                      openenv, hermes
-          ─────────────── pipeline backends (own the whole loop) ───────────────
-                      trl  ·  verl  ·  nemo_rl   (RunConfig compiled to native configs,
-                                                 monorl data/rewards/envs injected via patches)
+  ┌───────────────────────────── monorl.orchestrator ─────────────────────────────┐
+  │ data → env episodes (parallel) → rewards → advantages → trainer → weight sync │
+  └──┬───────────┬─────────────┬───────────────┬────────────┬─────────────────────┘
+  DataSource  Environment   RewardFunction  Trainer      RolloutEngine
+  local/hf/s3 single_turn   exact/format/   reference    hf (transformers)
+              tool_calling  math/code/      unsloth      vllm (patched)
+              remote MEP/1  judge/model                  sglang (patched)
+              (Go, C++, …)
+              openenv, hermes
+  ───────────────────── pipeline backends (own the whole loop) ────────────────────
+              trl  ·  verl  ·  nemo_rl
+              (RunConfig compiled to native configs,
+               monorl data/rewards/envs injected via patches)
 ```
 
 ## Principles
@@ -47,9 +48,12 @@ them and the extension points. Setup, checks, testing rules and conventions are 
 
 ### Component protocols — `src/monorl/core/interfaces.py`
 Read the file. Key points:
-- `RolloutEngine.generate(prompts, params) -> list[list[Completion]]`: exactly `params.n`
-  completions per prompt, order preserved; prompts are chats **or** raw token ids; when
-  `params.logprobs` is true every completion carries per-token logprobs under the sampling policy.
+- `RolloutEngine.generate(prompts, params, *, max_new_tokens=None) -> list[list[Completion]]`:
+  exactly `params.n` completions per prompt, order preserved; prompts are chats **or** raw token
+  ids; when `params.logprobs` is true every completion carries per-token logprobs under the
+  sampling policy. `max_new_tokens` is an optional generation cap per prompt, in place of
+  `params.max_new_tokens`: the turns of episodes with different room left in their context budget
+  share a call, and no engine generates past a prompt's cap.
   Optional, duck-typed capabilities: `cancel()` (abort the calls in flight) and
   `speculation_stats() -> SpeculationStats | None` (drafting counters since the previous call,
   for engines that decode speculatively).
@@ -74,11 +78,12 @@ Read the file. Key points:
 
 ### Registry — `src/monorl/core/registry.py`
 `registry.register(namespace, name, factory)`; factories are `factory(config: RunConfig, **kw)`
-except rewards: `factory(params: dict, **kw)` and data sources: `factory(data_config: DataConfig, **kw)`.
-Providers expose `register(registry)`. Built-in providers are imported lazily on lookup miss;
-adapters via `monorl.adapters.PROVIDERS`. A run config names further provider modules in
-`RunConfig.providers`; `ensure_providers(config)` loads them in every process that builds
-components from the config.
+except rewards: `factory(params: dict, **kw)` and data sources, which are row sources keyed by
+URI scheme: `factory(uri: ParsedURI, *, split, config_name, streaming, extra) -> RowSource`.
+Providers expose `register(registry)`. Built-in providers are imported lazily on lookup
+miss; adapters via `monorl.adapters.PROVIDERS`. A run config names further provider modules in
+`RunConfig.providers`; `ensure_providers(config)` loads them in every process that builds components
+from the config.
 
 Names: rollout_engine `hf|vllm|sglang`; trainer `reference|unsloth`; pipeline_backend
 `trl|verl|nemo_rl`; env `single_turn|tool_calling|remote|openenv|hermes|harness`; weight_sync
@@ -86,19 +91,21 @@ Names: rollout_engine `hf|vllm|sglang`; trainer `reference|unsloth`; pipeline_ba
 
 ### Orchestrator entrypoint — `monorl.orchestrator`
 ```python
-def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False) -> RunResult
+def run(
+    config: RunConfig, run_dir: Path | None = None, *, resume: bool = False
+) -> RunResult
 def resolve_run_dir(config: RunConfig) -> Path   # <logging.run_root>/<run_name>
 ```
-Dispatch: `config.is_pipeline_backend` → `registry.get("pipeline_backend", backend)(config).run(...)`;
-otherwise build `monorl.distributed.build_runtime(config)` and run the component loop.
-Loop per step: sample `prompts_per_step` prompts → run `group_size` episodes per prompt
-through the env (parallel; generation batched across episodes) → rewards → advantages
+Dispatch: `config.is_pipeline_backend` → `registry.get("pipeline_backend",
+backend)(config).run(...)`; otherwise build `monorl.distributed.build_runtime(config)` and run the
+component loop. Loop per step: sample `prompts_per_step` prompts → run `group_size` episodes per
+prompt through the env (parallel; generation batched across episodes) → rewards → advantages
 (`monorl.algorithms`) → `TrainBatch` → `trainer.train_step` (× `algorithm.num_epochs`) →
 `weight_sync.sync` → checkpoint every `save_every` → `reporter.log_metrics/log_trajectories`.
 `rollout.async_steps_ahead > 0` enables a producer thread generating ahead (bounded staleness);
 `algorithm.off_policy` configures how the loss accounts for it (decoupled PPO, truncated importance
-weights, ratio masks, score centering: [`OFF_POLICY.md`](OFF_POLICY.md)).
-Honour `SIGTERM`/`SIGINT` → `status cancelled`. Resume from the latest checkpoint when `resume`.
+weights, ratio masks, score centering: [`OFF_POLICY.md`](OFF_POLICY.md)). Honour `SIGTERM`/`SIGINT`
+→ `status cancelled`. Resume from the latest checkpoint when `resume`.
 
 #### Multi-turn episodes: prompts and training sequences
 `rollout.turn_rendering` decides how the prompt of turn `k+1` is built
@@ -157,7 +164,8 @@ By default every response token of an episode carries the episode's advantage
 that turn on, compared per turn index within the prompt group; `algorithm.name: ppo` replaces the
 group baseline with a value head in the reference trainer and turn-level GAE (`gamma`, `lam`,
 `value_coef`, `value_clip`; `TrainBatch.values` / `returns` / `value_mask`). Formulas, the
-treatment of groups with unequal turn counts and the costs: [`CREDIT_ASSIGNMENT.md`](CREDIT_ASSIGNMENT.md).
+treatment of groups with unequal turn counts and the costs:
+[`CREDIT_ASSIGNMENT.md`](CREDIT_ASSIGNMENT.md).
 
 #### Multi-token prediction
 `model.mtp` (`enabled`, `rollout`, `num_speculative_tokens`, `train`, `loss_coef`,
@@ -201,10 +209,11 @@ by training (`phase: train`), loop and pipeline evaluation (`eval`), rejection s
 (`rejection`) and SFT sample logging (`sft`). Rows never hold token ids or logprobs.
 
 ```
-{step, phase, sample_id, group_id, prompt, response, reward, reward_breakdown, success, done,
- finish_reason, num_turns, num_response_tokens, num_context_tokens, reference, info,
+{step, phase, sample_id, group_id, prompt, response, reward, reward_breakdown, success,
+ done, finish_reason, num_turns, num_response_tokens, num_context_tokens, reference, info,
  threads?: [[{role, content: str | [part], name?, tool_call_id?, tool_calls?}]],
- turns?: [{index, thread, message_index, reward, finish_reason, prompt_tokens, response_tokens, info}]}
+ turns?: [{index, thread, message_index, reward, finish_reason, prompt_tokens,
+           response_tokens, info}]}
 ```
 
 - `prompt` = last user message of the sample, `response` = all completions concatenated,
@@ -216,55 +225,78 @@ by training (`phase: train`), loop and pipeline evaluation (`eval`), rejection s
   — `Turn.message_index` when recorded, else the turns of a thread map in order onto the thread's
   last N assistant messages (N = its turn count), else `null`. `turns[i].info` = `Turn.info`.
 - Size guards: any string over 20000 characters is cut and ends with
-  `… [<n> characters truncated]`; media parts keep paths, URLs and `data:` URLs up to 64 KiB, anything
-  else becomes `{"type": "image", "image": null, "note": "<what was omitted>"}`; values that are not
-  JSON data (objects, bytes, non-finite floats) become short strings.
+  `… [<n> characters truncated]`; media parts keep paths, URLs and `data:` URLs up to 64 KiB,
+  anything else becomes `{"type": "image", "image": null, "note": "<what was omitted>"}`; values
+  that are not JSON data (objects, bytes, non-finite floats) become short strings.
 
 ### Internal helper contracts
 ```python
 # monorl.data
-def open_source(data_config: DataConfig, *, split: str | None = None, tokenizer=None, seed: int = 0) -> DataSource
-#   resolves uri scheme → local/hf/s3 source; sniffs format; applies prompt_template/system_prompt;
-#   drops samples over max_prompt_tokens when a tokenizer is given; shuffle(seed)/limit.
-def sniff_format(columns: dict[str, str], sample_rows: list[dict]) -> dict   # {format, prompt_field, answer_field, messages_field}
+def open_source(
+    data_config: DataConfig, *, split: str | None = None, tokenizer=None, seed: int = 0
+) -> DataSource
+#   resolves uri scheme → local/hf/s3 source; sniffs format; applies
+#   prompt_template/system_prompt; drops samples over max_prompt_tokens when a tokenizer
+#   is given; shuffle(seed)/limit.
+def sniff_format(columns: dict[str, str], sample_rows: list[dict]) -> dict
+#   {format, prompt_field, answer_field, messages_field}
 
 # monorl.rewards
-def build_reward(specs: Sequence[RewardSpec], *, config: RunConfig | None = None) -> RewardFunction
-#   weighted composite; RewardResult.breakdown[<spec.type or params["name"]>] = raw score of each member.
+def build_reward(
+    specs: Sequence[RewardSpec], *, config: RunConfig | None = None
+) -> RewardFunction
+#   weighted composite; RewardResult.breakdown[<spec.type or params["name"]>] = raw score
+#   of each member.
 
 # monorl.algorithms
-def compute_advantages(rewards: Tensor[B], group_ids: list[str], *, algorithm: AlgorithmConfig) -> Tensor[B]
+def compute_advantages(
+    rewards: Tensor[B], group_ids: list[str], *, algorithm: AlgorithmConfig
+) -> Tensor[B]
 #   group/batch/none normalisation; rloo = leave-one-out baseline; reinforce = raw reward.
-def policy_loss(logprobs: Tensor[B,T], old_logprobs: Tensor[B,T] | None, advantages: Tensor[B,T],
-                response_mask: Tensor[B,T], *, algorithm: AlgorithmConfig,
-                ref_logprobs: Tensor[B,T] | None = None, entropy: Tensor[B,T] | None = None,
-                loss_weights: Tensor[B,T] | None = None, behavior_logprobs: Tensor[B,T] | None = None,
+def policy_loss(logprobs: Tensor[B,T], old_logprobs: Tensor[B,T] | None,
+                advantages: Tensor[B,T], response_mask: Tensor[B,T], *,
+                algorithm: AlgorithmConfig,
+                ref_logprobs: Tensor[B,T] | None = None,
+                entropy: Tensor[B,T] | None = None,
+                loss_weights: Tensor[B,T] | None = None,
+                behavior_logprobs: Tensor[B,T] | None = None,
                 top_logprobs: Tensor[B,T,K] | None = None,
                 behavior_top_logprobs: Tensor[B,T,K] | None = None) -> PolicyLossOutput
-#   PolicyLossOutput(loss: scalar Tensor, metrics: dict[str, float]) with keys loss/policy, loss/kl, loss/entropy,
-#   policy/clipfrac, policy/approx_kl, policy/ratio_mean. old_logprobs=None → ratio=1 (on-policy REINFORCE-style).
-#   loss_weights: per-token weights of the loss mean (loss_agg="rollout"); behavior_logprobs and the top-k
-#   tensors feed algorithm.off_policy. The trainer passes each of the four only when the batch carries it.
+#   PolicyLossOutput(loss: scalar Tensor, metrics: dict[str, float]) with keys
+#   loss/policy, loss/kl, loss/entropy, policy/clipfrac, policy/approx_kl,
+#   policy/ratio_mean. old_logprobs=None → ratio=1 (on-policy REINFORCE-style).
+#   loss_weights: per-token weights of the loss mean (loss_agg="rollout");
+#   behavior_logprobs and the top-k tensors feed algorithm.off_policy. The trainer passes
+#   each of the four only when the batch carries it.
 def kl_penalty(logprobs, ref_logprobs, estimator: Literal["k1","k2","k3"]) -> Tensor[B,T]
 
 # monorl.rollout
-class BatchingEngine(RolloutEngine):   # wraps any engine; concurrent generate() calls from episode
-    def __init__(self, engine, *, max_batch_size: int, max_wait_ms: float)   # threads are coalesced into one engine call
+class BatchingEngine(RolloutEngine):
+    # wraps any engine; generate() calls that arrive together are coalesced into one
+    # engine call, and a call is split at max_batch_size
+    def __init__(self, engine, *, max_batch_size: int, max_wait_ms: float)
 
 # monorl.envs
-def make_env(config: RunConfig) -> Environment     # registry.get("env", config.env.type)(config)
+def make_env(config: RunConfig) -> Environment
+#   registry.get("env", config.env.type)(config)
 ```
 
 ### Patching API — `monorl.patching`
 ```python
-from monorl.patching import Patch, PatchSet, register_patchset, apply, revert, status, activate_import_hook
+from monorl.patching import (
+    Patch, PatchSet, register_patchset, apply, revert, status, activate_import_hook
+)
 PatchSet(framework="vllm", patches=[Patch(id="vllm.sleep_mode", target="vllm.LLM.sleep",
-         versions=">=0.8", mode="wrap"|"replace"|"add", build=lambda original: new_callable,
+         versions=">=0.8", mode="wrap"|"replace"|"add",
+         build=lambda original: new_callable,
          description=..., verify=lambda original: bool)])
-register_patchset(PATCHES)         # adapters do this at import
-apply("vllm") -> ApplyReport        # version-gated, idempotent, records originals for revert
-status("vllm") -> list[PatchStatus] # id, target, version_spec, installed_version, applicable, applied, verified, reason
-activate_import_hook()             # apply registered patchsets automatically after upstream import
+register_patchset(PATCHES)  # adapters do this at import
+apply("vllm") -> ApplyReport
+#   version-gated, idempotent, records originals for revert
+status("vllm") -> list[PatchStatus]
+#   id, target, version_spec, installed_version, applicable, applied, verified, reason
+activate_import_hook()
+#   apply registered patchsets automatically after upstream import
 ```
 Env `MONORL_DISABLE_PATCHES=1` disables everything. Adapters import the patch engine; the
 engine never imports adapters.
@@ -283,31 +315,60 @@ The files of a run directory, their row formats and the metrics glossary are in
 GET  /api/system                      doctor report
 GET  /api/config/schema               RunConfig JSON schema
 POST /api/config/validate  {config}   -> {ok, errors:[{loc, msg}]}
-GET  /api/recipes                     [{name, description, config}] from configs/recipes/*.yaml
-GET  /api/models/search?q=&limit=     HF hub text-generation models [{id, downloads, likes, pipeline_tag, tags, last_modified}]
-GET  /api/models/info?id=             config summary (architecture, params if known, gated)
+GET  /api/recipes                     [{name, description, config}] from
+                                      configs/recipes/*.yaml
+GET  /api/models/search?q=&limit=     HF hub text-generation models [{id, downloads,
+                                      likes, pipeline_tag, tags, last_modified}]
+GET  /api/models/info?id=             config summary (architecture, params if known,
+                                      gated)
 GET  /api/datasets/search?q=&limit=   HF hub datasets
-GET  /api/datasets/browse?uri=        list entries of a local dir or s3:// prefix [{name, uri, is_dir, size}]
-POST /api/datasets/preview {uri, split?, hf_config_name?, limit?} -> {columns:{name:dtype}, rows, inferred:{format, prompt_field, answer_field, messages_field}, num_rows?}
-GET  /api/connectors                  {s3: {configured: bool, region, endpoint_url, vars_present:[...]}}  (never echo secrets)
-POST /api/jobs {config}               -> job {id, run_dir, state,...}; spawns `python -m monorl.cli train --config <run_dir>/config.yaml --run-dir <run_dir>`
+GET  /api/datasets/browse?uri=        list entries of a local dir or s3:// prefix
+                                      [{name, uri, is_dir, size}]
+POST /api/datasets/preview {uri, split?, hf_config_name?, limit?}
+                                      -> {columns:{name:dtype}, rows, inferred:{format,
+                                      prompt_field, answer_field, messages_field},
+                                      num_rows?}
+GET  /api/connectors                  {s3: {configured: bool, region, endpoint_url,
+                                      vars_present:[...]}}  (never echo secrets)
+POST /api/jobs {config}               -> job {id, run_dir, state,...}; spawns
+                                      `python -m monorl.cli train
+                                      --config <run_dir>/config.yaml --run-dir <run_dir>`
 GET  /api/jobs                        [job]
 GET  /api/jobs/{id}                   job + status.json
 POST /api/jobs/{id}/cancel
-GET  /api/jobs/{id}/metrics?since=N        {rows, next}    GET /api/jobs/{id}/metrics/stream?since=N  (SSE: `metrics` per row, then `end` {state, next, error})
-GET  /api/jobs/{id}/logs?tail=N            {lines, next}   GET /api/jobs/{id}/logs/stream?since=N     (SSE: `log` per line, then `end` {state, next, error})
-GET  /api/jobs/{id}/trajectories?since=N   {rows, next}
+GET  /api/jobs/{id}/metrics?since=N   {rows, next}
+GET  /api/jobs/{id}/metrics/stream?since=N
+                                      (SSE: `metrics` per row, then `end`
+                                      {state, next, error})
+GET  /api/jobs/{id}/logs?tail=N       {lines, next}
+GET  /api/jobs/{id}/logs/stream?since=N
+                                      (SSE: `log` per line, then `end`
+                                      {state, next, error})
+GET  /api/jobs/{id}/trajectories?since=N
+                                      {rows, next}
 GET  /api/jobs/{id}/checkpoints
-GET  /api/jobs/{id}/events?metrics=N&logs=N&trajectories=N   SSE tail of the whole run dir on one connection: `metrics` / `log` / `trajectory`
-                                           per row or line from each cursor (default 0, as `since` above), then `end`
-                                           {state, error, next: {metrics, logs, trajectories}} once terminal and drained
-GET  /api/jobs/{id}/stages                 pipeline manifest {job_id, kind, name, state, final_model_path, error, stages:[...]} (`stages: []` for plain runs)
-GET  /api/jobs/{id}/stages/stream          SSE: `stages` = that payload, now and on every change, then `end` {state, next: null, error}
-GET  /api/jobs/{id}/stages/{index}         one stage + its status.json
-GET  /api/jobs/{id}/stages/{index}/(metrics|logs|trajectories|checkpoints)   the stage run dir, same shapes as the job-level routes
-GET  /api/jobs/{id}/stages/{index}/events?metrics=N&logs=N&trajectories=N    SSE as /api/jobs/{id}/events for the stage run dir; `end` once the stage
-                                           (or the job) is terminal; a pending stage's stream waits for it to start; unknown index -> 404
-GET  /api/envs                        registered env types + MEP example servers discovered under envs/sdk
+GET  /api/jobs/{id}/events?metrics=N&logs=N&trajectories=N
+                                      SSE tail of the whole run dir on one connection:
+                                      `metrics` / `log` / `trajectory` per row or line
+                                      from each cursor (default 0, as `since` above),
+                                      then `end` {state, error, next: {metrics, logs,
+                                      trajectories}} once terminal and drained
+GET  /api/jobs/{id}/stages            pipeline manifest {job_id, kind, name, state,
+                                      final_model_path, error, stages:[...]}
+                                      (`stages: []` for plain runs)
+GET  /api/jobs/{id}/stages/stream     SSE: `stages` = that payload, now and on every
+                                      change, then `end` {state, next: null, error}
+GET  /api/jobs/{id}/stages/{index}    one stage + its status.json
+GET  /api/jobs/{id}/stages/{index}/(metrics|logs|trajectories|checkpoints)
+                                      the stage run dir, same shapes as the job-level
+                                      routes
+GET  /api/jobs/{id}/stages/{index}/events?metrics=N&logs=N&trajectories=N
+                                      SSE as /api/jobs/{id}/events for the stage run
+                                      dir; `end` once the stage (or the job) is
+                                      terminal; a pending stage's stream waits for it
+                                      to start; unknown index -> 404
+GET  /api/envs                        registered env types + MEP example servers
+                                      discovered under envs/sdk
 ```
 Jobs persist in `$MONORL_HOME/jobs.json` (default `~/.monorl`); run dirs under
 `logging.run_root`. The server serves `web/dist` at `/` when present.
@@ -317,14 +378,15 @@ Jobs persist in `$MONORL_HOME/jobs.json` (default `~/.monorl`); run dirs under
 `doctor [--json]`, `patches list|status|apply <framework>`, `data inspect URI [--limit N]`,
 `env check (--command ... | --url ...)` (drives a MEP/1 server through spec/reset/step/close),
 `recipes list|show NAME`, `bench rollout|env|sync|plan` (`src/monorl/bench/cli.py`, also
-`python -m monorl.bench`: tokens/s, episodes/s, weight-sync timing and the placement plan for a recipe).
+`python -m monorl.bench`: tokens/s, episodes/s, weight-sync timing and the placement plan for a
+recipe).
 
 ### MEP/1 environment protocol — `src/monorl/envs/protocol.py` (read the docstring)
-Python side: env type `remote` with `env.params = {"transport": "stdio", "command": [...], "cwd": ...}`
-or `{"transport": "http", "url": "http://host:port", "parallel": N}` (`"urls": [...]` for replicas; each
-episode is pinned to one). Go SDK: `envs/sdk/go`
-(module `github.com/monorl/envsdk`), C++ SDK: `envs/sdk/cpp` (header-only `mep.hpp` +
-`nlohmann/json.hpp` vendored). Both serve stdio and http from the same env implementation.
+Python side: env type `remote` with `env.params = {"transport": "stdio", "command": [...], "cwd":
+...}` or `{"transport": "http", "url": "http://host:port", "parallel": N}` (`"urls": [...]` for
+replicas; each episode is pinned to one). Go SDK: `envs/sdk/go` (module `github.com/monorl/envsdk`),
+C++ SDK: `envs/sdk/cpp` (header-only `mep.hpp` + `nlohmann/json.hpp` vendored). Both serve stdio and
+http from the same env implementation.
 
 ## What we take from each framework
 
@@ -357,26 +419,36 @@ built per micro-batch. Raw-token prompts (`list[int]`) stay text-only; multi-tur
 re-encode the chat each turn.
 
 ```python
-# monorl.rollout.media  (torch-free at import; shared by hf engine, trainer, batch builder, vllm/sglang/trl adapters)
-def load_image(ref) -> PIL.Image.Image            # path | file:// | data: | http(s):// | s3://,hf:// via monorl.data.media.MediaResolver
+# monorl.rollout.media
+#   (torch-free at import; shared by hf engine, trainer, batch builder,
+#   vllm/sglang/trl adapters)
+def load_image(ref) -> PIL.Image.Image
+#   path | file:// | data: | http(s):// | s3://,hf:// via monorl.data.media.MediaResolver
 def chat_images(messages) -> list[PIL.Image.Image]
-def hf_content_parts(messages, *, load_media=True) -> list[dict]   # monorl parts → HF template parts (image → PIL)
+def hf_content_parts(messages, *, load_media=True) -> list[dict]
+#   monorl parts → HF template parts (image → PIL)
 def image_data_url(image, *, format="PNG") -> str
-def is_vlm_model(config) -> bool                  # AutoConfig: vision_config / image_token_id / known model_type
-def auto_model_class(config)                      # AutoModelForImageTextToText for VLMs, else AutoModelForCausalLM
-def load_processor(config) -> AutoProcessor | None   # None for text-only models (no second tokenizer load)
-def vlm_encode(processor, messages, *, add_generation_prompt=True) -> dict[str, Tensor]   # the one encoding recipe
+def is_vlm_model(config) -> bool
+#   AutoConfig: vision_config / image_token_id / known model_type
+def auto_model_class(config)
+#   AutoModelForImageTextToText for VLMs, else AutoModelForCausalLM
+def load_processor(config) -> AutoProcessor | None
+#   None for text-only models (no second tokenizer load)
+def vlm_encode(processor, messages, *, add_generation_prompt=True) -> dict[str, Tensor]
+#   the one encoding recipe
 def vlm_prompt_ids(processor, messages) -> list[int]
-def split_processor_outputs(enc) -> (token_aligned, media); def collate_media(per_sequence) -> dict[str, Tensor]
+def split_processor_outputs(enc) -> (token_aligned, media)
+def collate_media(per_sequence) -> dict[str, Tensor]
 ```
-`TrainBatch.extra` convention: tensors are ``[B, ...]`` (sliced on dim 0, e.g. ``mm_token_type_ids``),
-lists are per-sequence (``extra["per_sequence"][b]`` = that sequence's ``pixel_values``/``image_grid_thw``
-dict or ``None``); the trainer concatenates them per micro-batch and lets the model derive its own
-(M-RoPE) position ids. ``build_train_batch(..., processor=)`` re-encodes the final-turn chat and
-requires the ids to equal the engine's recorded ``prompt_token_ids``. The HF engine expands
-multimodal prompts to ``n`` rows itself (``generate``'s ``num_return_sequences`` would
-``repeat_interleave`` patch tensors). Multimodal episodes send the chat to the engine on every
-turn (one processor pass per turn, no prefix cache) and reject environment tool schemas.
+`TrainBatch.extra` convention: tensors are ``[B, ...]`` (sliced on dim 0, e.g.
+``mm_token_type_ids``), lists are per-sequence (``extra["per_sequence"][b]`` = that sequence's
+``pixel_values``/``image_grid_thw`` dict or ``None``); the trainer concatenates them per micro-batch
+and lets the model derive its own (M-RoPE) position ids. ``build_train_batch(..., processor=)``
+re-encodes the final-turn chat and requires the ids to equal the engine's recorded
+``prompt_token_ids``. The HF engine expands every prompt to ``n`` rows itself (``generate``'s
+``num_return_sequences`` would ``repeat_interleave`` patch tensors). Multimodal episodes send the
+chat to the engine on every turn (one processor pass per turn, no prefix cache) and reject
+environment tool schemas.
 
 ### SFT — `algorithm.name: sft`
 No rollouts, no rewards: the orchestrator's SFT loop iterates the dataset, encodes
@@ -387,7 +459,8 @@ trains with `monorl.algorithms.sft_loss(logprobs, response_mask, *, label_smooth
 → `PolicyLossOutput` with metrics `loss/sft`, `sft/ppl`, `sft/tokens`. `trainer.prompts_per_step`
 = sequences per optimizer step; `max_steps`/`save_every`/`eval_every` as for RL (eval = held-out
 NLL `eval/loss`). Pipeline backends map it to TRL `SFTTrainer`, verl's engine-based
-`sft_trainer_ray` (`sft_trainer_engine.yaml`; v0.9.1 dropped `fsdp_sft_trainer`), NeMo-RL `run_sft.py`.
+`sft_trainer_ray` (`sft_trainer_engine.yaml`; v0.9.1 dropped `fsdp_sft_trainer`), NeMo-RL
+`run_sft.py`.
 
 ### Pipelines — `monorl.config.pipeline.PipelineConfig` → `monorl.pipeline.run_pipeline(config, run_dir=None, *, resume=False) -> PipelineResult`
 Run dir layout: `<run_dir>/pipeline.yaml`, `status.json` (same shape as a run; `step` = stages
@@ -400,7 +473,8 @@ stages whose state is `succeeded`. Cancellation propagates to the active stage.
 CLI: `monorl pipeline --config PATH [--set ...] [--run-dir] [--resume]`; `monorl train` on a file
 with `stages:`+`base:` dispatches to the pipeline runner. Server: `POST /api/jobs` accepts
 `{config: RunConfig}` or `{pipeline: PipelineConfig}` → job `kind: "run" | "pipeline"`;
-`GET /api/jobs/{id}/stages` → manifest stages; `GET /api/jobs/{id}/stages/{index}/(metrics|logs|trajectories|checkpoints)`
-read that stage's run dir with the same query params/shapes as the job-level routes;
-`GET /api/config/pipeline_schema`. UI: pipeline jobs show a stage table and per-stage charts.
+`GET /api/jobs/{id}/stages` → manifest stages; `GET
+/api/jobs/{id}/stages/{index}/(metrics|logs|trajectories|checkpoints)` read that stage's run dir
+with the same query params/shapes as the job-level routes; `GET /api/config/pipeline_schema`. UI:
+pipeline jobs show a stage table and per-stage charts.
 

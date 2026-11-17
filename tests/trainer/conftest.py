@@ -53,6 +53,25 @@ def make_config(tiny_model_dir: Path, *, lora: bool = False, **trainer: Any) -> 
     )
 
 
+SGD = {"optimizer": "sgd", "learning_rate": 0.5}
+"""Trainer options for a test that compares the updates of two computations of one gradient: with
+plain SGD the weights differ by as much as the gradients do. Adam divides by the gradient's own
+size, which turns rounding noise in a nearly zero entry into a difference the size of the step."""
+
+
+def exported(trainer: Any) -> torch.Tensor:
+    """Every exported weight of ``trainer`` in one vector."""
+    return torch.cat([w.detach().flatten().float() for _, w in trainer.export_weights()])
+
+
+def assert_same_update(initial: torch.Tensor, a: torch.Tensor, b: torch.Tensor, rel: float = 1e-4) -> None:
+    """``a`` and ``b`` are ``initial`` after the same update: they moved, and they differ by at most
+    ``rel`` of the largest change of a weight (the rounding of two orders of the same sums)."""
+    moved = float((a - initial).abs().max())
+    assert moved > 0
+    torch.testing.assert_close(a, b, atol=rel * moved, rtol=0)
+
+
 def make_batch(
     tokenizer: Any, *, target: int = 1234, batch_size: int = 4, response_len: int = 5
 ) -> TrainBatch:

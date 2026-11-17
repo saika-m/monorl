@@ -15,10 +15,12 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from monorl.core.errors import ConfigError, DataError, EnvironmentError_
@@ -152,7 +154,9 @@ class ComponentLoop:
             )
             for engine in self.raw_engines
         ]
-        self.max_parallel = int(extra.get("max_parallel_episodes", 64))
+        self.max_parallel: int | None = (
+            int(extra["max_parallel_episodes"]) if extra.get("max_parallel_episodes") is not None else None
+        )
 
         self.samples = list(_resolve_open_source()(config.data, tokenizer=self.tokenizer, seed=seed))
         if not self.samples:
@@ -181,7 +185,9 @@ class ComponentLoop:
             min_p=float(extra.get("min_p", 0.0)),
             repetition_penalty=float(extra.get("repetition_penalty", 1.0)),
             stop=list(r.stop),
-            logprobs=True,
+            # Asked for only when the batch takes them as its behaviour policy (see _train_on):
+            # otherwise a served engine would compute and ship one float per token for nothing.
+            logprobs=self._engine_logprobs_match_trainer(),
             top_logprobs=(
                 config.algorithm.off_policy.score_centering_top_k
                 if config.algorithm.off_policy.score_centering
@@ -223,12 +229,23 @@ class ComponentLoop:
         step = int(latest.name.removeprefix("step-"))
         self.trainer.load_checkpoint(latest)
         self._last_checkpoint_step = step
-        random.seed(self.config.seed + step)
-        torch.manual_seed(self.config.seed + step)
         with self.engine_lock:
             self.weight_sync.sync(self.trainer, self.raw_engines)
             self.policy_version += 1
         self.reporter.log(f"resumed from {latest} at step {step}")
+        # Last, so that the generators are where the checkpoint left them when the next step starts.
+        state, inexact = restore_loop_state(latest, seed=int(self.config.seed), step=step)
+        if state is not None and "policy_version" in state:  # a checkpoint of the SFT loop has none
+            self.policy_version = int(state["policy_version"])
+        if self.config.rollout.async_steps_ahead > 0:
+            inexact.append(
+                "with rollout.async_steps_ahead > 0 the rollouts that ran ahead of the checkpoint are "
+                "not saved and are sampled again, from the weights of the checkpoint"
+            )
+        if inexact:
+            self.reporter.log(
+                f"the run will not continue exactly as the one it resumes: {'; '.join(inexact)}"
+            )
         return step
 
     # -- main loop ------------------------------------------------------------------------
@@ -265,11 +282,7 @@ class ComponentLoop:
             for step in steps:
                 if self.cancel.is_set():
                     return
-                with self.engine_lock:
-                    version = self.policy_version
-                    rollout = self._rollout_step(step)
-                rollout.policy_version = version
-                yield rollout
+                yield self._rollout_step(step)
             return
 
         # The producer may hold at most ``ahead + 1`` generated-but-untrained steps: the one the
@@ -288,13 +301,10 @@ class ComponentLoop:
                     while not permits.acquire(timeout=0.1):
                         if stop.is_set() or self.cancel.is_set():
                             return
-                    with self.engine_lock:
-                        version = self.policy_version
-                        try:
-                            rollout = self._rollout_step(step, abort=stop)
-                        except EpisodeAborted:
-                            break
-                    rollout.policy_version = version
+                    try:
+                        rollout = self._rollout_step(step, abort=stop)
+                    except EpisodeAborted:
+                        break
                     if not _put_until(q, rollout, stop):
                         break
             except BaseException as e:  # noqa: BLE001 - surfaced to the consumer
@@ -322,50 +332,102 @@ class ComponentLoop:
 
     # -- one step --------------------------------------------------------------------------
     def _rollout_step(self, step: int, *, abort: threading.Event | None = None) -> RolloutBatch:
+        """Sample and score the trajectories of ``step``.
+
+        The engine lock is held while the engines generate, so every trajectory of the step comes
+        from the weights of one policy version, and released before the rewards are scored: a
+        weight sync does not wait for reward functions. Dynamic sampling is the exception, because
+        it needs the scores to decide what to sample next from the same weights: there the lock
+        spans scoring and resampling too.
+        """
         config = self.config
+        dynamic = config.algorithm.dynamic_sampling
         tally = {"attempted": 0, "failed": 0, "incomplete": 0}
-        t0 = time.perf_counter()
-        trajectories = self._episodes(self.sampler.batch(step), step, round=0, abort=abort, tally=tally)
-        time_rollout = time.perf_counter() - t0
-        t1 = time.perf_counter()
-        self._score(trajectories)
-        time_reward = time.perf_counter() - t1
         metrics = {"rollout/groups_dropped": 0.0, "rollout/resample_rounds": 0.0}
-        if config.algorithm.dynamic_sampling:
-            kept, dropped = _drop_uniform_groups(trajectories)
-            metrics["rollout/groups_dropped"] += dropped
-            max_rounds = int(config.rollout.extra.get("dynamic_sampling_max_rounds", 3))
-            rounds = 0
-            while _num_groups(kept) < config.trainer.prompts_per_step and rounds < max_rounds:
-                rounds += 1
-                t0 = time.perf_counter()
-                extra = self._episodes(
-                    self.sampler.batch(step, round=rounds), step, round=rounds, abort=abort, tally=tally
-                )
-                time_rollout += time.perf_counter() - t0
-                t1 = time.perf_counter()
-                self._score(extra)
-                time_reward += time.perf_counter() - t1
-                extra_kept, dropped = _drop_uniform_groups(extra)
+        time_reward = 0.0
+        with self.engine_lock:
+            version = self.policy_version
+            t0 = time.perf_counter()
+            trajectories = self._episodes(self.sampler.batch(step), step, round=0, abort=abort, tally=tally)
+            time_rollout = time.perf_counter() - t0
+            if dynamic:
+                time_reward = self._timed_score(trajectories)
+                trajectories, dropped = _drop_uniform_groups(trajectories)
                 metrics["rollout/groups_dropped"] += dropped
-                kept.extend(_take_groups(extra_kept, config.trainer.prompts_per_step - _num_groups(kept)))
-            metrics["rollout/resample_rounds"] = float(rounds)
-            trajectories = kept
+                resample_rollout, resample_reward = self._resample(
+                    trajectories, step, abort=abort, tally=tally, metrics=metrics
+                )
+                time_rollout += resample_rollout
+                time_reward += resample_reward
+            speculation = self._speculation_metrics()
+        if not dynamic:
+            time_reward = self._timed_score(trajectories)
         if config.env.max_failed_frac > 0:
             metrics["rollout/failed_episodes"] = float(tally["failed"])
             metrics["rollout/failed_frac"] = tally["failed"] / max(1, tally["attempted"])
             metrics["rollout/groups_incomplete"] = float(tally["incomplete"])
         metrics["time/rollout"] = time_rollout
         metrics["time/reward"] = time_reward
-        metrics.update(self._speculation_metrics())
-        return RolloutBatch(
-            step=step, trajectories=trajectories, policy_version=self.policy_version, metrics=metrics
-        )
+        metrics.update(speculation)
+        return RolloutBatch(step=step, trajectories=trajectories, policy_version=version, metrics=metrics)
+
+    def _resample(
+        self,
+        kept: list[Trajectory],
+        step: int,
+        *,
+        abort: threading.Event | None,
+        tally: dict[str, int],
+        metrics: dict[str, float],
+    ) -> tuple[float, float]:
+        """DAPO dynamic sampling: fill ``kept`` up to ``trainer.prompts_per_step`` groups, in place.
+
+        Round ``r`` replaces the missing groups with the first prompts of ``sampler.batch(step,
+        round=r)`` whose groups have a gradient, in the order of that draw. The draw is rolled out
+        a slice at a time: first as many prompts as groups are missing, then, while groups are
+        still missing and the draw is not used up, a slice twice as long as the previous one. So a
+        step that lost one group usually pays for one more prompt instead of a whole step, and a
+        draw that yields nothing costs at most ``log2`` as many engine rounds as it has prompts.
+        Returns the seconds spent generating and scoring.
+        """
+        config = self.config
+        per_step = config.trainer.prompts_per_step
+        max_rounds = int(config.rollout.extra.get("dynamic_sampling_max_rounds", 3))
+        time_rollout = time_reward = 0.0
+        rounds = 0
+        while _num_groups(kept) < per_step and rounds < max_rounds:
+            rounds += 1
+            candidates = self.sampler.batch(step, round=rounds)
+            start, size = 0, per_step - _num_groups(kept)
+            while start < len(candidates) and _num_groups(kept) < per_step:
+                t0 = time.perf_counter()
+                extra = self._episodes(
+                    candidates[start : start + size],
+                    step,
+                    round=rounds,
+                    first=start,
+                    abort=abort,
+                    tally=tally,
+                )
+                time_rollout += time.perf_counter() - t0
+                time_reward += self._timed_score(extra)
+                extra_kept, dropped = _drop_uniform_groups(extra)
+                metrics["rollout/groups_dropped"] += dropped
+                kept.extend(_take_groups(extra_kept, per_step - _num_groups(kept)))
+                start += size
+                size *= 2
+        metrics["rollout/resample_rounds"] = float(rounds)
+        return time_rollout, time_reward
+
+    def _timed_score(self, trajectories: Sequence[Trajectory]) -> float:
+        t0 = time.perf_counter()
+        self._score(trajectories)
+        return time.perf_counter() - t0
 
     def _speculation_metrics(self) -> dict[str, float]:
         """``mtp/accept_rate`` and ``mtp/accept_length`` of what the engines generated since the
         previous call; empty unless an engine drafts (``speculation_stats()``, an optional engine
-        capability). Read under the engine lock, so rollouts and evaluations do not mix."""
+        capability). Call it holding the engine lock, so rollouts and evaluations do not mix."""
         total = SpeculationStats()
         for engine in self.raw_engines:
             read = getattr(engine, "speculation_stats", None)
@@ -380,17 +442,23 @@ class ComponentLoop:
         step: int,
         *,
         round: int,
+        first: int = 0,
         abort: threading.Event | None,
         tally: dict[str, int],
     ) -> list[Trajectory]:
+        """One group of episodes per prompt. ``first`` is the position of ``prompts[0]`` in the
+        draw of ``round``: group ids and engine replicas follow the position in the draw, however
+        the draw is sliced."""
         group_size = self.config.rollout.group_size
         specs: list[EpisodeSpec] = []
-        for p, sample in enumerate(prompts):
+        for p, sample in enumerate(prompts, start=first):
             group_id = f"s{step}-p{p}" if round == 0 else f"s{step}-r{round}-p{p}"
-            for _ in range(group_size):
-                engine = self.engines[len(specs) % len(self.engines)]
+            for member in range(group_size):
+                engine = self.engines[(p * group_size + member) % len(self.engines)]
                 specs.append(EpisodeSpec(sample=sample, group_id=group_id, engine=engine))
-        trajectories, failed = self._run_specs(specs, self.sampling, abort=abort, what=f"step {step}")
+        trajectories, failed = self._run_specs(
+            specs, self.sampling, abort=abort, what=f"step {step}", earlier=tally
+        )
         tally["attempted"] += len(specs)
         tally["failed"] += failed
         if failed and _needs_group_baseline(self.config):
@@ -406,10 +474,13 @@ class ComponentLoop:
         *,
         abort: threading.Event | None = None,
         what: str,
+        earlier: dict[str, int] | None = None,
     ) -> tuple[list[Trajectory], int]:
         """Run ``specs`` under the run's episode policy (context budget, ``env.retries``,
         ``env.max_failed_frac``): the trajectories of the episodes that finished and the number
-        that failed for good. More failures than tolerated fail the run."""
+        that failed for good. More failures than tolerated fail the run; ``earlier`` is the tally
+        of the episodes of the same step that ran before, which count towards that fraction (a
+        resample slice of one prompt must not fail the run with its first failed episode)."""
         env_cfg = self.config.env
         failures: list[EpisodeFailure] | None = [] if env_cfg.max_failed_frac > 0 else None
         trajectories = run_episodes(
@@ -423,13 +494,18 @@ class ComponentLoop:
             max_context_tokens=self.config.context_budget,
             retries=env_cfg.retries,
             failures=failures,
+            turn_batching=self.config.rollout.turn_batching,
         )
         if not failures:
             return trajectories, 0
         first = failures[0].error
         summary = f"{what}: {len(failures)} of {len(specs)} episodes failed"
         cause = f"first failure: {type(first).__name__}: {first}"
-        if len(failures) > env_cfg.max_failed_frac * len(specs):
+        attempted = len(specs) + (earlier["attempted"] if earlier else 0)
+        failed = len(failures) + (earlier["failed"] if earlier else 0)
+        if failed > env_cfg.max_failed_frac * attempted:
+            if attempted > len(specs):
+                summary += f" ({failed} of {attempted} in the step so far)"
             raise EnvironmentError_(
                 f"{summary}, more than env.max_failed_frac={env_cfg.max_failed_frac:g} allows; {cause}"
             ) from first
@@ -628,6 +704,7 @@ class ComponentLoop:
             shutil.rmtree(tmp)
         tmp.mkdir(parents=True)
         self.trainer.save_checkpoint(tmp)
+        save_loop_state(tmp, {"policy_version": self.policy_version})
         if path.exists():
             shutil.rmtree(path)
         os.replace(tmp, path)  # a crash mid-save leaves only step-N.tmp, never a half-written step-N
@@ -684,7 +761,9 @@ class ComponentLoop:
         if not self._eval_samples:
             return
         t0 = time.perf_counter()
-        with self.engine_lock:
+        # The generators are put back: the checkpoint of this step is on disk already, and the next
+        # step of a resumed run has to start from the same random state as this run's.
+        with self.engine_lock, preserved_rng():
             specs = [
                 EpisodeSpec(
                     sample=s, group_id=f"eval-s{step}-{s.id}", engine=self.engines[i % len(self.engines)]
@@ -735,6 +814,100 @@ def _checkpoint_complete(path: Path) -> bool:
     """Checkpoints are written to ``step-N.tmp`` and renamed, so any non-empty ``step-N`` is complete
     (a crash mid-save leaves only the ``.tmp`` directory, which ``list_checkpoints`` ignores)."""
     return path.is_dir() and any(path.iterdir())
+
+
+# -- what a loop adds to a checkpoint ----------------------------------------------------------
+
+LOOP_STATE_FILE = "loop_state.pt"
+
+
+def rng_state() -> dict[str, Any]:
+    """The state of every global random generator of this process: Python, NumPy, and torch on the
+    CPU, on every CUDA device (once CUDA is in use here) and on MPS. Plain containers and tensors,
+    so that ``torch.load(weights_only=True)`` reads it back."""
+    numpy = np.random.get_state(legacy=False)
+    cuda = torch.cuda.is_available() and torch.cuda.is_initialized()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": numpy["bit_generator"],
+            "key": torch.from_numpy(numpy["state"]["key"].astype(np.int64)),
+            "pos": int(numpy["state"]["pos"]),
+            "has_gauss": int(numpy["has_gauss"]),
+            "gauss": float(numpy["gauss"]),
+        },
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if cuda else None,
+        "mps": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
+    }
+
+
+def set_rng_state(state: dict[str, Any]) -> list[str]:
+    """Put the generators back to ``state`` (:func:`rng_state`). Returns one sentence for every
+    generator of ``state`` this process cannot take (other accelerators than the saving process)."""
+    random.setstate(state["python"])
+    numpy = state["numpy"]
+    np.random.set_state(
+        {
+            "bit_generator": numpy["bit_generator"],
+            "state": {"key": numpy["key"].numpy().astype(np.uint32), "pos": numpy["pos"]},
+            "has_gauss": numpy["has_gauss"],
+            "gauss": numpy["gauss"],
+        }
+    )
+    torch.set_rng_state(state["torch"])
+    left_out: list[str] = []
+    if state["cuda"] is not None:
+        devices = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if devices == len(state["cuda"]):
+            torch.cuda.set_rng_state_all(state["cuda"])
+        else:
+            left_out.append(
+                f"the checkpoint holds the generators of {len(state['cuda'])} CUDA device(s) and this "
+                f"process has {devices}, so the CUDA generators were not restored"
+            )
+    if state["mps"] is not None:
+        if torch.backends.mps.is_available():
+            torch.mps.set_rng_state(state["mps"])
+        else:
+            left_out.append("the checkpoint holds an MPS generator and this process has no MPS device")
+    return left_out
+
+
+@contextmanager
+def preserved_rng() -> Iterator[None]:
+    """Leave the global generators as they were found, whatever the body draws."""
+    state = rng_state()
+    try:
+        yield
+    finally:
+        set_rng_state(state)
+
+
+def save_loop_state(checkpoint: Path, state: dict[str, Any]) -> None:
+    """Write ``state`` and the generators (:func:`rng_state`) into the checkpoint directory. Call it
+    after ``Trainer.save_checkpoint`` and before the directory gets its final name: the generators
+    are then where the next step finds them, and the checkpoint is complete or absent."""
+    torch.save({**state, "rng": rng_state()}, checkpoint / LOOP_STATE_FILE)
+
+
+def restore_loop_state(checkpoint: Path, *, seed: int, step: int) -> tuple[dict[str, Any] | None, list[str]]:
+    """Restore the generators from ``checkpoint``; call it after everything else of a resume, so
+    that nothing draws between this and the next step. Returns what :func:`save_loop_state` was
+    given, and the reasons why the run will not continue exactly as the run it resumes (none when
+    the generators of this process are all back). A checkpoint without loop state was written
+    before the loops saved it: ``(None, [why])``, with Python and torch reseeded from
+    ``seed + step`` as resumes were then."""
+    file = checkpoint / LOOP_STATE_FILE
+    if not file.exists():
+        random.seed(seed + step)
+        torch.manual_seed(seed + step)
+        return None, [
+            f"{checkpoint} holds no {LOOP_STATE_FILE} (it was written before the loop saved its state), "
+            f"so Python and torch were seeded with seed + step = {seed + step}"
+        ]
+    state = torch.load(file, map_location="cpu", weights_only=True)
+    return state, set_rng_state(state.pop("rng"))
 
 
 def _num_groups(trajectories: Sequence[Trajectory]) -> int:

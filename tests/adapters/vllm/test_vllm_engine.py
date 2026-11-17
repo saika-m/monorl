@@ -108,6 +108,37 @@ def test_sampling_param_mapping(fake_vllm, vllm_config: RunConfig) -> None:
     assert sampling_kwargs(SamplingParams(logprobs=False))["logprobs"] is None
 
 
+def test_prompts_with_caps_of_their_own_are_one_enqueue_with_sampling_params_per_prompt(
+    fake_vllm, vllm_config: RunConfig
+) -> None:
+    """``LLM.enqueue`` takes a sequence with one ``SamplingParams`` per prompt: the prompts of a
+    call differ in ``max_tokens`` and in nothing else, and none generates past its own."""
+    eng = _engine(vllm_config)
+    params = SamplingParams(n=2, max_new_tokens=9, temperature=0.5, stop=["x"])
+    out = eng.generate([[1], [2], [3], [4]], params, max_new_tokens=[2, 9, 1, 2])
+    llm = FakeLLM.instances[-1]
+    assert llm.names().count("enqueue") == 1
+    sent = llm.calls[-1][1]["sampling_params"]
+    assert [sp.max_tokens for sp in sent] == [2, 9, 1, 2]
+    assert {(sp.n, sp.temperature, tuple(sp.stop), sp.logprobs) for sp in sent} == {(2, 0.5, ("x",), 0)}
+    assert [[c.token_ids for c in group] for group in out] == [
+        [[0, 0], [0, 1]],
+        [[1, 0, 7], [1, 1, 7]],  # the fake's whole answer
+        [[2], [2]],
+        [[3, 0], [3, 1]],
+    ]
+    assert [[c.finish_reason for c in group] for group in out] == [
+        ["length"] * 2,
+        ["stop"] * 2,
+        ["length"] * 2,
+        ["length"] * 2,
+    ]
+    assert [len(c.logprobs) for group in out for c in group] == [2, 2, 3, 3, 1, 1, 2, 2]
+    assert [group[0].prompt_token_ids for group in out] == [[1], [2], [3], [4]]
+    with pytest.raises(ValueError, match="3 max_new_tokens for 4 prompts"):
+        eng.generate([[1], [2], [3], [4]], params, max_new_tokens=[2, 9, 1])
+
+
 def test_generate_token_and_chat_prompts(fake_vllm, vllm_config: RunConfig) -> None:
     eng = _engine(vllm_config)
     chat = [{"role": "user", "content": "What is 2+2?"}]
