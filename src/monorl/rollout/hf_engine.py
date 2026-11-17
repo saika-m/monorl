@@ -691,6 +691,80 @@ class HFRolloutEngine:
             return None
         return rows if self.device.type == "mps" else 0
 
+    def _shared_prompt_cache(
+        self,
+        prompt_ids: list[list[int]],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        n: int,
+        switch: _CancelSwitch,
+    ) -> DynamicCache | None:
+        """Prefill repeated text prompts once, then give every sample its own KV-cache rows.
+
+        Keep the last prompt token for ``generate`` to compute its first sampling logits. The
+        cache is local to this call: neither another request nor a weight update can reuse it.
+        Short prompts keep the ordinary path because a second forward pass costs more than it saves.
+        """
+        if (
+            input_ids.shape[1] < 128
+            or len(prompt_ids) * n < 2
+            or self.config is None
+            or self._processor is not None
+            or self.config.model.trust_remote_code
+            or self.model.training
+            or any(len(ids) < 2 for ids in prompt_ids)
+        ):
+            return None
+        model_config = self.model.config
+        rope = getattr(model_config, "rope_parameters", None)
+        if rope is None:
+            rope = vars(model_config).get("rope_scaling")
+        if (
+            model_config.is_encoder_decoder
+            or not self.model._supports_default_dynamic_cache()
+            or not self.model._supports_logits_to_keep()
+            or self.model.generation_config.cache_implementation is not None
+            or getattr(model_config, "sliding_window", None) is not None
+            or getattr(model_config, "attention_chunk_size", None) is not None
+            or any(kind != "full_attention" for kind in (getattr(model_config, "layer_types", None) or []))
+            or (rope is not None and rope.get("rope_type", rope.get("type")) != "default")
+        ):
+            return None
+
+        unique: dict[tuple[int, ...], int] = {}
+        first_rows: list[int] = []
+        sample_rows: list[int] = []
+        for row, ids in enumerate(prompt_ids):
+            key = tuple(ids)
+            if key not in unique:
+                unique[key] = len(first_rows)
+                first_rows.append(row)
+            sample_rows.extend([unique[key]] * n)
+        if len(first_rows) == len(sample_rows):
+            return None
+
+        if len(first_rows) != len(prompt_ids):
+            selection = torch.tensor(first_rows, device=input_ids.device)
+            input_ids = input_ids.index_select(0, selection)
+            attention_mask = attention_mask.index_select(0, selection)
+        prefix_mask = attention_mask[:, :-1]
+        position_ids = prefix_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(prefix_mask == 0, 0)
+        cache = DynamicCache()
+        inputs = self.model.prepare_inputs_for_generation(
+            input_ids[:, :-1],
+            attention_mask=prefix_mask,
+            position_ids=position_ids,
+            past_key_values=cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        switch.check()
+        self.model(**inputs, return_dict=True)
+        switch.check()
+        cache.batch_select_indices(torch.tensor(sample_rows, device=input_ids.device))
+        return cache
+
     def _decode_batch(
         self,
         encoded: list[_EncodedPrompt],
@@ -710,12 +784,17 @@ class HFRolloutEngine:
         in a single call. What changes is the batch ``torch.multinomial`` draws for: once a row of
         the batch has finished, the others get other random numbers than they would have (from the
         same distribution)."""
-        input_ids, attention_mask = self._left_pad([e.ids for e in encoded])
-        input_ids = input_ids.repeat_interleave(n, dim=0)
-        attention_mask = attention_mask.repeat_interleave(n, dim=0)
+        prompt_ids = [e.ids for e in encoded]
+        input_ids, attention_mask = self._left_pad(prompt_ids)
         model_kwargs: dict[str, Any] = {}
         if any(e.multimodal for e in encoded):
             model_kwargs = self._multimodal_inputs(encoded, n, input_ids.shape[1])
+        else:
+            cache = self._shared_prompt_cache(prompt_ids, input_ids, attention_mask, n, switch)
+            if cache is not None:
+                model_kwargs["past_key_values"] = cache
+        input_ids = input_ids.repeat_interleave(n, dim=0)
+        attention_mask = attention_mask.repeat_interleave(n, dim=0)
         rows = input_ids.shape[0]
         stop = StopStringCriteria(self._tokenizer, list(params.stop)) if params.stop else None
         temperature = params.temperature if params.temperature > 0.0 else 1.0
@@ -739,7 +818,9 @@ class HFRolloutEngine:
 
         while True:
             slack = self._slack(len(live))
-            continued = "past_key_values" in model_kwargs  # from a cache that has given up rows
+            # from a cache its rows can be taken out of: the shared prefill (a DynamicCache of
+            # DynamicLayer) or the cache of a call that has given up rows
+            continued = "past_key_values" in model_kwargs
             left = [row_caps[row] - steps for row in live]
             finish = _FinishRecorder(left, self._eos_ids, stop, slack=slack if continued else None)
             recorder = _LogprobRecorder(temperature, logprobs=params.logprobs, top=params.top_logprobs)
