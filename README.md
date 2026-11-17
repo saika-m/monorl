@@ -322,7 +322,7 @@ The native loop: rollout engines and trainers behind monorl's orchestrator.
 | Off-policy corrections (`algorithm.off_policy`) | decoupled PPO, truncated IS weights, ratio mask, score centering | yes (top-k for score centering) | yes (top-k for score centering) | yes |
 | Colocated (sleep) | n/a | yes | yes | – |
 | Disaggregated / Ray | yes | yes | yes | – |
-| Weight sync | inprocess | cuda_ipc, broadcast, checkpoint | cuda_ipc, broadcast, checkpoint | inprocess |
+| Weight sync | inprocess, broadcast, checkpoint | inprocess, cuda_ipc, broadcast, checkpoint | inprocess, cuda_ipc, broadcast, checkpoint | inprocess |
 | Patched | – | yes | yes | – |
 
 Pipeline backends: the same config compiled for another framework's loop.
