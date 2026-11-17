@@ -94,6 +94,8 @@ loop)* toggle at the top — a `PipelineConfig` whose `base` is the same wizard 
    `sft_train_on_prompt`, `sft_turns` (*Turns trained*: the `last` assistant turn or `all`) and
    `trainer.eval_every`. For RL runs the *Algorithm* card also holds
    `rollout.turn_rendering` (`tokens` / `template`: how multi-turn prompts are built),
+   `rollout.turn_batching` (`lockstep` / `arrival`: how the turns of concurrent episodes are
+   batched),
    `algorithm.loss_agg`, whose `rollout` option weighs every episode equally, the *Context
    budget* (`rollout.max_context_tokens`, next to *Max new tokens*; empty = `trainer.max_seq_len`;
    flagged when it exceeds `trainer.max_seq_len` or the trainer is verl / nemo_rl) and *Credit
