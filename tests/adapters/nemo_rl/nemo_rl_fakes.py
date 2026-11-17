@@ -55,6 +55,7 @@ FAKE_HOME_FILES: dict[str, str] = {
         import json
         import os
         import re
+        import signal
         import sys
         import time
 
@@ -86,6 +87,15 @@ FAKE_HOME_FILES: dict[str, str] = {
                     },
                     f,
                 )
+            if os.environ.get("FAKE_NEMO_RL_SLEEP") == "chatty":
+                # a framework that logs while it shuts down, more than the pipe to the backend holds
+                def shut_down(*_):
+                    for i in range(4000):
+                        print(f"shutting down {i:04d} " + "." * 100)
+                    print("shutdown complete", flush=True)
+                    sys.exit(0)
+
+                signal.signal(signal.SIGTERM, shut_down)
             if os.environ.get("FAKE_NEMO_RL_SLEEP"):
                 print("sleeping", flush=True)
                 while True:

@@ -376,31 +376,32 @@ gives the backend the event that the first signal sets (`PipelineBackend.run(...
   ended `succeeded`; `metrics.jsonl` has the row of every step from 1 to 4 once, and
   `trajectories.jsonl` the 8 episodes of each.
 * **verl** and **NeMo-RL** run the framework in a child process and do not finish the step. What
-  follows is read from the two backends and from the pinned sources; neither was run with a
+  the backends do is tested against stand-ins for the two frameworks (a stand-in entry, a fake
+  checkout); what the frameworks do is read from the pinned sources. Neither was run with a
   signal here. Common to both: while monorl prepares the run (compiling the config, exporting the
   data) the event is set and logged like in any run, and the backend does not read it, so the
   child is started all the same. From the start of the child to its end the backend handles both
-  signals itself, the first and every later one in the same way. The training loops of the two
-  frameworks handle neither signal at the pin (`verl/trainer/`; `nemo_rl/algorithms/grpo.py` and
-  `sft.py`, `examples/run_grpo.py` and `run_sft.py`): the step in flight is lost, no checkpoint
-  is written for the signal, and `--resume` continues from the checkpoint the framework saved
-  last on its own schedule. The run ends `cancelled` with exit code 130.
-  * **verl.** Every signal sends SIGTERM to the driver (`python -m monorl.adapters.verl.entry`)
-    and logs `cancel requested: sent SIGTERM to verl driver`. About 30 seconds after the first
-    one (`VerlBackend.grace_seconds`, checked once a second) a driver that is still running is
-    killed with SIGKILL, after the line `verl driver did not exit in time: sending SIGKILL`. A
-    second signal does not shorten that wait. The status message is `verl run cancelled`, and
-    the step is that of `checkpoints/latest_checkpointed_iteration.txt`, or of the last row of
-    `metrics.jsonl` when verl saved no checkpoint. The driver is in the process group of
-    `monorl train`, so Ctrl-C in a terminal reaches it as SIGINT as well. What the Ray processes
-    of the run do when the driver ends was not looked at.
+  signals itself. Its handler only notes the request: the child is stopped outside the handler,
+  while the backend goes on with its work, and a second signal changes nothing. The training
+  loops of the two frameworks handle neither signal at the pin (`verl/trainer/`;
+  `nemo_rl/algorithms/grpo.py` and `sft.py`, `examples/run_grpo.py` and `run_sft.py`): the step
+  in flight is lost, no checkpoint is written for the signal, and `--resume` continues from the
+  checkpoint the framework saved last on its own schedule. The run ends `cancelled` with exit
+  code 130.
+  * **verl.** Within a second of the signal (the backend looks once a second) the driver,
+    `python -m monorl.adapters.verl.entry`, gets SIGTERM, and `run.log` the line
+    `cancel requested: sent SIGTERM to verl driver`. A driver that is still running 30 seconds
+    later (`VerlBackend.grace_seconds`) is killed with SIGKILL, after the line
+    `verl driver did not exit in time: sending SIGKILL`. The status message is
+    `verl run cancelled`, and the step is that of `checkpoints/latest_checkpointed_iteration.txt`,
+    or of the last row of `metrics.jsonl` when verl saved no checkpoint. The driver is in the
+    process group of `monorl train`, so Ctrl-C in a terminal reaches it as SIGINT as well. What
+    the Ray processes of the run do when the driver ends was not looked at.
   * **NeMo-RL.** The child runs in a session of its own, so Ctrl-C in a terminal reaches only
-    monorl. Every signal sends SIGTERM to the child's process group and then waits, inside the
-    signal handler, for the child to exit; after 30 seconds (`CANCEL_GRACE_SECONDS`) the group
-    gets SIGKILL. While it waits, the child's output is not copied to `run.log`. A second signal
-    does the same again inside the first (SIGTERM, a wait of its own) and does not end the run
-    sooner. The status message is `cancelled by user`, and the step is that of the last row of
-    `metrics.jsonl`.
+    monorl. The child's process group gets SIGTERM, and SIGKILL if the child is still running 30
+    seconds later (`CANCEL_GRACE_SECONDS`). What the child prints while it shuts down is copied
+    to `run.log` like the rest of its output. The status message is `cancelled by user`, and the
+    step is that of the last row of `metrics.jsonl`.
 
 ## Choosing
 

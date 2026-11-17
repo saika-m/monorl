@@ -42,6 +42,8 @@ ENTRY_MODULE = "monorl.adapters.nemo_rl.entry"
 STEP_REFRESH_INTERVAL = 5.0
 #: Grace period after SIGTERM before SIGKILL on cancel.
 CANCEL_GRACE_SECONDS = 30.0
+#: Seconds between two looks of the thread that cancels the child once a signal asked for it.
+CANCEL_POLL_SECONDS = 0.05
 
 
 def nemo_rl_home(config: RunConfig) -> Path:
@@ -243,9 +245,21 @@ class NemoRLBackend:
             self._proc = proc
         reporter.set_status("running", "NeMo-RL training started", child_pid=proc.pid, backend=self.name)
 
-        with _signal_handlers(self._on_signal):
-            self._stream(proc, reporter)
-            returncode = proc.wait()
+        # The handler only sets an event. It runs on the main thread, which copies the child's
+        # output: stopping the child (SIGTERM, a wait, SIGKILL) is left to a thread, so that the
+        # output is still copied while the child shuts down, and a second signal starts nothing.
+        requested, finished = threading.Event(), threading.Event()
+        canceller = threading.Thread(
+            target=self._cancel_when, args=(requested, finished), name="monorl-nemo-rl-cancel", daemon=True
+        )
+        canceller.start()
+        try:
+            with _signal_handlers(lambda signum, frame: requested.set()):
+                self._stream(proc, reporter)
+                returncode = proc.wait()
+        finally:
+            finished.set()
+            canceller.join()
 
         checkpoints = list_checkpoints(run_dir)
         step = latest_step(run_dir)
@@ -270,8 +284,12 @@ class NemoRLBackend:
             error=error,
         )
 
-    def _on_signal(self, signum: int, _frame: Any) -> None:
-        self.cancel()
+    def _cancel_when(self, requested: threading.Event, finished: threading.Event) -> None:
+        """:meth:`cancel` once ``requested`` is set, unless the run has ``finished`` before."""
+        while not finished.is_set():
+            if requested.wait(CANCEL_POLL_SECONDS):
+                self.cancel()
+                return
 
     def _stream(self, proc: subprocess.Popen[str], reporter: RunReporter) -> None:
         assert proc.stdout is not None

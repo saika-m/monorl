@@ -4,7 +4,9 @@ Launch is a subprocess ``python -m monorl.adapters.verl.entry <overrides>`` (cwd
 monorl process never imports verl/ray. Its stdout+stderr stream into ``run.log``; metrics arrive
 through the ``Tracking.log`` patch (``metrics.jsonl``); ``status.json`` is kept current here.
 Cancellation (``cancel()``, SIGTERM/SIGINT in the main thread) forwards SIGTERM to the verl driver,
-which is what ``ray job stop`` does, then SIGKILLs after :attr:`VerlBackend.grace_seconds`.
+which is what ``ray job stop`` does, then SIGKILLs after :attr:`VerlBackend.grace_seconds`. The
+signal handler only sets the event that ``cancel()`` sets; the loop that waits for the driver acts
+on it.
 
 verl writes checkpoints to ``trainer.default_local_dir`` (= ``<run_dir>/checkpoints``) as
 ``global_step_<n>/`` plus ``latest_checkpointed_iteration.txt`` (``verl/trainer/ppo/v1/trainer_base.py``);
@@ -126,7 +128,6 @@ class VerlBackend:
         self._custom_python = bool(python or extra.get("verl_python"))
         self._proc: subprocess.Popen[bytes] | None = None
         self._cancel = threading.Event()
-        self._reporter: RunReporter | None = None
 
     # -- staging ------------------------------------------------------------------------
     def prepare(self, config: RunConfig, run_dir: str | Path, *, resume: bool = False) -> list[str]:
@@ -163,16 +164,12 @@ class VerlBackend:
 
     # -- lifecycle ----------------------------------------------------------------------
     def cancel(self) -> None:
-        """Request cancellation: SIGTERM to the verl driver (``ray job stop`` semantics)."""
+        """Request cancellation: ``run`` sends SIGTERM to the verl driver (``ray job stop``
+        semantics) the next time it looks, at most :attr:`poll_seconds` later. This only sets an
+        event, so that the signal handler can call it: the handler runs on the main thread in the
+        middle of whatever that thread is doing, and must not wait for the reporter's lock, which
+        the thread may hold (see :func:`monorl.core.signals.signal_guard`)."""
         self._cancel.set()
-        proc = self._proc
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.send_signal(signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            if self._reporter is not None:
-                self._reporter.log("cancel requested: sent SIGTERM to verl driver")
 
     def run(
         self,
@@ -214,7 +211,6 @@ class VerlBackend:
                     stderr=subprocess.STDOUT,
                 )
                 reporter.set_status("running", "verl started", step=0, child_pid=self._proc.pid)
-                self._reporter = reporter
                 self._wait(run_dir, reporter)
             returncode = self._proc.returncode
         finally:
@@ -268,6 +264,8 @@ class VerlBackend:
             link_checkpoints(run_dir)
             if self._cancel.is_set():
                 if deadline is None:
+                    proc.send_signal(signal.SIGTERM)
+                    reporter.log("cancel requested: sent SIGTERM to verl driver")
                     deadline = time.monotonic() + self.grace_seconds
                 elif time.monotonic() > deadline:
                     reporter.log("verl driver did not exit in time: sending SIGKILL")

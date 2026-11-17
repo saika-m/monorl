@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -274,6 +276,44 @@ def test_cancel_propagates_sigterm(
     assert result.final_step == 2
     assert read_status(run_dir)["state"] == "cancelled"
     assert "cancel requested" in (run_dir / "run.log").read_text()
+
+
+@pytest.fixture
+def signals_in_a_status_write(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
+    """``send(*signals)``: the main thread gets them, one after the other, in the middle of the
+    first write of ``status.json`` that reports a step of the driver. That write is
+    ``RunReporter.set_status`` in the backend's wait loop, which holds the reporter's lock."""
+    from monorl.core import reporting
+
+    write, pending = reporting._atomic_write_json, []
+
+    def write_and_signal(path: Path, payload: dict) -> None:
+        write(path, payload)
+        if pending and payload["state"] == "running" and payload["step"] >= 1:
+            signals = list(pending)
+            pending.clear()
+            for sig in signals:
+                signal.raise_signal(sig)
+
+    monkeypatch.setattr(reporting, "_atomic_write_json", write_and_signal)
+    return pending.extend
+
+
+@pytest.mark.timeout(60)
+def test_a_signal_during_a_write_of_the_reporter_cancels_instead_of_hanging(
+    make_config, tmp_path: Path, fake_entry: Path, monkeypatch: pytest.MonkeyPatch, signals_in_a_status_write
+):
+    """The handler runs on the main thread, here while that thread holds the reporter's lock: a
+    handler that logged would wait for the lock for ever (the timeout ends the test then)."""
+    monkeypatch.setenv("FAKE_ENTRY_MODE", "hang")
+    cfg = make_config()
+    run_dir = tmp_path / "run"
+    signals_in_a_status_write([signal.SIGTERM])
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert result.state == "cancelled" and result.error is None
+    assert read_status(run_dir)["state"] == "cancelled"
+    assert "cancel requested: sent SIGTERM to verl driver" in (run_dir / "run.log").read_text()
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
 def test_checkpoint_helpers(tmp_path: Path):

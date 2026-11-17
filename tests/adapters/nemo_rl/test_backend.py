@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -248,6 +249,40 @@ def test_run_reports_failure(
     assert result.state == "failed" and "code 3" in result.error
     assert result.final_step == 2 and read_status(run_dir)["state"] == "failed"
     assert "boom" in (run_dir / "run.log").read_text()
+
+
+class _SignallingReporter(RunReporter):
+    """Raises ``signals``, one after the other, on the thread that writes the child's line ``at``
+    to ``run.log``: the main thread, which copies the child's output while ``run`` waits."""
+
+    def __init__(self, run_dir: Path, *, at: str, signals: list[signal.Signals]) -> None:
+        super().__init__(run_dir, echo=False)
+        self.at, self.signals = at, signals
+
+    def log(self, message: str) -> None:
+        super().log(message)
+        if message == self.at:
+            signals, self.signals = self.signals, []
+            for sig in signals:
+                signal.raise_signal(sig)
+
+
+def test_a_child_that_logs_while_it_shuts_down_is_not_held_up(
+    python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM while NeMo-RL runs. The child gets it and logs more than its pipe holds before it
+    exits: the backend has to go on copying its output. A handler that waits for the child on the
+    main thread reads nothing, the child blocks on its output and is killed after 30 seconds."""
+    monkeypatch.setenv("FAKE_NEMO_RL_SLEEP", "chatty")
+    run_dir = tmp_path / "run"
+    reporter = _SignallingReporter(run_dir, at="sleeping", signals=[signal.SIGTERM])
+    result = NemoRLBackend().run(python_launch, run_dir, reporter=reporter)
+    assert result.state == "cancelled"
+    status = read_status(run_dir)
+    assert status["state"] == "cancelled" and status["returncode"] == 0  # it ended on its own
+    log = (run_dir / "run.log").read_text()
+    assert "shutting down 3999" in log and "shutdown complete" in log
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
 def test_cancel_propagates_to_child(
