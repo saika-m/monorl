@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 
 import httpx
@@ -230,6 +231,22 @@ def test_failed_judgments_of_a_call_are_counted_by_kind_in_one_warning(traj, cap
         "reward quality: 3 of 5 judgments failed and scored 0 (2x HTTPStatusError: 403 Forbidden, "
         """1x no_score); the endpoint said: '{"error":"key has no access to judge-1"}'"""
     ]
+
+
+def test_retries_leave_the_process_wide_random_generator_alone(traj):
+    calls: list[int] = []
+    waits: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(len(calls))
+        return httpx.Response(502) if len(calls) % 2 else _reply("<score>7</score>")
+
+    # a run seeds that generator and saves its state with a checkpoint; the loop and the judge's
+    # workers would otherwise draw from one stream
+    state = random.getstate()
+    results = _judge(handler, waits, max_workers=2)([traj("a"), traj("b"), traj("c")])
+    assert [r.score for r in results] == [0.7] * 3 and len(waits) == 3
+    assert random.getstate() == state
 
 
 def test_the_waits_of_a_judgment_stay_within_retry_max_wait_s(traj):

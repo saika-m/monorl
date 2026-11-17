@@ -153,6 +153,9 @@ class LLMJudgeReward:
         if not (self.retry_backoff_s >= 0 and self.retry_max_wait_s >= 0):
             raise ValueError("llm_judge: retry_backoff_s and retry_max_wait_s must not be negative")
         self._wait = wait or threading.Event.wait
+        # A generator of its own: the process-wide one is seeded by the run and saved with its
+        # checkpoints, and a retry must not move it.
+        self._jitter = random.Random()
         self.scope = str(params.get("scope", "last"))
         self.reference_key = params.get("reference_key")
 
@@ -195,7 +198,7 @@ class LLMJudgeReward:
             return None
         if attempt >= self.max_attempts:
             return None
-        return max(math.ldexp(self.retry_backoff_s, attempt - 1) * random.uniform(0.5, 1.0), asked)
+        return max(math.ldexp(self.retry_backoff_s, attempt - 1) * self._jitter.uniform(0.5, 1.0), asked)
 
     def _failed(self, attempts: int, **info: Any) -> RewardResult:
         if attempts > 1:
