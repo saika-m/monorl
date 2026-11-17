@@ -99,10 +99,10 @@ def test_same_device_reuses_staged_values_without_stale_update_cache(
         assert MonorlWorkerExtension.monorl_update_weights(worker, policy, draft) == 5
         MonorlWorkerExtension.monorl_refresh_drafter(worker)
         assert Counter(name for name, _ in moves) == Counter({name: 1 for name in expected})
-        for name, tensor in policy:
-            assert target_inputs[name] is draft_inputs[name]
-            assert target_inputs[name] is not tensor
+        for name, _ in policy:  # the drafter is offered the policy's stream too, on its device
             assert target_inputs[name].device == target.weight.device
+            assert draft_inputs[name].device == drafter.weight.device
+            assert torch.equal(draft_inputs[name].cpu(), expected[name])
         _assert_values(target.loaded[-len(policy) :], {name: expected[name] for name, _ in policy})
         _assert_values(drafter.loaded[-len(draft) :], {name: expected[name] for name, _ in draft})
         assert all(tensor.device == drafter.weight.device for _, tensor in drafter.loaded[-len(draft) :])
@@ -125,7 +125,6 @@ def test_different_devices_get_independent_staging(fake_vllm, monkeypatch: pytes
     for name, tensor in policy:
         assert target_inputs[name].device.type == "cpu"
         assert draft_inputs[name].device.type == "meta"
-        assert target_inputs[name] is not draft_inputs[name]
         assert [destination for moved, destination in moves if moved == name] == ["cpu", "meta"]
         assert torch.equal(target_inputs[name], tensor)
     for name, tensor in draft:

@@ -162,11 +162,12 @@ already-resident inputs still need no device copy. This applies to ROCm through 
 API without changing the quantized-head refresh or sampling behavior.
 
 The staged policy buffers remain live until both loaders consume them, within the current RPC
-payload, and are not cached across updates. Native payloads are controlled by
-`rollout.extra.chunk_bytes` (except an individual oversized tensor); the HTTP endpoint sends one
-tensor per call. Reuse can increase transient memory during target loading compared with streaming
-and re-copying, so this is not a promise of lower peak device memory. Loaders must treat borrowed
-weight inputs as read-only, as the existing on-device input path already requires.
+payload, and are not cached across updates. A payload carries at most `rollout.extra.chunk_bytes`
+of tensors in process (512 MiB by default) and `rollout.extra.weight_request_bytes` of them in
+server mode (64 MiB by default), unless a single tensor is larger. Reuse can increase transient
+memory during target loading compared with streaming and re-copying, so this is not a promise of
+lower peak device memory. Loaders must treat borrowed weight inputs as read-only, as the existing
+on-device input path already requires.
 
 transformers 5.22 can load MTP layers but not write them: `MtpModel` is not saved with the
 model, and reverting its key renamings produces invalid keys. monorl records, when it loads the
