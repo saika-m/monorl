@@ -492,7 +492,7 @@ Rewards and episodes (`train` rows of the RL loop, `src/monorl/orchestrator/metr
 | Metric | Meaning |
 |---|---|
 | `reward/mean`, `reward/std` | mean and population standard deviation of episode rewards |
-| `reward/<name>` | mean of one reward part over all episodes: a reward function's name (`reward/exact_match`), `env`, `overlong_penalty` |
+| `reward/<name>` | mean of one reward part over all episodes: a reward function's name (`reward/exact_match`), `env`, `overlong_penalty`; what a function reports besides its score is `reward/<name>/<entry>` (`reward/llm_judge/failed`, [REWARDS.md](REWARDS.md)) |
 | `reward/success_rate` | share of episodes with `reward >= logging.success_threshold` |
 | `reward/pass_at_k` | share of prompt groups with at least one successful episode; only when a group has 2 or more episodes |
 | `episode/turns_mean`, `episode/turns_max` | policy turns per episode |
