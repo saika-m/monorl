@@ -175,8 +175,16 @@ class VerlBackend:
                 self._reporter.log("cancel requested: sent SIGTERM to verl driver")
 
     def run(
-        self, config: RunConfig, run_dir: Path, *, reporter: RunReporter, resume: bool = False
+        self,
+        config: RunConfig,
+        run_dir: Path,
+        *,
+        reporter: RunReporter,
+        resume: bool = False,
+        cancel: threading.Event | None = None,
     ) -> RunResult:
+        """``cancel`` is not read: while the child runs, the signals of this process are handled
+        here (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
         run_dir = Path(run_dir).expanduser().resolve()
         if not self._custom_python and not is_available():
             raise BackendUnavailable("pipeline_backend 'verl' needs `pip install monorl[verl]` (verl>=0.9.1)")

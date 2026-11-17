@@ -188,8 +188,16 @@ class NemoRLBackend:
 
     # -- run -----------------------------------------------------------------------------
     def run(
-        self, config: RunConfig, run_dir: Path, *, reporter: RunReporter, resume: bool = False
+        self,
+        config: RunConfig,
+        run_dir: Path,
+        *,
+        reporter: RunReporter,
+        resume: bool = False,
+        cancel: threading.Event | None = None,
     ) -> RunResult:
+        """``cancel`` is not read: while the child runs, the signals of this process are handled
+        here (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
         run_dir = Path(run_dir).expanduser().resolve()
         home = nemo_rl_home(config)
         self._cancelled.clear()
