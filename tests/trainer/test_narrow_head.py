@@ -96,7 +96,8 @@ def test_a_step_is_that_of_the_logits_at_every_position(
     assert not torch.allclose(lp_a, old_a, atol=1e-3)  # and the two steps moved the policy
     if case == "ppo":
         assert values_a.abs().max() > 0
-        torch.testing.assert_close(values_a, values_b, atol=1e-6, rtol=0)
+        # relative: after two SGD steps the estimates are far from zero, and a float32 has 7 digits
+        torch.testing.assert_close(values_a, values_b, atol=1e-6, rtol=1e-5)
 
 
 def test_an_mtp_step_is_that_of_the_logits_at_every_position(tmp_path: Path) -> None:
