@@ -679,7 +679,10 @@ def test_patches_list_and_status(runner: CliRunner, monkeypatch: pytest.MonkeyPa
     assert result.exit_code == 0 and "patches: trl" in result.output and "patches: vllm" not in result.output
 
     result = runner.invoke(app, ["patches", "status", "nothing"])
-    assert result.exit_code == 0 and "no patches registered" in result.output
+    assert result.exit_code == 1
+    message = " ".join(result.output.split())
+    assert "no patches are registered for 'nothing'; frameworks with patches: trl, vllm" in message
+    assert runner.invoke(app, ["patches", "status", "nothing", "--json"]).exit_code == 1
 
 
 def test_patches_apply_reports(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:

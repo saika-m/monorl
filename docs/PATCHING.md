@@ -70,9 +70,14 @@ is true when nothing failed.
 ```
 monorl patches list                 # every registered patch, per framework
 monorl patches status [FRAMEWORK]   # applicable / applied / verified against installed versions
-monorl patches apply FRAMEWORK      # apply now (also happens automatically, see below)
+monorl patches apply FRAMEWORK      # apply in this process and report which patches took
 monorl doctor                       # frameworks table shows applicable/applied/total counts
 ```
+
+`patches status` with a framework that has no patchset is an error that names the frameworks
+that have one. `patches apply` writes nothing to the installed package: a run applies the patches
+itself when it builds a component of the framework (see below), so the command is a check that
+they apply to the installed version.
 
 `PatchStatus` fields: `id, target, version_spec, installed_version, applicable, applied,
 verified, reason, framework, mode, description`. `verified` is `None` when the target was not

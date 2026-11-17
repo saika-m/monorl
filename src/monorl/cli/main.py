@@ -389,7 +389,13 @@ def patches_status(
     """Show applicability / applied / verified state of patches against installed versions."""
     patching = _patching_module()
     _load_adapters()
-    frameworks = [framework] if framework else patching.registered_frameworks()
+    registered = patching.registered_frameworks()
+    if framework is not None and framework not in registered:
+        _fail(
+            f"no patches are registered for {framework!r}; "
+            f"frameworks with patches: {', '.join(registered) or '(none)'}"
+        )
+    frameworks = [framework] if framework else registered
     if as_json:
         typer.echo(
             json.dumps({fw: [s.to_dict() for s in patching.status(fw)] for fw in frameworks}, indent=2)
