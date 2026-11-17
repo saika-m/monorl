@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from monorl.config.loader import mask_secrets
 from monorl.config.pipeline import PipelineConfig, RejectionSampleStage, TrainStage
 from monorl.config.schema import DataConfig, RunConfig
 from monorl.core.reporting import FINAL_DIR
@@ -110,7 +111,7 @@ class Manifest:
         self.updated_at = time.time()
         path = Path(self.run_dir) / MANIFEST_FILE
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2, default=str))
+        tmp.write_text(json.dumps(mask_secrets(self.to_dict()), indent=2, default=str))
         os.replace(tmp, path)
 
     @classmethod

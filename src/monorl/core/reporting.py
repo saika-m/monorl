@@ -46,8 +46,10 @@ _MAX_JSON_DEPTH = 12
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    from monorl.config.loader import mask_secrets  # monorl.config imports this package
+
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, default=str))
+    tmp.write_text(json.dumps(mask_secrets(payload), indent=2, default=str))
     os.replace(tmp, path)
 
 
@@ -158,7 +160,11 @@ class RunReporter:
 
     # -- log -----------------------------------------------------------------------------
     def log(self, message: str) -> None:
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        from monorl.config.loader import mask_secrets  # monorl.config imports this package
+
+        # A message that quotes a value of the config (an error of a reward, a URL with its key)
+        # names the variable instead, as config.yaml does.
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {mask_secrets(message)}"
         with self._lock, open(self.run_dir / LOG_FILE, "a") as f:
             f.write(line + "\n")
         if self._echo:
