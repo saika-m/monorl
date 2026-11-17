@@ -5,9 +5,11 @@ Params:
     model: judge model name (required).
     api_key_env: environment variable holding the bearer token (default ``OPENAI_API_KEY``;
         missing variable → no ``Authorization`` header, which local servers accept).
-    rubric: prompt template with ``{prompt}``, ``{response}``, ``{reference}`` placeholders;
-        the judge must answer with ``<score>N</score>``.
-    system_prompt: optional system message.    max_score: scale of ``N`` (default 10).
+    rubric: ``str.format`` template with ``{prompt}``, ``{response}``, ``{reference}`` and
+        ``{max_score}`` placeholders (a literal brace is ``{{`` or ``}}``); the judge must
+        answer with ``<score>N</score>``.
+    system_prompt: optional system message.
+    max_score: scale of ``N`` (default 10; above 0).
     normalize: divide the score by ``max_score`` (default ``True`` → reward in ``[0, 1]``).
     temperature (0.0), max_tokens (512), timeout_s (60), max_workers (8),
     extra_body: dict merged into the request body.
@@ -18,6 +20,7 @@ Factory kwargs: ``client=httpx.Client(...)`` injects a transport (tests use ``Mo
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Sequence
@@ -60,8 +63,17 @@ class LLMJudgeReward:
             raise ValueError("llm_judge needs params.base_url and params.model")
         self.model = str(model)
         self.rubric = str(params.get("rubric", DEFAULT_RUBRIC))
+        try:
+            self.rubric.format(prompt="", response="", reference="", max_score=0)
+        except (KeyError, IndexError, ValueError, AttributeError) as e:
+            raise ValueError(
+                "llm_judge: rubric is a str.format template that may use {prompt}, {response}, "
+                f"{{reference}} and {{max_score}}; write a literal brace as {{{{ or }}}} ({type(e).__name__}: {e})"
+            ) from None
         self.system_prompt = params.get("system_prompt")
         self.max_score = float(params.get("max_score", 10))
+        if not 0 < self.max_score < math.inf:
+            raise ValueError("llm_judge: max_score must be a number above 0")
         self.normalize = bool(params.get("normalize", True))
         self.temperature = float(params.get("temperature", 0.0))
         self.max_tokens = int(params.get("max_tokens", 512))
@@ -118,10 +130,11 @@ class LLMJudgeReward:
             return RewardResult(
                 score=0.0, breakdown={self.name: 0.0}, info={"error": f"{type(e).__name__}: {e}"}
             )
-        raw = parse_score(content)
+        # ``content`` is null when the judge spent its tokens on reasoning, refused, or called a tool.
+        raw = parse_score(content) if isinstance(content, str) else None
         if raw is None:
             if self.on_error == "raise":
-                raise ValueError(f"llm_judge: no <score> tag in judge output: {content[:200]!r}")
+                raise ValueError(f"llm_judge: no <score> tag in judge output: {str(content)[:200]!r}")
             return RewardResult(
                 score=0.0, breakdown={self.name: 0.0}, info={"error": "no_score", "judge_output": content}
             )

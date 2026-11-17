@@ -13,6 +13,16 @@ def _mock_client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler), base_url="http://placeholder")
 
 
+def _reply(content) -> httpx.Response:
+    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+
+def _judge(handler, **params):
+    return registry.get("reward", "llm_judge")(
+        {"base_url": "http://j", "model": "m", **params}, client=_mock_client(handler)
+    )
+
+
 def test_parse_score():
     assert parse_score("Reasoning...\n<score>7</score>") == 7.0
     assert parse_score("<SCORE> 3.5 </SCORE>") == 3.5
@@ -95,6 +105,38 @@ def test_llm_judge_error_handling(traj):
         strict([traj("a")])
 
 
+def test_a_reply_without_text_is_a_judgment_without_a_score(traj):
+    result = _judge(lambda request: _reply(None))([traj("a")])[0]
+    assert result.score == 0.0 and result.info == {"error": "no_score", "judge_output": None}
+    with pytest.raises(ValueError, match="no <score> tag"):
+        _judge(lambda request: _reply(None), on_error="raise")([traj("a")])
+
+
 def test_llm_judge_requires_endpoint_params():
     with pytest.raises(ValueError):
         registry.get("reward", "llm_judge")({"model": "m"})
+
+
+@pytest.mark.parametrize(
+    ("params", "message"),
+    [
+        ({"rubric": 'Reply as JSON: {"score": N}\n{response}'}, "literal brace"),
+        ({"rubric": "{response} {}"}, "literal brace"),
+        ({"max_score": 0}, "max_score"),
+    ],
+)
+def test_llm_judge_rejects_params_it_cannot_run_with(params, message):
+    with pytest.raises(ValueError, match=message):
+        registry.get("reward", "llm_judge")({"base_url": "http://j", "model": "m", **params})
+
+
+def test_a_rubric_may_hold_escaped_braces(traj):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["messages"][-1]["content"])
+        return _reply("<score>7</score>")
+
+    fn = _judge(handler, rubric='Grade {response} like {{"score": N}}, then <score>N</score>.')
+    assert fn([traj("this")])[0].score == 0.7
+    assert seen == ['Grade this like {"score": N}, then <score>N</score>.']
