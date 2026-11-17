@@ -634,10 +634,12 @@ inline const char* reason(int status) {
     switch (status) {
         case 200: return "OK";
         case 400: return "Bad Request";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
         case 500: return "Internal Server Error";
         default: return "Error";
     }
@@ -652,6 +654,32 @@ inline std::string response(int status, const std::string& body, bool keep_alive
       << extra_headers << "\r\n"
       << body;
     return o.str();
+}
+
+/// The http transport is for environment clients, not for browsers: a page open in a browser
+/// on the machine of the server can send requests to it. Returns the error for a request a page
+/// can send, nullopt for any other. Browsers add Origin to every request a page sends to another
+/// site and to every POST, also to its own site; the body types a page can send to another site
+/// without asking first are text/plain and the two form types, never application/json.
+inline std::optional<Error> refusal(const HttpRequest& req) {
+    if (req.headers.count("origin")) {
+        return Error("forbidden",
+                     "request refused: it carries an Origin header, which browsers add to the requests of web "
+                     "pages; an environment server answers environment clients only. Send the request without "
+                     "Origin (monorl's clients and curl send none)",
+                     403);
+    }
+    if (req.method == "POST") {
+        auto it = req.headers.find("content-type");
+        std::string content_type = it == req.headers.end() ? "" : it->second;
+        if (lower(trim(content_type.substr(0, content_type.find(';')))) != "application/json") {
+            return Error("unsupported_media_type",
+                         "request refused: the body of a POST must be sent with Content-Type: application/json, got " +
+                             json(content_type.substr(0, 80)).dump(-1, ' ', false, json::error_handler_t::replace),
+                         415);
+        }
+    }
+    return std::nullopt;
 }
 
 inline void handle_connection(int fd, Handler& handler) {
@@ -672,7 +700,12 @@ inline void handle_connection(int fd, Handler& handler) {
         int status = 200;
         json resp;
         std::string extra;
-        if (op == "spec" || op == "health") {
+        if (auto refused = refusal(req)) {
+            status = refused->status();
+            resp = refused->envelope();
+            std::cerr << "[mep] " << req.method << ' ' << json(req.path).dump(-1, ' ', false, json::error_handler_t::replace)
+                      << ": " << refused->what() << std::endl;
+        } else if (op == "spec" || op == "health") {
             if (req.method != "GET" && req.method != "POST") {
                 status = 405;
                 resp = Error("method_not_allowed", "use GET or POST for /" + op, 405).envelope();
