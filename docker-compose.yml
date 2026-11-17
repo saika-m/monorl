@@ -1,5 +1,6 @@
 # monorl local stack.
-#   docker compose up --build                 # UI on http://localhost:8000 + a fleet of 4 wordle env servers
+#   docker compose up --build                 # UI on port 8000 + a fleet of 4 wordle env servers
+#   docker compose logs ui | grep token=      # the URL that signs a browser in to the UI
 #   docker compose up --scale env-wordle=8    # grow the fleet
 #   docker compose --profile gpu up ray-head  # Ray head node on the vLLM image (needs the NVIDIA runtime)
 #
@@ -9,6 +10,11 @@
 #   env: {type: remote, params: {transport: http, urls: ["http://monorl-env-wordle-1:8080",
 #         "http://monorl-env-wordle-2:8080", "http://monorl-env-wordle-3:8080", "http://monorl-env-wordle-4:8080"]}}
 # From the host the replicas are on localhost:8081-8084.
+#
+# Every port is published on the host's loopback interface only. MONORL_PUBLISH_ADDR names another
+# host address to publish on (0.0.0.0 for all of them), e.g. for Ray workers on other machines; the
+# UI then also needs MONORL_ALLOWED_HOSTS (the names it is reached by) and should get a
+# MONORL_SERVER_TOKEN of your own. See docker/README.md.
 name: monorl
 
 x-aws-env: &aws-env
@@ -27,10 +33,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile.cpu
     ports:
-      - "8000:8000"
+      - "${MONORL_PUBLISH_ADDR:-127.0.0.1}:8000:8000"
     environment:
       <<: *aws-env
       HF_TOKEN: ${HF_TOKEN:-}
+      MONORL_SERVER_TOKEN: ${MONORL_SERVER_TOKEN:-}
+      MONORL_ALLOWED_HOSTS: ${MONORL_ALLOWED_HOSTS:-}
     volumes:
       - ${MONORL_HOME:-~/.monorl}:/root/.monorl
       - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
@@ -52,7 +60,7 @@ services:
     deploy:
       replicas: 4
     ports:
-      - "8081-8084:8080"
+      - "${MONORL_PUBLISH_ADDR:-127.0.0.1}:8081-8084:8080"
     restart: unless-stopped
 
   # Ray head for GPU clusters. Workers join with:
@@ -74,9 +82,9 @@ services:
       - --ray-client-server-port=10001
       - --block
     ports:
-      - "6379:6379"
-      - "8265:8265"
-      - "10001:10001"
+      - "${MONORL_PUBLISH_ADDR:-127.0.0.1}:6379:6379"
+      - "${MONORL_PUBLISH_ADDR:-127.0.0.1}:8265:8265"
+      - "${MONORL_PUBLISH_ADDR:-127.0.0.1}:10001:10001"
     shm_size: 10g
     environment:
       <<: *aws-env

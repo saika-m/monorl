@@ -36,7 +36,7 @@ and `HF_HOME=/root/.cache/huggingface`, and declares `/root/.monorl` and
 
 ```sh
 docker build -f docker/Dockerfile.cpu -t monorl:cpu .
-docker run --rm -p 8000:8000 -v ~/.monorl:/root/.monorl monorl:cpu
+docker run --rm -p 127.0.0.1:8000:8000 -v ~/.monorl:/root/.monorl monorl:cpu
 
 docker build -f docker/Dockerfile.vllm -t monorl:vllm .
 docker run --rm --gpus all --shm-size 10g -v ~/.monorl:/root/.monorl \
@@ -45,13 +45,43 @@ docker run --rm --gpus all --shm-size 10g -v ~/.monorl:/root/.monorl \
 
 docker build -f docker/Dockerfile.envs --build-arg ENV_NAME=go-wordle \
   -t monorl-env:wordle .
-docker run --rm -p 8080:8080 monorl-env:wordle
+docker run --rm -p 127.0.0.1:8080:8080 monorl-env:wordle
 curl -s localhost:8080/spec
 ```
 
 The vLLM commands need a GPU host and have not been run here. The headers of
 `Dockerfile.sglang` and `Dockerfile.verl` hold the matching commands (`Dockerfile.verl` takes
 `--build-arg INFER_BACKEND=... --build-arg TRAIN_BACKEND=...`).
+
+## Ports and sign-in
+
+A run's config names commands, so the UI's API is as powerful as a shell in its container, which
+runs as root with the mounted `~/.monorl`, the Hugging Face cache and the `HF_TOKEN` / `AWS_*`
+variables. The commands above and the compose file therefore publish every port on `127.0.0.1`
+only (`-p 127.0.0.1:8000:8000`; a bare `-p 8000:8000` publishes on every interface of the host),
+and the API needs a token ([docs/WEB_UI.md](../docs/WEB_UI.md#access)).
+
+The CPU image prints the sign-in URL when it starts, `http://127.0.0.1:8000/?token=<token>`
+(`docker compose logs ui` for the compose stack). Open it in a browser on the host; with another
+host port, change the port in the URL. The token is new on every start and is also in
+`~/.monorl/server_token` on the host through the mount. `-e MONORL_SERVER_TOKEN=<token>` sets a
+fixed one (at least 16 characters out of letters, digits and `._~-`).
+
+For a deliberate LAN setup, publish on the address of your choice, name the host the browser
+will use and set a token of your own:
+
+```sh
+docker run --rm -p 8000:8000 -v ~/.monorl:/root/.monorl \
+  -e MONORL_SERVER_TOKEN="$(openssl rand -hex 32)" -e MONORL_ALLOWED_HOSTS=box.lan \
+  monorl:cpu
+```
+
+With compose the same is `MONORL_PUBLISH_ADDR=0.0.0.0 MONORL_ALLOWED_HOSTS=box.lan
+MONORL_SERVER_TOKEN=<token> docker compose up`; `MONORL_PUBLISH_ADDR` applies to the environment
+replicas and to the Ray ports as well, none of which has any authentication (Ray's dashboard
+port 8265 accepts jobs). The connection is plain HTTP. The `docker run` commands of this
+section have not been run here (no Docker daemon); `docker compose config` shows `host_ip:
+127.0.0.1` on every port by default and `0.0.0.0` with `MONORL_PUBLISH_ADDR=0.0.0.0`.
 
 ## `env-entrypoint.sh`
 
@@ -68,9 +98,12 @@ not been run here):
 
 | Service | Image | What it runs |
 |---|---|---|
-| `ui` | `monorl:cpu` (`Dockerfile.cpu`) | `monorl serve` on port 8000; mounts `~/.monorl` and the Hugging Face cache; starts after `env-wordle` is healthy |
+| `ui` | `monorl:cpu` (`Dockerfile.cpu`) | `monorl serve` on port 8000 (sign-in URL in `docker compose logs ui`); mounts `~/.monorl` and the Hugging Face cache; starts after `env-wordle` is healthy |
 | `env-wordle` | `monorl-env:wordle` (`Dockerfile.envs`) | 4 replicas of `go-wordle`, on host ports 8081 to 8084 |
 | `ray-head` | `monorl:vllm` (`Dockerfile.vllm`) | `ray start --head` (ports 6379, 8265, 10001); profile `gpu`, needs the NVIDIA runtime |
+
+All host ports are on `127.0.0.1` unless `MONORL_PUBLISH_ADDR` names another address (see above;
+Ray workers on other machines need it to join the head).
 
 The header of the compose file shows the `env.type: remote` block that addresses the replicas
 one by one.
