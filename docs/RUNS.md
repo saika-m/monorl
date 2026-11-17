@@ -95,6 +95,10 @@ The SFT loop has no rollouts, rewards, environments or weight sync. Each step en
 train stage, so a signal that arrives in the last step of a stage, which ends `succeeded`, still
 stops the pipeline before the next stage ([PIPELINES.md](PIPELINES.md#resume-and-cancellation)).
 
+A pipeline backend gets the same event. `trainer.backend: trl` does what is described above, with
+TRL's checkpoint of the step; `verl` and `nemo_rl` stop their child process without finishing the
+step ([BACKENDS.md](BACKENDS.md#signals-with-a-pipeline-backend)).
+
 A real cancel of an SFT run (`kill -INT` after step 1 was logged, exit code 130):
 
 ```text

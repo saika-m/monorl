@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -90,12 +91,21 @@ def map_metrics(logs: dict[str, Any], *, sft: bool = False) -> dict[str, float]:
 class ReporterCallback(TrainerCallback):
     """Writes ``metrics.jsonl``/``status.json``, sends every metrics row to the sinks of
     ``logging.wandb_project`` and ``logging.tensorboard`` as well, and mirrors TRL checkpoints as
-    ``step-<n>`` entries."""
+    ``step-<n>`` entries. Once ``cancel`` is set (the first SIGINT or SIGTERM of the run), the
+    step in flight is the last one: see :meth:`on_step_end`."""
 
-    def __init__(self, reporter: RunReporter, *, sft: bool = False, label: str = "GRPOTrainer") -> None:
+    def __init__(
+        self,
+        reporter: RunReporter,
+        *,
+        sft: bool = False,
+        label: str = "GRPOTrainer",
+        cancel: threading.Event | None = None,
+    ) -> None:
         self.reporter = reporter
         self.sft = sft
         self.label = label
+        self.cancel = cancel
         self.last_metrics: dict[str, float] = {}
         self._sinks: MetricSinks | None = None
 
@@ -127,6 +137,16 @@ class ReporterCallback(TrainerCallback):
         self.reporter.log_metrics(int(state.global_step), metrics, phase=phase)
         if self._sinks is not None:
             self._sinks.log(int(state.global_step), metrics)  # under the names of metrics.jsonl
+
+    def on_step_end(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kw: Any
+    ) -> None:
+        """A cancelled run ends with the step that just finished, like the loops of the
+        orchestrator: ``Trainer`` logs the step and saves its checkpoint whatever the logging
+        and saving intervals are, so that a resume continues from it, and leaves its loop."""
+        if self.cancel is not None and self.cancel.is_set() and state.global_step < state.max_steps:
+            self.reporter.log(f"stopping after step {state.global_step} (cancel requested)")
+            control.should_log = control.should_save = control.should_training_stop = True
 
     def on_train_end(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kw: Any

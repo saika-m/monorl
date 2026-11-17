@@ -116,7 +116,7 @@ def _run(
             check_local_model(config)
             ensure_providers(config)
             if config.is_pipeline_backend:
-                result = _run_pipeline(config, reporter, resume)
+                result = _run_pipeline(config, reporter, resume, cancel)
             elif config.is_sft:
                 result = SFTLoop(config, reporter, cancel=cancel, resume=resume).run()
             else:
@@ -155,9 +155,11 @@ def _run(
     return result
 
 
-def _run_pipeline(config: RunConfig, reporter: RunReporter, resume: bool) -> RunResult:
+def _run_pipeline(
+    config: RunConfig, reporter: RunReporter, resume: bool, cancel: threading.Event
+) -> RunResult:
     backend = registry.get("pipeline_backend", config.trainer.backend)(config)
-    result = backend.run(config, reporter.run_dir, reporter=reporter, resume=resume)
+    result = backend.run(config, reporter.run_dir, reporter=reporter, resume=resume, cancel=cancel)
     if not result.checkpoints:
         result.checkpoints = list_checkpoints(reporter.run_dir)
     return result

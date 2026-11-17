@@ -8,7 +8,8 @@ rewards → TRL reward function (:mod:`.rewards`), monorl environments → TRL `
 reporter ← ``TrainerCallback`` + the ``trl.grpo.monorl_hooks`` patch (:mod:`.callbacks`,
 :mod:`.patches`). Both trainers share checkpointing (``checkpoints/step-<n>``), resume
 (``Trainer.train(resume_from_checkpoint=...)`` with the newest complete ``checkpoint-<n>``, only
-when the run was started with ``--resume``) and the merged ``final/`` export.
+when the run was started with ``--resume``), the merged ``final/`` export, and the end of a
+cancelled run: after the step the first signal arrived in, with the checkpoint of that step.
 """
 
 from __future__ import annotations
@@ -125,7 +126,13 @@ class TRLPipelineBackend:
 
     # -- PipelineBackend ---------------------------------------------------------------------
     def run(
-        self, config: RunConfig, run_dir: Path, *, reporter: RunReporter, resume: bool = False
+        self,
+        config: RunConfig,
+        run_dir: Path,
+        *,
+        reporter: RunReporter,
+        resume: bool = False,
+        cancel: threading.Event | None = None,
     ) -> RunResult:
         run_dir = Path(run_dir)
         trl = _import_trl()
@@ -141,7 +148,7 @@ class TRLPipelineBackend:
         )
         if config.is_sft:
             args = compile_sft_config(config, run_dir, device=device)
-            callback = ReporterCallback(reporter, sft=True, label="SFTTrainer")
+            callback = ReporterCallback(reporter, sft=True, label="SFTTrainer", cancel=cancel)
             trainer_cls, loss_kwargs = trl.SFTTrainer, {}
             smoothing = sft_label_smoothing(config)
             if smoothing > 0:
@@ -161,11 +168,11 @@ class TRLPipelineBackend:
             )
         else:
             args = compile_grpo_config(config, run_dir, device=device)
-            callback = ReporterCallback(reporter)
+            callback = ReporterCallback(reporter, cancel=cancel)
             trainer = self._build_grpo_trainer(
                 trl, config, args, model, tokenizer, processing_class, train_ds, eval_ds, callback, reporter
             )
-        return self._train(trainer, args, tokenizer, callback, run_dir, reporter, resume)
+        return self._train(trainer, args, tokenizer, callback, run_dir, reporter, resume, cancel)
 
     # -- internals ---------------------------------------------------------------------------
     def _build_grpo_trainer(
@@ -245,6 +252,7 @@ class TRLPipelineBackend:
         run_dir: Path,
         reporter: RunReporter,
         resume: bool,
+        cancel: threading.Event | None,
     ) -> RunResult:
         from transformers import PrinterCallback
 
@@ -267,7 +275,16 @@ class TRLPipelineBackend:
         with _sigterm_as_interrupt():
             try:
                 trainer.train(resume_from_checkpoint=resume_from)
-                final_path = str(self._save_final(trainer, tokenizer, run_dir / FINAL_DIR))
+                # The callback ended the training after the step the first signal arrived in. A
+                # signal in the last step leaves nothing to cancel, as in the orchestrator's loops.
+                if (
+                    cancel is not None
+                    and cancel.is_set()
+                    and trainer.state.global_step < trainer.state.max_steps
+                ):
+                    state = "cancelled"
+                else:
+                    final_path = str(self._save_final(trainer, tokenizer, run_dir / FINAL_DIR))
             # Trainer.train calls no callback when it raises: the sinks are closed here, inside
             # the handlers, where they still see the exception and end the W&B run as failed.
             except KeyboardInterrupt:

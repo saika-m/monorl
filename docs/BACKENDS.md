@@ -348,6 +348,60 @@ starts at step 0 and `run.log` says so. Without `--resume` no backend continues 
   of step `n`, so a run killed in between has no such row. Not run here: the tests use the fake
   checkout, whose training script continues after the newest `step_<n>` as NeMo-RL does.
 
+### Signals with a pipeline backend
+
+[RUNS.md](RUNS.md#cancelling) says what SIGINT and SIGTERM do in a run: the first ends it after
+the step in flight, with a checkpoint of that step, and a second one stops it at once. `run()`
+gives the backend the event that the first signal sets (`PipelineBackend.run(..., cancel=event)`).
+
+* **TRL** trains in the process of `monorl train` and does the same. A callback reads the event at
+  the end of every step. Once it is set, `Trainer` logs that step and saves
+  `checkpoints/checkpoint-<n>` (`step-<n>`), whatever `logging.log_every` and `trainer.save_every`
+  are, and leaves its loop. `final/` is not written, the state is `cancelled`, the exit code 130,
+  and `--resume` continues from that checkpoint. A signal in the last step leaves nothing to
+  cancel and the run ends `succeeded`. A signal that arrives before step 1 has ended, also while
+  the model is loading, ends the run after step 1. A second signal raises `KeyboardInterrupt`
+  inside `Trainer.train`: the state is `cancelled`, and the step it interrupted has no checkpoint.
+  Run here on CPU: `trl_grpo_cpu.yaml` with `trainer.max_steps=4`, `trainer.save_every=4`,
+  `data.limit=8`, `rollout.max_new_tokens=32` and LoRA, SIGINT six seconds into step 1:
+
+  ```text
+  2026-11-17 02:59:30 received SIGINT: finishing the current step, then stopping
+  2026-11-17 02:59:41 stopping after step 1 (cancel requested)
+  2026-11-17 02:59:42 checkpoint saved: .../checkpoints/step-1
+  2026-11-17 02:59:42 [cancelled] cancelled after step 1
+  ```
+
+  `--resume` then logged `resuming from .../checkpoints/checkpoint-1`, trained steps 2 to 4 and
+  ended `succeeded`; `metrics.jsonl` has the row of every step from 1 to 4 once, and
+  `trajectories.jsonl` the 8 episodes of each.
+* **verl** and **NeMo-RL** run the framework in a child process and do not finish the step. What
+  follows is read from the two backends and from the pinned sources; neither was run with a
+  signal here. Common to both: while monorl prepares the run (compiling the config, exporting the
+  data) the event is set and logged like in any run, and the backend does not read it, so the
+  child is started all the same. From the start of the child to its end the backend handles both
+  signals itself, the first and every later one in the same way. The training loops of the two
+  frameworks handle neither signal at the pin (`verl/trainer/`; `nemo_rl/algorithms/grpo.py` and
+  `sft.py`, `examples/run_grpo.py` and `run_sft.py`): the step in flight is lost, no checkpoint
+  is written for the signal, and `--resume` continues from the checkpoint the framework saved
+  last on its own schedule. The run ends `cancelled` with exit code 130.
+  * **verl.** Every signal sends SIGTERM to the driver (`python -m monorl.adapters.verl.entry`)
+    and logs `cancel requested: sent SIGTERM to verl driver`. About 30 seconds after the first
+    one (`VerlBackend.grace_seconds`, checked once a second) a driver that is still running is
+    killed with SIGKILL, after the line `verl driver did not exit in time: sending SIGKILL`. A
+    second signal does not shorten that wait. The status message is `verl run cancelled`, and
+    the step is that of `checkpoints/latest_checkpointed_iteration.txt`, or of the last row of
+    `metrics.jsonl` when verl saved no checkpoint. The driver is in the process group of
+    `monorl train`, so Ctrl-C in a terminal reaches it as SIGINT as well. What the Ray processes
+    of the run do when the driver ends was not looked at.
+  * **NeMo-RL.** The child runs in a session of its own, so Ctrl-C in a terminal reaches only
+    monorl. Every signal sends SIGTERM to the child's process group and then waits, inside the
+    signal handler, for the child to exit; after 30 seconds (`CANCEL_GRACE_SECONDS`) the group
+    gets SIGKILL. While it waits, the child's output is not copied to `run.log`. A second signal
+    does the same again inside the first (SIGTERM, a wait of its own) and does not end the run
+    sooner. The status message is `cancelled by user`, and the step is that of the last row of
+    `metrics.jsonl`.
+
 ## Choosing
 
 * Laptop / CPU / MPS: `hf` + `reference` (or `trl`).

@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import json
+import signal
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from transformers import AutoModelForCausalLM
-from trl_support import ENV_NAME, REWARD_NAME, TwoTurnEnv
+from trl_support import ENV_NAME, REWARD_NAME, TwoTurnEnv, VowelReward
 
 from monorl.adapters.trl.rollout import EpisodeRollout, TrainerPolicyEngine
 from monorl.config.schema import RunConfig
 from monorl.core.registry import registry
 from monorl.core.reporting import RunReporter, iter_metrics, iter_trajectories, list_checkpoints, read_status
+from monorl.core.types import RewardResult, Trajectory
+from monorl.orchestrator import run
 from monorl.patching import is_applied
 
 pytestmark = pytest.mark.slow
@@ -150,6 +154,48 @@ def test_resume_of_a_killed_run_continues_as_the_uninterrupted_run(
     assert all((weights[name] == expected[name]).all() for name in expected)
     moved = load_file(run_dir / "checkpoints" / "checkpoint-2" / "model.safetensors")
     assert any((moved[name] != expected[name]).any() for name in expected)  # steps 3 and 4 did train
+
+
+def test_first_signal_ends_the_run_after_its_step_and_resume_continues_from_it(
+    trl_config: RunConfig, tmp_path: Path
+) -> None:
+    """SIGINT while step 2 of 4 scores its completions. The run ends after that step, cancelled,
+    with TRL's checkpoint of it (no checkpoint was due before step 4), and ``--resume`` trains
+    steps 3 and 4 from there: the rows are those of a run that was not interrupted."""
+    full_dir, run_dir = tmp_path / "full", tmp_path / "cancelled"
+    config = _resume_config(trl_config, 4)
+    config.trainer.save_every = 4
+    assert run(config, full_dir).state == "succeeded"
+
+    class SignalReward(VowelReward):
+        batches = 0
+
+        def __call__(self, trajectories: Sequence[Trajectory]) -> list[RewardResult]:
+            SignalReward.batches += 1
+            if SignalReward.batches == 2:
+                signal.raise_signal(signal.SIGINT)
+            return super().__call__(trajectories)
+
+    registry.register("reward", REWARD_NAME, lambda params, **kw: SignalReward(), overwrite=True)
+    try:
+        result = run(config, run_dir)
+        assert result.state == "cancelled", result.error
+        assert result.final_step == 2 and result.final_model_path is None
+        status = read_status(run_dir)
+        assert status is not None and status["state"] == "cancelled" and status["step"] == 2
+        assert [row["step"] for row in _step_rows(run_dir)] == [1, 2]
+        assert [Path(p).name for p in list_checkpoints(run_dir)] == ["step-2"]
+        assert not (run_dir / "final").exists()
+        log = (run_dir / "run.log").read_text()
+        assert "received SIGINT" in log and "stopping after step 2 (cancel requested)" in log
+
+        resumed = run(config, run_dir, resume=True)
+    finally:
+        registry.register("reward", REWARD_NAME, lambda params, **kw: VowelReward(), overwrite=True)
+    assert resumed.state == "succeeded", resumed.error
+    assert resumed.final_step == 4 and (run_dir / "final" / "config.json").exists()
+    assert f"resuming from {run_dir / 'checkpoints' / 'checkpoint-2'}" in (run_dir / "run.log").read_text()
+    assert _step_rows(run_dir) == _step_rows(full_dir)
 
 
 def test_run_without_resume_trains_from_step_0_next_to_old_checkpoints(
