@@ -7,6 +7,7 @@ dispatch between pipeline backends (trl/verl/nemo_rl own their loop, SFT include
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -47,6 +48,31 @@ def resolve_run_dir(config: RunConfig) -> Path:
     return Path(config.logging.run_root).expanduser() / (config.run_name or default_run_name(config))
 
 
+def check_local_model(config: RunConfig) -> None:
+    """Raise :class:`ConfigError` when ``model.name_or_path`` or ``model.tokenizer_name_or_path``
+    is written as a path (it starts with ``/``, ``./``, ``../`` or ``~``) and is not a directory.
+
+    The loaders (transformers, and the frameworks that load through it) read a string that is no
+    directory as a Hub id, and say of a path only that it is no valid repository name. They take
+    the string as it is written: ``~`` is not expanded, so neither is it here. With
+    ``cluster.ray_address`` the model is loaded on the nodes of that cluster, which may hold a path
+    this machine does not, and nothing is checked."""
+    if config.cluster.mode == "ray" and config.cluster.ray_address:
+        return
+    for key in ("name_or_path", "tokenizer_name_or_path"):
+        path = getattr(config.model, key)
+        if not path or not path.startswith(("/", "./", "../", "~")) or os.path.isdir(path):
+            continue
+        problem = "is a file, not a model directory" if os.path.isfile(path) else "does not exist"
+        if path.startswith("~"):
+            home = os.path.expanduser(path)
+            hint = f"write {home}" if os.path.isdir(home) else f"{home} does not exist either"
+            problem = f"does not exist: '~' is not expanded when a model is loaded ({hint})"
+        elif not os.path.isabs(path):
+            problem += f" (looked for {os.path.abspath(path)})"
+        raise ConfigError(f"model.{key}: the local path {path} {problem}")
+
+
 def run(
     config: RunConfig,
     run_dir: Path | None = None,
@@ -77,6 +103,7 @@ def run(
     with signal_guard(cancel, reporter, "finishing the current step, then stopping"):
         reporter.set_status("running", f"starting {kind} backend {backend!r} (resume={resume})", step=0)
         try:
+            check_local_model(config)
             ensure_providers(config)
             if config.is_pipeline_backend:
                 result = _run_pipeline(config, reporter, resume)
