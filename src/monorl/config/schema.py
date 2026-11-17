@@ -252,7 +252,11 @@ class AlgorithmConfig(_Model):
     clip_eps_high: float | None = Field(None, gt=0.0, description="Asymmetric upper clip (DAPO clip-higher).")
     advantage_norm: Literal["group", "batch", "none"] = Field(
         "group",
-        description="Normalise rewards within the prompt group (GRPO), across the batch, or not at all.",
+        description=(
+            "grpo and dapo: normalise rewards within the prompt group, across the batch, or not at all. "
+            "Not read by rloo, ppo or reinforce, except that verl subtracts the group mean under reinforce "
+            "when this is 'group'."
+        ),
     )
     advantage_std_norm: bool = Field(
         True, description="Divide by std in group normalisation (False = Dr.GRPO style)."
@@ -505,10 +509,21 @@ class RunConfig(_Model):
             if self.env.type != "single_turn":
                 raise ValueError("sft trains on dataset responses; env.type must be 'single_turn'")
             return self
-        if self.algorithm.name in {"grpo", "dapo", "rloo"} and self.rollout.group_size < 2:
-            raise ValueError(f"{self.algorithm.name} needs rollout.group_size >= 2")
-        if self.algorithm.advantage_norm == "group" and self.rollout.group_size < 2:
-            raise ValueError("advantage_norm='group' needs rollout.group_size >= 2")
+        if self.rollout.group_size < 2:
+            if self.algorithm.name in {"grpo", "dapo", "rloo"}:
+                raise ValueError(f"{self.algorithm.name} needs rollout.group_size >= 2")
+            # reinforce and ppo read advantage_norm nowhere but here: verl maps 'group' under reinforce
+            # to REINFORCE++ with the prompt group's mean reward as the baseline.
+            if (
+                self.algorithm.name == "reinforce"
+                and self.trainer.backend == "verl"
+                and self.algorithm.advantage_norm == "group"
+            ):
+                raise ValueError(
+                    "trainer.backend='verl' subtracts the prompt group's mean reward under reinforce with "
+                    "algorithm.advantage_norm='group', which leaves no advantage with rollout.group_size=1; set "
+                    "algorithm.advantage_norm to 'batch' or 'none', or rollout.group_size >= 2"
+                )
         if self.cluster.placement == "disaggregated" and self.cluster.gpus_per_node > 0:
             r, t = self.cluster.rollout_gpus, self.cluster.trainer_gpus
             total = self.cluster.num_nodes * self.cluster.gpus_per_node

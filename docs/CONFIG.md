@@ -91,7 +91,7 @@ See: [ALGORITHMS.md](ALGORITHMS.md), [CREDIT_ASSIGNMENT.md](CREDIT_ASSIGNMENT.md
 | `algorithm.kl_estimator` | `k1`, `k2`, `k3`; default `k3` | KL estimator (Schulman's k1/k2/k3). |
 | `algorithm.clip_eps` | number, > 0.0; default `0.2` | PPO clipping epsilon (lower bound). |
 | `algorithm.clip_eps_high` | number or null, > 0.0; default `null` | Asymmetric upper clip (DAPO clip-higher). |
-| `algorithm.advantage_norm` | `group`, `batch`, `none`; default `group` | Normalise rewards within the prompt group (GRPO), across the batch, or not at all. |
+| `algorithm.advantage_norm` | `group`, `batch`, `none`; default `group` | grpo and dapo: normalise rewards within the prompt group, across the batch, or not at all. Not read by rloo, ppo or reinforce, except that verl subtracts the group mean under reinforce when this is 'group'. |
 | `algorithm.advantage_std_norm` | boolean; default `true` | Divide by std in group normalisation (False = Dr.GRPO style). |
 | `algorithm.loss_agg` | `token`, `sequence`, `rollout`; default `token` | Average the loss over all response tokens, per training sequence first, or per rollout first ('rollout': every episode counts equally however many sequences its turns form). |
 | `algorithm.entropy_coef` | number, >= 0.0; default `0.0` | Weight of the entropy bonus: entropy_coef * entropy is subtracted from the loss. |
