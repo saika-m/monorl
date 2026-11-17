@@ -169,6 +169,8 @@ class Layout:
             image_fields=[f for f in image_fields if f],
         )
         if layout.format not in ("chat", "prompt_answer", "text"):
+            if not columns:
+                raise DataError(f"{config.uri} has no rows, so its format cannot be detected")
             raise DataError(f"could not infer dataset format from columns {sorted(columns)}; set data.format")
         if layout.format == "chat" and not layout.messages_field:
             raise DataError(f"format=chat needs messages_field; columns: {sorted(columns)}")

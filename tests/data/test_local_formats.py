@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,19 @@ def test_missing_and_unsupported(tmp_path: Path) -> None:
     (tmp_path / "bad.jsonl").write_text('{"question": "a", "answer": "b"}\n{not json\n')
     with pytest.raises(DataError, match="invalid JSON"):
         _open(tmp_path / "bad.jsonl")
+
+
+def test_a_file_without_rows_says_so(tmp_path: Path) -> None:
+    """Not "could not infer dataset format from columns []; set data.format": no format has rows."""
+    for name, text in (("empty.jsonl", ""), ("blank.jsonl", "\n\n"), ("array.json", "[]")):
+        path = tmp_path / name
+        path.write_text(text)
+        with pytest.raises(DataError, match=re.escape(f"{path} has no rows")):
+            _open(path)
+    # rows without a text column are a different problem, and are still reported with their columns
+    (tmp_path / "numbers.jsonl").write_text('{"a": 1}\n')
+    with pytest.raises(DataError, match=re.escape("could not infer dataset format from columns ['a']")):
+        _open(tmp_path / "numbers.jsonl")
 
 
 def test_local_streaming_is_lazy_and_len_raises(qa_jsonl: Path) -> None:
