@@ -301,7 +301,7 @@ The native loop: rollout engines and trainers behind monorl's orchestrator.
 | | hf + reference | vLLM | SGLang | Unsloth |
 |---|---|---|---|---|
 | Role | engine + trainer | engine | engine | trainer |
-| Pin | transformers 5.22 | 0.33.0 | 0.5.23 | 2026.10.11 |
+| Pin | transformers 5.22, 5.23 | 0.33.0 | 0.5.23 | 2026.10.11 |
 | Tested here | real, CPU | fakes | fakes | fakes |
 | RL algorithms | GRPO, DAPO, RLOO, REINFORCE, PPO (value head) | any (engine) | any (engine) | GRPO, DAPO, RLOO, REINFORCE, PPO (value head) |
 | Per-turn credit (`credit_assignment: turn`) | yes | any (engine) | any (engine) | yes |

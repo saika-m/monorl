@@ -14,7 +14,7 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 
 | Framework | Pin | Role | `RunConfig` selector |
 |---|---|---|---|
-| transformers | 5.22 | rollout engine | `rollout.backend: hf` |
+| transformers | 5.22, 5.23 | rollout engine | `rollout.backend: hf` |
 | reference trainer (torch) | – | trainer (full / LoRA via peft) | `trainer.backend: reference` |
 | vLLM | 0.33.0 | rollout engine | `rollout.backend: vllm` |
 | SGLang | 0.5.23 | rollout engine | `rollout.backend: sglang` |
