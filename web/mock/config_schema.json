@@ -1,0 +1,1288 @@
+{
+  "$defs": {
+    "AlgorithmConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "default": "grpo",
+          "description": "Policy-gradient objective, or 'sft' for supervised fine-tuning on the dataset responses (no rollouts).",
+          "enum": [
+            "grpo",
+            "dapo",
+            "rloo",
+            "reinforce",
+            "ppo",
+            "sft"
+          ],
+          "title": "Name",
+          "type": "string"
+        },
+        "sft_label_smoothing": {
+          "default": 0.0,
+          "description": "Label smoothing for sft.",
+          "exclusiveMaximum": 1.0,
+          "minimum": 0.0,
+          "title": "Sft Label Smoothing",
+          "type": "number"
+        },
+        "sft_train_on_prompt": {
+          "default": false,
+          "description": "sft: include prompt tokens in the loss (default: response only).",
+          "title": "Sft Train On Prompt",
+          "type": "boolean"
+        },
+        "sft_turns": {
+          "default": "last",
+          "description": "sft: assistant turns of a conversation that carry the loss. 'last': only the final one, earlier turns are context. 'all': every assistant turn (multi-turn and tool-using conversations), except those a row marks with 'weight': 0.",
+          "enum": [
+            "last",
+            "all"
+          ],
+          "title": "Sft Turns",
+          "type": "string"
+        },
+        "kl_coef": {
+          "default": 0.0,
+          "description": "Coefficient of the KL penalty to the reference policy (0 disables).",
+          "minimum": 0.0,
+          "title": "Kl Coef",
+          "type": "number"
+        },
+        "kl_estimator": {
+          "default": "k3",
+          "description": "KL estimator (Schulman's k1/k2/k3).",
+          "enum": [
+            "k1",
+            "k2",
+            "k3"
+          ],
+          "title": "Kl Estimator",
+          "type": "string"
+        },
+        "clip_eps": {
+          "default": 0.2,
+          "description": "PPO clipping epsilon (lower bound).",
+          "exclusiveMinimum": 0.0,
+          "title": "Clip Eps",
+          "type": "number"
+        },
+        "clip_eps_high": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Asymmetric upper clip (DAPO clip-higher).",
+          "title": "Clip Eps High"
+        },
+        "advantage_norm": {
+          "default": "group",
+          "description": "grpo and dapo: normalise rewards within the prompt group, across the batch, or not at all. Not read by rloo, ppo or reinforce, except that verl subtracts the group mean under reinforce when this is 'group'.",
+          "enum": [
+            "group",
+            "batch",
+            "none"
+          ],
+          "title": "Advantage Norm",
+          "type": "string"
+        },
+        "advantage_std_norm": {
+          "default": true,
+          "description": "Divide by std in group normalisation (False = Dr.GRPO style).",
+          "title": "Advantage Std Norm",
+          "type": "boolean"
+        },
+        "loss_agg": {
+          "default": "token",
+          "description": "Average the loss over all response tokens, per training sequence first, or per rollout first ('rollout': every episode counts equally however many sequences its turns form).",
+          "enum": [
+            "token",
+            "sequence",
+            "rollout"
+          ],
+          "title": "Loss Agg",
+          "type": "string"
+        },
+        "entropy_coef": {
+          "default": 0.0,
+          "description": "Weight of the entropy bonus: entropy_coef * entropy is subtracted from the loss.",
+          "minimum": 0.0,
+          "title": "Entropy Coef",
+          "type": "number"
+        },
+        "num_epochs": {
+          "default": 1,
+          "description": "Optimizer passes over each rollout batch.",
+          "minimum": 1,
+          "title": "Num Epochs",
+          "type": "integer"
+        },
+        "dynamic_sampling": {
+          "default": false,
+          "description": "Drop groups whose rewards are all identical (DAPO).",
+          "title": "Dynamic Sampling",
+          "type": "boolean"
+        },
+        "overlong_penalty": {
+          "default": 0.0,
+          "description": "Reward penalty for truncated (length) completions.",
+          "minimum": 0.0,
+          "title": "Overlong Penalty",
+          "type": "number"
+        },
+        "credit_assignment": {
+          "default": "episode",
+          "description": "Which rewards a response token is credited with. 'episode': the reward of its whole episode, the same advantage for every token. 'turn': the return from its own turn on (later per-turn rewards discounted by gamma; the reward-function score arrives at the final turn), compared with the same turn of the other episodes of its prompt group. See docs/CREDIT_ASSIGNMENT.md.",
+          "enum": [
+            "episode",
+            "turn"
+          ],
+          "title": "Credit Assignment",
+          "type": "string"
+        },
+        "gamma": {
+          "default": 1.0,
+          "description": "Discount for multi-turn per-turn rewards.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Gamma",
+          "type": "number"
+        },
+        "lam": {
+          "default": 1.0,
+          "description": "GAE lambda (ppo only): 1 = returns minus the value baseline, 0 = one-step TD error.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Lam",
+          "type": "number"
+        },
+        "value_coef": {
+          "default": 0.5,
+          "description": "Value loss weight (ppo only).",
+          "minimum": 0.0,
+          "title": "Value Coef",
+          "type": "number"
+        },
+        "value_clip": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0.5,
+          "description": "ppo only: the value loss also penalises a value estimate clipped to this distance from the estimate the advantages were computed with (null = plain squared error).",
+          "title": "Value Clip"
+        },
+        "off_policy": {
+          "$ref": "#/$defs/OffPolicyConfig",
+          "description": "Off-policy corrections (off by default)."
+        }
+      },
+      "title": "AlgorithmConfig",
+      "type": "object"
+    },
+    "ClusterConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "default": "local",
+          "description": "Run in-process or on a Ray cluster.",
+          "enum": [
+            "local",
+            "ray"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "ray_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Ray address ('auto' to join an existing cluster).",
+          "title": "Ray Address"
+        },
+        "num_nodes": {
+          "default": 1,
+          "description": "Nodes of the cluster.",
+          "minimum": 1,
+          "title": "Num Nodes",
+          "type": "integer"
+        },
+        "gpus_per_node": {
+          "default": 0,
+          "description": "GPUs on each node; 0 runs on CPU.",
+          "minimum": 0,
+          "title": "Gpus Per Node",
+          "type": "integer"
+        },
+        "placement": {
+          "default": "auto",
+          "description": "Share GPUs between rollout and training (colocated) or split them (disaggregated).",
+          "enum": [
+            "auto",
+            "colocated",
+            "disaggregated"
+          ],
+          "title": "Placement",
+          "type": "string"
+        },
+        "rollout_gpus": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "GPUs for inference when disaggregated.",
+          "title": "Rollout Gpus"
+        },
+        "trainer_gpus": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "GPUs for training when disaggregated.",
+          "title": "Trainer Gpus"
+        },
+        "weight_sync": {
+          "default": "auto",
+          "description": "Weight sync strategy: 'auto', 'inprocess', 'checkpoint', 'broadcast', 'cuda_ipc'.",
+          "title": "Weight Sync",
+          "type": "string"
+        },
+        "extra": {
+          "additionalProperties": true,
+          "description": "Options of the runtime and the weight sync (ray_init, sync_dir, ...).",
+          "title": "Extra",
+          "type": "object"
+        }
+      },
+      "title": "ClusterConfig",
+      "type": "object"
+    },
+    "DataConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "uri": {
+          "description": "Dataset location: 'hf://org/name' (Hub), 's3://bucket/prefix-or-file' (credentials from AWS_* env vars), a local file/directory (.jsonl/.json/.parquet/.csv/.arrow), or the scheme of a data source that a module in `providers` registers.",
+          "title": "Uri",
+          "type": "string"
+        },
+        "split": {
+          "default": "train",
+          "description": "Split name for Hub datasets (ignored for files).",
+          "title": "Split",
+          "type": "string"
+        },
+        "hf_config_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Hub dataset config/subset name.",
+          "title": "Hf Config Name"
+        },
+        "format": {
+          "default": "auto",
+          "description": "'chat': a messages column; 'prompt_answer': prompt + reference answer columns; 'text': a single prompt column; 'auto' sniffs columns.",
+          "enum": [
+            "auto",
+            "chat",
+            "prompt_answer",
+            "text"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "messages_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Column holding chat messages (format=chat).",
+          "title": "Messages Field"
+        },
+        "prompt_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Column holding the prompt/question.",
+          "title": "Prompt Field"
+        },
+        "answer_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Column holding the reference answer (optional).",
+          "title": "Answer Field"
+        },
+        "image_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Column(s) holding images (HF Image feature, file path/URI, bytes or base64) attached to the prompt as image content parts. Use '<image>' in prompt_template to position them.",
+          "title": "Image Field"
+        },
+        "response_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Column holding the target response for SFT (defaults to answer_field / the trailing assistant turn).",
+          "title": "Response Field"
+        },
+        "tools_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Column holding the tool schemas (a list of OpenAI-style function schemas, or its JSON string) a chat row's prompts are rendered with. Default: a 'tools' column of a chat dataset when it holds one.",
+          "title": "Tools Field"
+        },
+        "system_prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "System prompt prepended to every sample.",
+          "title": "System Prompt"
+        },
+        "prompt_template": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Python format string applied to the prompt column, e.g. '{prompt}\\nThink step by step.'",
+          "title": "Prompt Template"
+        },
+        "max_prompt_tokens": {
+          "default": 1024,
+          "description": "Samples with longer prompts are dropped.",
+          "minimum": 1,
+          "title": "Max Prompt Tokens",
+          "type": "integer"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Use only the first N samples (after shuffling).",
+          "title": "Limit"
+        },
+        "shuffle": {
+          "default": true,
+          "description": "Shuffle the rows with the run's seed (a streaming source shuffles within a buffer).",
+          "title": "Shuffle",
+          "type": "boolean"
+        },
+        "streaming": {
+          "default": false,
+          "description": "Stream from Hub/S3 instead of materialising locally.",
+          "title": "Streaming",
+          "type": "boolean"
+        },
+        "eval_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional evaluation dataset (same format).",
+          "title": "Eval Uri"
+        },
+        "eval_split": {
+          "default": "test",
+          "description": "Split of eval_uri that is evaluated.",
+          "title": "Eval Split",
+          "type": "string"
+        },
+        "extra": {
+          "additionalProperties": true,
+          "description": "Loader-specific options.",
+          "title": "Extra",
+          "type": "object"
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "title": "DataConfig",
+      "type": "object"
+    },
+    "EnvConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "default": "single_turn",
+          "description": "Environment: 'single_turn', 'tool_calling', 'openenv', 'hermes', ...",
+          "title": "Type",
+          "type": "string"
+        },
+        "max_turns": {
+          "default": 1,
+          "description": "Policy turns an episode may take at most.",
+          "minimum": 1,
+          "title": "Max Turns",
+          "type": "integer"
+        },
+        "retries": {
+          "default": 0,
+          "description": "Times an episode whose environment failed (a crashed agent, a failing step) is started again.",
+          "minimum": 0,
+          "title": "Retries",
+          "type": "integer"
+        },
+        "max_failed_frac": {
+          "default": 0.0,
+          "description": "Share of a rollout batch's episodes that may fail for good; they are left out of the batch. Above it the run fails. 0 (default): any failed episode fails the run.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Max Failed Frac",
+          "type": "number"
+        },
+        "params": {
+          "additionalProperties": true,
+          "description": "Environment-specific parameters.",
+          "title": "Params",
+          "type": "object"
+        }
+      },
+      "title": "EnvConfig",
+      "type": "object"
+    },
+    "LoggingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "run_root": {
+          "default": "~/.monorl/runs",
+          "description": "Directory that holds run directories.",
+          "title": "Run Root",
+          "type": "string"
+        },
+        "log_every": {
+          "default": 1,
+          "description": "Write metrics every this many steps (the last step is always written).",
+          "minimum": 1,
+          "title": "Log Every",
+          "type": "integer"
+        },
+        "save_trajectories": {
+          "default": true,
+          "description": "Write sampled rollouts to trajectories.jsonl.",
+          "title": "Save Trajectories",
+          "type": "boolean"
+        },
+        "trajectories_per_step": {
+          "default": 8,
+          "description": "Rollouts saved per logged step at most; 0 saves none.",
+          "minimum": 0,
+          "title": "Trajectories Per Step",
+          "type": "integer"
+        },
+        "save_transcripts": {
+          "default": true,
+          "description": "Include the full conversation and per-turn details of every saved rollout.",
+          "title": "Save Transcripts",
+          "type": "boolean"
+        },
+        "success_threshold": {
+          "default": 1.0,
+          "description": "Total reward at or above which an episode counts as solved (success-rate and pass@k metrics).",
+          "title": "Success Threshold",
+          "type": "number"
+        },
+        "wandb_project": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Weights & Biases project the metrics are also logged to (needs the wandb package).",
+          "title": "Wandb Project"
+        },
+        "tensorboard": {
+          "default": false,
+          "description": "Also write the metrics as TensorBoard events under <run_dir>/tensorboard.",
+          "title": "Tensorboard",
+          "type": "boolean"
+        }
+      },
+      "title": "LoggingConfig",
+      "type": "object"
+    },
+    "LoraConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Train LoRA adapters instead of full parameters.",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "r": {
+          "default": 16,
+          "description": "LoRA rank.",
+          "minimum": 1,
+          "title": "R",
+          "type": "integer"
+        },
+        "alpha": {
+          "default": 32,
+          "description": "LoRA alpha (scaling = alpha / r).",
+          "minimum": 1,
+          "title": "Alpha",
+          "type": "integer"
+        },
+        "dropout": {
+          "default": 0.05,
+          "description": "LoRA dropout.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Dropout",
+          "type": "number"
+        },
+        "target_modules": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "const": "all-linear",
+              "type": "string"
+            }
+          ],
+          "default": "all-linear",
+          "description": "Module names to adapt, or 'all-linear'.",
+          "title": "Target Modules"
+        }
+      },
+      "title": "LoraConfig",
+      "type": "object"
+    },
+    "ModelConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "name_or_path": {
+          "description": "Hugging Face model id or local path.",
+          "title": "Name Or Path",
+          "type": "string"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Hub revision (branch, tag or commit).",
+          "title": "Revision"
+        },
+        "tokenizer_name_or_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Override tokenizer (defaults to the model).",
+          "title": "Tokenizer Name Or Path"
+        },
+        "trust_remote_code": {
+          "default": false,
+          "description": "Let the model repository's own code run when the model is loaded.",
+          "title": "Trust Remote Code",
+          "type": "boolean"
+        },
+        "dtype": {
+          "default": "auto",
+          "description": "Parameter dtype; 'auto' picks bf16 on accelerators and fp32 on CPU.",
+          "enum": [
+            "auto",
+            "float32",
+            "bfloat16",
+            "float16"
+          ],
+          "title": "Dtype",
+          "type": "string"
+        },
+        "attn_implementation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "e.g. 'flash_attention_2', 'sdpa', 'eager'.",
+          "title": "Attn Implementation"
+        },
+        "chat_template": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Jinja chat template override.",
+          "title": "Chat Template"
+        },
+        "lora": {
+          "$ref": "#/$defs/LoraConfig"
+        },
+        "mtp": {
+          "$ref": "#/$defs/MtpConfig"
+        }
+      },
+      "required": [
+        "name_or_path"
+      ],
+      "title": "ModelConfig",
+      "type": "object"
+    },
+    "MtpConfig": {
+      "additionalProperties": false,
+      "description": "Multi-token prediction layers of the model (``docs/MTP.md``).",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Load the checkpoint's MTP (multi-token prediction) layers next to the policy and keep them in weight sync, checkpoints and the final export. Needs a model that ships MTP layers.",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "rollout": {
+          "default": false,
+          "description": "Draft tokens with the MTP layers during rollouts (speculative decoding). The policy verifies every draft, so the sampled tokens and their logprobs are the policy's; only speed changes.",
+          "title": "Rollout",
+          "type": "boolean"
+        },
+        "num_speculative_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Tokens drafted per decoding step. Default: one per MTP layer on the hf engine, 1 on vLLM, SGLang's own default.",
+          "title": "Num Speculative Tokens"
+        },
+        "train": {
+          "default": false,
+          "description": "Train the MTP layers with an auxiliary loss (predict the tokens after the next one) on the response tokens of every batch, in RL and SFT, so drafts keep matching a policy that changes.",
+          "title": "Train",
+          "type": "boolean"
+        },
+        "loss_coef": {
+          "default": 0.1,
+          "description": "Weight of the MTP loss in the total loss.",
+          "minimum": 0.0,
+          "title": "Loss Coef",
+          "type": "number"
+        },
+        "detach_trunk": {
+          "default": true,
+          "description": "true: the MTP loss updates the MTP layers only. false: it also flows into the policy's own parameters, as in pretraining.",
+          "title": "Detach Trunk",
+          "type": "boolean"
+        }
+      },
+      "title": "MtpConfig",
+      "type": "object"
+    },
+    "OffPolicyConfig": {
+      "additionalProperties": false,
+      "description": "Corrections for batches sampled by another policy than the one being updated (stale rollouts\nunder ``rollout.async_steps_ahead``, engines whose weights or numerics lag): docs/OFF_POLICY.md.",
+      "properties": {
+        "anchor": {
+          "default": "auto",
+          "description": "Proximal policy the clipped ratio is anchored on. 'behavior': the policy that sampled the tokens (the engine's log-probs). 'trainer': the trainer's policy when the update on the batch starts (decoupled PPO; one extra forward pass per batch). 'auto': 'trainer' when importance_weights or ratio_mask is set, otherwise the backend's default.",
+          "enum": [
+            "auto",
+            "behavior",
+            "trainer"
+          ],
+          "title": "Anchor",
+          "type": "string"
+        },
+        "importance_weights": {
+          "default": "none",
+          "description": "Weigh the policy loss by the truncated importance ratio between the proximal and the behaviour policy, per token or per training sequence (product of its token ratios).",
+          "enum": [
+            "none",
+            "token",
+            "sequence"
+          ],
+          "title": "Importance Weights",
+          "type": "string"
+        },
+        "importance_cap": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 2.0,
+          "description": "Upper bound of the importance weights (null = untruncated).",
+          "title": "Importance Cap"
+        },
+        "ratio_mask": {
+          "default": "none",
+          "description": "Drop from the policy loss the tokens, or whole training sequences, whose proximal/behaviour importance ratio is outside [ratio_mask_low, ratio_mask_high]. 'sequence' tests the product of a sequence's token ratios, 'sequence_mean' their geometric mean.",
+          "enum": [
+            "none",
+            "token",
+            "sequence",
+            "sequence_mean"
+          ],
+          "title": "Ratio Mask",
+          "type": "string"
+        },
+        "ratio_mask_low": {
+          "default": 0.5,
+          "description": "Lower bound of the accepted importance ratio.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "title": "Ratio Mask Low",
+          "type": "number"
+        },
+        "ratio_mask_high": {
+          "default": 5.0,
+          "description": "Upper bound of the accepted importance ratio.",
+          "minimum": 1.0,
+          "title": "Ratio Mask High",
+          "type": "number"
+        },
+        "score_centering": {
+          "default": false,
+          "description": "Subtract the expected score under the sampling policy from the policy gradient (arXiv:2609.20807). Needs the engine's top-k next-token log-probs and the 'behavior' anchor.",
+          "title": "Score Centering",
+          "type": "boolean"
+        },
+        "score_centering_top_k": {
+          "default": 128,
+          "description": "Number of most likely next tokens the engine records per sampled token.",
+          "minimum": 1,
+          "title": "Score Centering Top K",
+          "type": "integer"
+        }
+      },
+      "title": "OffPolicyConfig",
+      "type": "object"
+    },
+    "RewardSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "description": "Reward function name (see /api/system for the list).",
+          "title": "Type",
+          "type": "string"
+        },
+        "weight": {
+          "default": 1.0,
+          "description": "Multiplier when combining several rewards.",
+          "title": "Weight",
+          "type": "number"
+        },
+        "params": {
+          "additionalProperties": true,
+          "description": "Parameters of the reward function.",
+          "title": "Params",
+          "type": "object"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "RewardSpec",
+      "type": "object"
+    },
+    "RolloutConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "default": "hf",
+          "description": "Rollout engine: 'hf' (transformers), 'vllm', 'sglang'.",
+          "title": "Backend",
+          "type": "string"
+        },
+        "group_size": {
+          "default": 4,
+          "description": "Completions sampled per prompt (G in GRPO).",
+          "minimum": 1,
+          "title": "Group Size",
+          "type": "integer"
+        },
+        "max_new_tokens": {
+          "default": 256,
+          "description": "Tokens a turn may generate at most.",
+          "minimum": 1,
+          "title": "Max New Tokens",
+          "type": "integer"
+        },
+        "temperature": {
+          "default": 1.0,
+          "description": "Sampling temperature; 0 decodes greedily.",
+          "minimum": 0.0,
+          "title": "Temperature",
+          "type": "number"
+        },
+        "top_p": {
+          "default": 1.0,
+          "description": "Nucleus sampling threshold; 1.0 turns it off.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "title": "Top P",
+          "type": "number"
+        },
+        "top_k": {
+          "default": -1,
+          "description": "-1 disables top-k.",
+          "title": "Top K",
+          "type": "integer"
+        },
+        "stop": {
+          "description": "Strings at which a turn's generation stops.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Stop",
+          "type": "array"
+        },
+        "tensor_parallel_size": {
+          "default": 1,
+          "description": "GPUs one engine replica spans (tensor parallelism).",
+          "minimum": 1,
+          "title": "Tensor Parallel Size",
+          "type": "integer"
+        },
+        "data_parallel_size": {
+          "default": 1,
+          "description": "Number of independent engine replicas.",
+          "minimum": 1,
+          "title": "Data Parallel Size",
+          "type": "integer"
+        },
+        "gpu_memory_utilization": {
+          "default": 0.6,
+          "description": "Share of a GPU's memory the engine may take (vLLM gpu_memory_utilization, SGLang mem_fraction_static).",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "title": "Gpu Memory Utilization",
+          "type": "number"
+        },
+        "max_model_len": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Context length the engine is started with (vLLM max_model_len, SGLang context_length). Default: the model's own.",
+          "title": "Max Model Len"
+        },
+        "max_context_tokens": {
+          "anyOf": [
+            {
+              "minimum": 2,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Context budget of an episode in tokens: no prompt plus completion of a turn may exceed it. A turn's generation is capped to the room that is left, an episode without room for another turn ends, and an agent behind the gateway gets a context_length_exceeded error. Default: trainer.max_seq_len (and rollout.max_model_len when set), so that nothing an episode samples is cut off in training.",
+          "title": "Max Context Tokens"
+        },
+        "enable_sleep_mode": {
+          "default": true,
+          "description": "Offload engine memory while training (colocated).",
+          "title": "Enable Sleep Mode",
+          "type": "boolean"
+        },
+        "async_steps_ahead": {
+          "default": 0,
+          "description": "Generate up to N batches ahead of training (off-policy staleness bound). 0 = synchronous.",
+          "minimum": 0,
+          "title": "Async Steps Ahead",
+          "type": "integer"
+        },
+        "turn_rendering": {
+          "default": "tokens",
+          "description": "How a multi-turn prompt is built. 'tokens': the sampled tokens of earlier turns stay in the context and only new messages are rendered. 'template': the chat template re-renders the whole conversation every turn.",
+          "enum": [
+            "tokens",
+            "template"
+          ],
+          "title": "Turn Rendering",
+          "type": "string"
+        },
+        "turn_batching": {
+          "default": "lockstep",
+          "description": "How the turns of concurrent episodes reach an engine. 'lockstep': once every running episode has its next prompt, all of them are generated in one call, in a fixed order, so a run repeats for a fixed seed; an episode waits for the slowest environment step of its round. 'arrival': an episode asks as soon as its environment has answered and requests are batched as they arrive: faster when environment steps are slow and uneven, not repeatable. Agent harnesses that drive their own episodes always run the second way.",
+          "enum": [
+            "lockstep",
+            "arrival"
+          ],
+          "title": "Turn Batching",
+          "type": "string"
+        },
+        "device": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Device for the 'hf' backend (cpu/mps/cuda); auto if unset.",
+          "title": "Device"
+        },
+        "extra": {
+          "additionalProperties": true,
+          "description": "Engine-specific options passed through.",
+          "title": "Extra",
+          "type": "object"
+        }
+      },
+      "title": "RolloutConfig",
+      "type": "object"
+    },
+    "TrainerConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "default": "reference",
+          "description": "Trainer: 'reference' (torch), 'unsloth', or a pipeline backend: 'trl', 'verl', 'nemo_rl'.",
+          "title": "Backend",
+          "type": "string"
+        },
+        "learning_rate": {
+          "default": 1e-06,
+          "description": "Learning rate (its peak under warmup or a schedule).",
+          "exclusiveMinimum": 0.0,
+          "title": "Learning Rate",
+          "type": "number"
+        },
+        "prompts_per_step": {
+          "default": 8,
+          "description": "Prompts per optimizer step (x group_size = sequences).",
+          "minimum": 1,
+          "title": "Prompts Per Step",
+          "type": "integer"
+        },
+        "micro_batch_size": {
+          "default": 4,
+          "description": "Sequences per forward/backward pass.",
+          "minimum": 1,
+          "title": "Micro Batch Size",
+          "type": "integer"
+        },
+        "max_steps": {
+          "default": 100,
+          "description": "Training steps of the run.",
+          "minimum": 1,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "warmup_steps": {
+          "default": 0,
+          "description": "Steps over which the learning rate rises linearly from 0.",
+          "minimum": 0,
+          "title": "Warmup Steps",
+          "type": "integer"
+        },
+        "weight_decay": {
+          "default": 0.0,
+          "description": "Weight decay of the optimizer.",
+          "minimum": 0.0,
+          "title": "Weight Decay",
+          "type": "number"
+        },
+        "max_grad_norm": {
+          "default": 1.0,
+          "description": "Norm the gradient is clipped to at every step.",
+          "exclusiveMinimum": 0.0,
+          "title": "Max Grad Norm",
+          "type": "number"
+        },
+        "precision": {
+          "default": "bf16",
+          "description": "Mixed-precision mode (fp32 forced on CPU).",
+          "enum": [
+            "fp32",
+            "bf16",
+            "fp16"
+          ],
+          "title": "Precision",
+          "type": "string"
+        },
+        "gradient_checkpointing": {
+          "default": false,
+          "description": "Recompute activations in the backward pass instead of storing them: less memory, more compute.",
+          "title": "Gradient Checkpointing",
+          "type": "boolean"
+        },
+        "optimizer": {
+          "default": "adamw",
+          "description": "Optimizer.",
+          "enum": [
+            "adamw",
+            "adam",
+            "sgd"
+          ],
+          "title": "Optimizer",
+          "type": "string"
+        },
+        "scheduler": {
+          "default": "constant",
+          "description": "Learning rate after the warmup: constant, or a linear or cosine decay to 0 at the last step.",
+          "enum": [
+            "constant",
+            "linear",
+            "cosine"
+          ],
+          "title": "Scheduler",
+          "type": "string"
+        },
+        "save_every": {
+          "default": 50,
+          "description": "Checkpoint interval in steps.",
+          "minimum": 1,
+          "title": "Save Every",
+          "type": "integer"
+        },
+        "eval_every": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Evaluate on data.eval_uri every this many steps. Null, or no eval_uri: no evaluation during the run.",
+          "title": "Eval Every"
+        },
+        "max_seq_len": {
+          "default": 2048,
+          "description": "Prompt + response truncation for training.",
+          "minimum": 16,
+          "title": "Max Seq Len",
+          "type": "integer"
+        },
+        "device": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "cpu/mps/cuda; auto if unset.",
+          "title": "Device"
+        },
+        "extra": {
+          "additionalProperties": true,
+          "description": "Backend-specific options (e.g. verl/nemo overrides).",
+          "title": "Extra",
+          "type": "object"
+        }
+      },
+      "title": "TrainerConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "run_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Defaults to '<model>-<algorithm>-<timestamp>'.",
+      "title": "Run Name"
+    },
+    "seed": {
+      "default": 42,
+      "description": "Seed of the run: Python and torch are seeded with it at the start and with seed + step at every step, and data sources and backends receive it.",
+      "title": "Seed",
+      "type": "integer"
+    },
+    "providers": {
+      "description": "Modules imported before the run builds its components. Each exposes register(registry) and may add rewards, environments, engines, trainers or other components under names the config can then use. They are imported from the working directory or the Python path.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Providers",
+      "type": "array"
+    },
+    "model": {
+      "$ref": "#/$defs/ModelConfig"
+    },
+    "data": {
+      "$ref": "#/$defs/DataConfig"
+    },
+    "algorithm": {
+      "$ref": "#/$defs/AlgorithmConfig"
+    },
+    "rollout": {
+      "$ref": "#/$defs/RolloutConfig"
+    },
+    "trainer": {
+      "$ref": "#/$defs/TrainerConfig"
+    },
+    "rewards": {
+      "description": "Combined as a weighted sum.",
+      "items": {
+        "$ref": "#/$defs/RewardSpec"
+      },
+      "title": "Rewards",
+      "type": "array"
+    },
+    "env": {
+      "$ref": "#/$defs/EnvConfig"
+    },
+    "cluster": {
+      "$ref": "#/$defs/ClusterConfig"
+    },
+    "logging": {
+      "$ref": "#/$defs/LoggingConfig"
+    }
+  },
+  "required": [
+    "model",
+    "data"
+  ],
+  "title": "RunConfig",
+  "type": "object"
+}
