@@ -111,16 +111,19 @@ class RowSource(abc.ABC):
 
 
 def expand_files(fs, parsed: ParsedURI) -> list[str]:
-    """Resolve a file / directory / glob into concrete data-file paths (sorted)."""
+    """Resolve a file / directory / glob into concrete data-file paths (sorted). A path that
+    exists is that file or directory, whatever characters it holds (``runs[v1]/train.jsonl``);
+    only one that does not is read as a glob."""
     path = parsed.path
-    if any(ch in path for ch in "*?["):
+    exists = fs.exists(path)
+    if not exists and any(ch in path for ch in "*?["):
         fs.invalidate_cache()
         matches = [p for p in fs.glob(path) if fs.isfile(p)]
         files = formats.select_files(matches)
         if not files:
             raise DataError(f"glob {parsed.raw!r} matched no supported data files")
         return files
-    if not fs.exists(path):
+    if not exists:
         raise FileNotFoundError(f"dataset path not found: {parsed.raw}")
     if fs.isdir(path):
         fs.invalidate_cache(path)

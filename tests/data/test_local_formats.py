@@ -101,6 +101,20 @@ def test_glob(tmp_path: Path) -> None:
     assert len(_open(tmp_path / "train-*.jsonl")) == 8
 
 
+def test_a_path_that_exists_is_not_read_as_a_glob(tmp_path: Path) -> None:
+    """``[``, ``?`` and ``*`` are glob syntax only in a path that names nothing: ``runs[v1]`` as a
+    pattern matches ``runsv`` and ``runs1``, never the directory of that name."""
+    d = tmp_path / "runs[v1]"
+    d.mkdir()
+    write_jsonl(d / "train.jsonl", QA_ROWS[:4])
+    write_jsonl(d / "test.jsonl", QA_ROWS[4:6])
+    assert [s.id for s in _open(d / "train.jsonl")] == [f"{d / 'train.jsonl'}#{i}" for i in range(4)]
+    assert len(_open(d)) == 6
+    assert len(_open(tmp_path / "runs[[]v1]" / "t*.jsonl")) == 6, "in a pattern the bracket is escaped"
+    with pytest.raises(DataError, match="matched no supported data files"):
+        _open(d / "t*.jsonl")
+
+
 def test_directory_prefers_data_format_over_metadata_json(tmp_path: Path) -> None:
     d = tmp_path / "saved"
     d.mkdir()
