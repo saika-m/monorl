@@ -193,14 +193,34 @@ def serve(
     port: int = typer.Option(8000, "--port"),
     open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the UI in a browser."),
     reload: bool = typer.Option(False, "--reload", help="Auto-reload on source changes (development)."),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        help="Access token of the API (default: MONORL_SERVER_TOKEN, else a new random one). "
+        "Prefer the variable: an option shows in the process list.",
+    ),
+    allowed_host: list[str] = typer.Option(
+        [],
+        "--allowed-host",
+        help="Accept this name in the Host header besides localhost, 127.0.0.1 and [::1] "
+        "(repeatable; MONORL_ALLOWED_HOSTS takes a comma-separated list).",
+    ),
 ) -> None:
-    """Start the local web UI + API server."""
+    """Start the local web UI + API server. Every API request needs the access token: open the
+    sign-in URL this prints, or read the token from $MONORL_HOME/server_token."""
     import uvicorn
 
-    url = f"http://{host}:{port}"
-    console.print(f"monorl server at [bold]{url}[/bold]")
+    from monorl.server import auth
+
+    try:
+        token = auth.configure(host, token, allowed_host)
+    except ConfigError as e:
+        _fail(str(e))
+        return
+    for line in auth.startup_lines(host, port, token):
+        console.print(line, markup=False, highlight=False, soft_wrap=True)
     if open_browser:
-        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+        threading.Timer(1.0, webbrowser.open, args=(auth.signin_url(host, port, token),)).start()
     uvicorn.run("monorl.server.app:create_app", factory=True, host=host, port=port, reload=reload)
 
 

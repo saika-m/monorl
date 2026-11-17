@@ -35,6 +35,7 @@ from monorl.config.schema import RunConfig
 from monorl.core.errors import MonorlError
 from monorl.core.reporting import CONFIG_FILE, LOG_FILE, read_status
 from monorl.pipeline.stages import PIPELINE_CONFIG_FILE, default_pipeline_name
+from monorl.server.auth import TOKEN_ENV
 
 JOBS_FILE = "jobs.json"
 TERMINAL_STATES: frozenset[str] = frozenset({"succeeded", "failed", "cancelled"})
@@ -236,8 +237,10 @@ class JobManager:
                     start_new_session=True,
                     # The reporter writes run.log itself; its stderr echo would be captured
                     # into the same file and duplicate every line.
+                    # The API token stays with the server: a run has no use for it, and the
+                    # commands of a config (environments, harness agents) inherit this.
                     env={
-                        **os.environ,
+                        **{k: v for k, v in os.environ.items() if k != TOKEN_ENV},
                         "MONORL_REPORTER_ECHO": "0",
                         "PYTHONPATH": os.pathsep.join(
                             p for p in (self._launch_dir, os.environ.get("PYTHONPATH")) if p

@@ -1,24 +1,84 @@
 # Web UI
 
-`monorl serve` starts a FastAPI server (`monorl.server.app:create_app`) on
-`http://127.0.0.1:8000`, serves the built React UI from `web/dist` at `/` and opens a browser
-tab (`--no-open` to skip). The UI is a low-code front end over `RunConfig`: the wizard builds a
-config from forms written in `web/src/wizard/`, shows each field's description from
+`monorl serve` starts a FastAPI server (`monorl.server.app:create_app`) on `http://127.0.0.1:8000`,
+serves the built React UI from `web/dist` at `/` and opens a browser tab on its sign-in URL
+(`--no-open` to skip; see [Access](#access)). The UI is a low-code front end over `RunConfig`: the
+wizard builds a config from forms written in `web/src/wizard/`, shows each field's description from
 `GET /api/config/schema` (`RunConfig.model_json_schema()`) and has the server validate the result.
 Types and defaults are restated in `web/src/types.ts` and `web/src/defaults.ts`;
 [`web/README.md`](../web/README.md) lists what a new config field needs there.
 
 ```
 monorl serve [--host 127.0.0.1] [--port 8000] [--no-open] [--reload]
+             [--token TOKEN] [--allowed-host NAME]...
 make web          # pnpm install + build web/dist
                   # (needed once; `monorl serve` works API-only without it)
 ```
 
-Development: `cd web && pnpm dev` runs Vite on `:5173` proxying `/api` to the Python server
-(CORS is enabled for both origins). `pnpm dev:mock` serves a mock of the API on `:8000` instead
-(`web/mock/server.ts`): seeded runs and pipelines with fake metrics, logs and rollouts, including
-`tool-calling-grpo-seed`, whose trajectories cover every part of the transcript view below, and
-`gsm8k-grpo-smol-seed`, whose rows and metrics predate transcripts.
+Development: `cd web && pnpm dev` runs Vite on `:5173` proxying `/api` and the sign-in URL to the
+Python server, so the browser only talks to `:5173`: start `monorl serve --no-open` and open
+`http://localhost:5173/?token=<token>` with the token of the URL it printed. `pnpm dev:mock` serves
+a mock of the API on `:8000` instead (`web/mock/server.ts`): seeded runs and pipelines with fake
+metrics, logs and rollouts, including `tool-calling-grpo-seed`, whose trajectories cover every part
+of the transcript view below, and `gsm8k-grpo-smol-seed`, whose rows and metrics predate
+transcripts. The mock needs no token.
+
+## Access
+
+A run's config names commands that the server starts (`env.params.command`, harness commands,
+sandbox arguments), so whoever can call the API can run programs as the user of the server. The
+server therefore checks every request:
+
+- **Token.** Every `/api/*` route needs the server's access token, either as
+  `Authorization: Bearer <token>` or as the session cookie that the sign-in URL sets. Only the
+  files of the UI (`GET` outside `/api`) are served without it. Without a valid token the answer
+  is `401` with a JSON `detail` that says how to sign in, and the UI shows that message in place
+  of its pages.
+- **Host.** The `Host` header has to be `localhost`, `127.0.0.1` or `[::1]` (any port), the
+  address given to `--host` unless that is `0.0.0.0` or `::`, or a name added with
+  `--allowed-host NAME` (repeatable) or `MONORL_ALLOWED_HOSTS=NAME[,NAME]`. Anything else is
+  `403`, with or without the token: a web page that points its own name at `127.0.0.1` cannot
+  use the session of the browser.
+- **Origin.** A request with a method other than `GET`, `HEAD` or `OPTIONS` whose `Origin`
+  header names another origin than the one the request is addressed to is `403`. No other origin
+  is allowed by default (`ServerSettings.cors_origins` when the app is built in Python).
+
+The token is new on every start unless `MONORL_SERVER_TOKEN` (or `--token`, which shows in the
+process list) sets one: at least 16 characters out of letters, digits and `._~-`. The server
+writes it to `$MONORL_HOME/server_token` with mode `0600`, where scripts on the same machine read
+it, and keeps it out of the environment of the runs it starts. The file belongs to the server
+that started last with that `MONORL_HOME`.
+
+`monorl serve` prints the sign-in URL and opens it:
+
+```
+monorl server: open this URL to sign in
+http://127.0.0.1:8000/?token=<token>
+```
+
+A `GET` with a valid `token` parameter sets the cookie (`monorl_session_<port>`, `HttpOnly`,
+`SameSite=Strict`, `Path=/`) and redirects to the same URL without the parameter, so the token
+does not stay in the address bar. The cookie lasts until the browser closes or the server
+restarts with a new token; then the UI shows the sign-in message again and the printed URL of
+the running server signs in again. The URL is also in the terminal and, as a request line, in
+the server's access log: treat both like the token.
+
+From a script:
+
+```sh
+TOKEN="$(cat "${MONORL_HOME:-$HOME/.monorl}/server_token")"
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/jobs
+```
+
+To reach the UI from another machine, bind another address and name what the browser will have
+in its address bar: `monorl serve --host 0.0.0.0 --allowed-host box.lan` (or the machine's IP
+address), then open `http://box.lan:8000/?token=<token>`. The connection is plain HTTP: the
+token and everything else cross the network unencrypted, so do this on a network you trust or
+behind a TLS proxy or an SSH tunnel (`ssh -L 8000:127.0.0.1:8000 box` needs no option at all).
+
+The interactive OpenAPI pages (`/api/docs`, `/redoc`) are not served, because they load their
+script from a CDN into the origin that holds the session. The schema is at
+`/api/openapi.json`, with the token like every other route.
 
 ## Pages
 
@@ -203,6 +263,9 @@ installed frameworks with patch status, registered components per namespace.
 | `logging.run_root` | where run directories go (`<run_root>/<run_name>`) |
 | `MONORL_RECIPES_DIR`, `MONORL_WEB_DIST`, `MONORL_ENVS_BIN`, `MONORL_ENVS_SDK` | override discovery paths |
 | `AWS_*`, `HF_TOKEN` | data connectors (read by the server process) |
+| `MONORL_SERVER_TOKEN` | access token of the API instead of a generated one ([Access](#access)) |
+| `MONORL_ALLOWED_HOSTS` | comma-separated names accepted in `Host` besides the local ones |
+| `$MONORL_HOME/server_token` | the token of the running server, mode `0600` |
 
 The server never imports a training backend: it writes `config.yaml`, spawns the CLI, and reads
 `status.json`, `metrics.jsonl`, `trajectories.jsonl`, `run.log` and `checkpoints/`

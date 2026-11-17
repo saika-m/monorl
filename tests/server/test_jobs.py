@@ -18,6 +18,8 @@ from monorl.server import routes_jobs
 from monorl.server.app import ServerSettings, create_app
 from monorl.server.jobs import TERMINAL_STATES, JobManager, JobNotFound, train_command
 
+from .conftest import signed_in
+
 
 @pytest.fixture
 def terminal(client: TestClient, wait_for):  # noqa: ANN001, ANN201
@@ -234,7 +236,7 @@ def test_cancel_escalates_to_sigkill(
 ) -> None:
     monkeypatch.setenv("FAKE_TRAINER_MODE", "stubborn")
     jobs = JobManager(settings.home, grace_seconds=0.3)
-    with TestClient(create_app(settings, jobs=jobs)) as client:
+    with signed_in(create_app(settings, jobs=jobs)) as client:
         job = client.post("/api/jobs", json={"config": config_dict}).json()
         wait_for(lambda: client.get(f"/api/jobs/{job['id']}/metrics").json()["rows"])
         t0 = time.time()
