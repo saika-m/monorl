@@ -9,7 +9,8 @@ when compiling their native configs.
 ```yaml
 cluster:
   mode: local | ray          # in-process vs Ray actors
-  ray_address: auto          # join an existing cluster (ray start --head) or null to start one
+  ray_address: auto          # join an existing cluster (ray start --head)
+                             # or null to start one
   num_nodes: 1
   gpus_per_node: 8
   placement: auto | colocated | disaggregated
@@ -39,10 +40,15 @@ Without CUDA every placement degrades to CPU/MPS in-process: `mode: local`,
 `monorl bench` measures the pieces the planner has to balance, on the hardware you have:
 
 ```
-monorl bench plan --config RECIPE [--gpus G --gpu-mem-gb M --preset h100|a100|l40s|mps|cpu]   # placement + step-time estimate
-monorl bench sync --config RECIPE [--all | --strategy S] [--fake-params N --engines E]   # weight sync timing
-monorl bench env  (--command CMD... | --url URL) [--parallel 1,8,32] [--episodes N]       # MEP/1 episodes/s
-monorl bench rollout --config RECIPE [--batch-sizes 1,4,16,64] [--prompts N]              # tokens/s per batch size
+# placement + step-time estimate
+monorl bench plan --config RECIPE \
+    [--gpus G --gpu-mem-gb M --preset h100|a100|l40s|mps|cpu]
+# weight sync timing
+monorl bench sync --config RECIPE [--all | --strategy S] [--fake-params N --engines E]
+# MEP/1 episodes/s
+monorl bench env  (--command CMD... | --url URL) [--parallel 1,8,32] [--episodes N]
+# tokens/s per batch size
+monorl bench rollout --config RECIPE [--batch-sizes 1,4,16,64] [--prompts N]
 ```
 
 `plan` prints the same placement the orchestrator would use (`Runtime.placement`) plus a

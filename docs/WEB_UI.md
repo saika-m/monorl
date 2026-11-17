@@ -10,7 +10,8 @@ Types and defaults are restated in `web/src/types.ts` and `web/src/defaults.ts`;
 
 ```
 monorl serve [--host 127.0.0.1] [--port 8000] [--no-open] [--reload]
-make web          # pnpm install + build web/dist (needed once; `monorl serve` works API-only without it)
+make web          # pnpm install + build web/dist
+                  # (needed once; `monorl serve` works API-only without it)
 ```
 
 Development: `cd web && pnpm dev` runs Vite on `:5173` proxying `/api` to the Python server
@@ -43,12 +44,13 @@ loop)* toggle at the top — a `PipelineConfig` whose `base` is the same wizard 
    and, when training, *MTP loss weight* (`loss_coef`) and *Update the MTP layers only*
    (`detach_trunk`). The card shows the server's rules inline: no MTP with the `unsloth` and
    `trl` trainers, no MTP training with `verl`, no drafting with `rollout.extra.min_p` > 0 on
-   vLLM / SGLang or with the `verl` / `nemo_rl` trainers (which generate with those engines); and two hints the UI cannot check: on the hf engine the draft count has to be
-   empty or the model's number of MTP layers, and NeMo-RL trains MTP layers only with
-   `trainer.extra.megatron.enabled` and `mtp_num_layers`. With every field at its default the
-   section is left out of the YAML; switching MTP off removes the section.
-   Runs that train or draft with MTP chart `loss/mtp`, `mtp/accuracy`, `mtp/accept_rate` and
-   `mtp/accept_length` under the additional metrics of the run page.
+   vLLM / SGLang or with the `verl` / `nemo_rl` trainers (which generate with those engines); and
+   two hints the UI cannot check: on the hf engine the draft count has to be empty or the model's
+   number of MTP layers, and NeMo-RL trains MTP layers only with `trainer.extra.megatron.enabled`
+   and `mtp_num_layers`. With every field at its default the section is left out of the YAML;
+   switching MTP off removes the section. Runs that train or draft with MTP chart `loss/mtp`,
+   `mtp/accuracy`, `mtp/accept_rate` and `mtp/accept_length` under the additional metrics of the run
+   page.
 3. *Data* — pick a source:
    * **Local** — browse directories on the server's filesystem (`/api/datasets/browse?uri=`).
    * **S3** — browse `s3://bucket/prefix` with credentials from the server's `AWS_*` environment;
@@ -58,8 +60,9 @@ loop)* toggle at the top — a `PipelineConfig` whose `base` is the same wizard 
    Then *Preview* (`POST /api/datasets/preview`): columns with dtypes, first rows, the inferred
    layout, and a column mapper writing `prompt_field` / `answer_field` / `messages_field` /
    `tools_field` (the column with a chat row's tool schemas) / `image_field` (comma list for
-   several columns; auto-filled from the sniffer's `image_fields`) and, for SFT, `response_field`. Image cells render as a `[image W×H]` chip
-   (decoded images) or a thumbnail (`http(s)://…png|jpg|webp`, `data:image/…` URIs).
+   several columns; auto-filled from the sniffer's `image_fields`) and, for SFT, `response_field`.
+   Image cells render as a `[image W×H]` chip (decoded images) or a thumbnail
+   (`http(s)://…png|jpg|webp`, `data:image/…` URIs).
 4. *Rewards & environment* — add weighted reward functions (names and parameter hints come from
    `GET /api/system` components) and choose the env type; remote MEP/1 envs list the example
    binaries discovered under `envs/bin` (`GET /api/envs`). `harness` (an external agent program
