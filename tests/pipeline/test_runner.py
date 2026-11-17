@@ -421,6 +421,49 @@ def test_sigterm_during_the_last_step_of_a_train_stage_stops_the_pipeline_after_
     assert result.final_model_path is None
 
 
+@pytest.mark.parametrize("last", ["train", "eval"])
+def test_sigterm_when_nothing_is_left_to_cancel_ends_the_pipeline_succeeded(
+    last: str, make_pipeline: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The signal arrives in the last step of the last stage (a train stage: in its last train
+    step; an eval stage: while its last chunk is scored). Every stage ends ``succeeded``, and so
+    does the pipeline, with its final model: there was nothing left to stop."""
+    stages: list[dict[str, Any]] = [
+        {"type": "train", "name": "first", "overrides": {"trainer": {"max_steps": 2}}},
+        {"type": "train", "name": "second", "overrides": {"trainer": {"max_steps": 2}}},
+    ]
+    if last == "train":
+        original = fakes.FakeTrainer.train_step
+
+        def train_step(self: Any, batch: Any) -> dict[str, float]:
+            out = original(self, batch)
+            if self.config.run_name == "01-second" and self.step == 2:
+                _sigterm_self()
+            return out
+
+        monkeypatch.setattr(fakes.FakeTrainer, "train_step", train_step)
+    else:
+        stages.append({"type": "eval", "name": "eval", "max_prompts": 2})  # one chunk
+        score = fakes.ExactReward.__call__
+
+        def scored(self: Any, trajectories: Any) -> Any:
+            if trajectories[0].group_id.startswith("eval"):
+                _sigterm_self()
+            return score(self, trajectories)
+
+        monkeypatch.setattr(fakes.ExactReward, "__call__", scored)
+    result = run_pipeline(make_pipeline(stages))
+    assert [s["state"] for s in result.stages] == ["succeeded"] * len(stages)
+    logs = [Path(s["run_dir"]) / "run.log" for s in result.stages[-1:]] + [Path(result.run_dir) / "run.log"]
+    assert any("received SIGTERM" in log.read_text() for log in logs)  # the signal did arrive
+    assert result.state == "succeeded"
+    final = str(Path(result.stages[1]["run_dir"]) / "final")
+    assert result.final_model_path == final and Path(final).is_dir()
+    status, manifest = read_status(result.run_dir), read_manifest(result.run_dir)
+    assert status["state"] == "succeeded" and status["message"] == f"finished {len(stages)} stages"
+    assert manifest["state"] == "succeeded" and manifest["final_model_path"] == final
+
+
 def test_sigterm_during_rejection_stage_cancels_pipeline(
     make_pipeline: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

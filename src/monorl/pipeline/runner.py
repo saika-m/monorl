@@ -105,8 +105,8 @@ def run_pipeline(
             reporter.log(tb)
             runner.mark_active("failed", f"{type(e).__name__}: {e}")
             return runner.finish("failed", f"{type(e).__name__}: {e}")
-    if cancel.is_set():
-        return runner.finish("cancelled", None)
+    # Every stage succeeded. A signal that came in the last step of the last stage found nothing
+    # left to cancel, in the stage and in the pipeline alike.
     return runner.finish("succeeded", None)
 
 
