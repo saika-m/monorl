@@ -138,6 +138,7 @@ push cancels the run of an older one.
 |---|---|
 | A reward, environment, data source, engine, trainer or backend | the extension points in [`src/monorl/README.md`](src/monorl/README.md) |
 | An adapter for a framework, or a newer pin of one | [`src/monorl/adapters/README.md`](src/monorl/adapters/README.md) |
+| A parameter of a built-in reward or environment | `declare_params` next to the code that reads it ([`src/monorl/core/params.py`](src/monorl/core/params.py)) and its row in [`docs/REWARDS.md`](docs/REWARDS.md) or [`docs/ENVIRONMENTS.md`](docs/ENVIRONMENTS.md); `tests/docs/test_params_tables.py` compares the two |
 | A recipe | [`configs/recipes/README.md`](configs/recipes/README.md) |
 | An environment in Go or C++ | [`docs/ENV_SDK.md`](docs/ENV_SDK.md) |
 | A task directory for sandboxed runs | [`examples/sandbox/README.md`](examples/sandbox/README.md) |
