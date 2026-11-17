@@ -18,6 +18,7 @@ Example files live in `$DEMO` (`/tmp/monorl-docs-data` when written).
 | `hf://org/name` | `hf`: Hugging Face Hub dataset | `data.split` (default `train`), `data.hf_config_name` for subsets (GSM8K: `main`). `hf://org/name@revision` pins a revision; `hf://org/name/path/in/repo.jsonl` narrows to specific files. `hf://datasets/org/name` is tolerated. Gated/private datasets use your `HF_TOKEN` / `huggingface-cli login`. |
 | `org/name` | `local` | Without `hf://` a repository id is a relative path: the run fails with `dataset path not found: org/name` unless that path exists. |
 | `s3://bucket/key.jsonl`, `s3://bucket/prefix/` | `s3`: S3 or S3-compatible object store via `s3fs` | Credentials from the environment only (below). A prefix reads every supported file under it, in the same file formats. |
+| `http://host/train.jsonl`, `https://...` | `s3`: fsspec's HTTP filesystem (`aiohttp`) | One file, in the same file formats, told by the extension the URL ends with; no directories, no globs. A server without range requests works: the file is read whole. |
 | `gs://`, `az://`, ... | `s3`: any other fsspec filesystem | Works when the driver (`gcsfs`, `adlfs`, ...) is installed, credentials per that driver; without it: `no fsspec driver for scheme`. |
 | `myscheme://anything` | the source a provider module registered as `myscheme` | See [Writing a data source](#writing-a-data-source). A scheme that is neither registered nor an fsspec protocol is an error that lists the registered names. |
 
@@ -28,8 +29,9 @@ task directories `skip_unsupported: true` leaves out tasks that cannot be run, a
 source gets a copy, and file sources read none.
 
 Run here: every `local` form, `hf://openai/gsm8k`, `s3://` against a local moto server,
-`memory://` as another fsspec protocol, a provider's scheme. Not run here: AWS, MinIO, R2,
-`gs://` and `az://` (no driver installed), gated Hub datasets.
+`http://` against a server on the loopback interface (JSONL, CSV, Parquet), `memory://` as
+another fsspec protocol, a provider's scheme. Not run here: AWS, MinIO, R2, `https://`, `gs://`
+and `az://` (no driver installed), gated Hub datasets.
 
 ## S3 credentials and endpoints
 

@@ -8,6 +8,8 @@ Supported shapes:
   driver is installed. S3 credentials come **only** from the environment
   (``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_SESSION_TOKEN``,
   ``AWS_DEFAULT_REGION``/``AWS_REGION``, ``AWS_ENDPOINT_URL``), never from config.
+* ``http://host/file.jsonl`` or ``https://``: one file a web server serves, in the file formats
+  of a local file. A web server lists nothing, so a directory or a glob is not read this way.
 * local path or ``file://`` — file, directory or glob. A string without ``://`` is always a
   path: a Hub dataset needs the ``hf://`` prefix.
 * ``<scheme>://anything`` for a scheme a provider module registered a ``data_source`` for
@@ -25,6 +27,8 @@ from typing import Any, Literal
 from monorl.core.errors import DataError
 
 Kind = Literal["local", "hf", "remote"]
+
+HTTP_SCHEMES: tuple[str, ...] = ("http", "https")
 
 S3_ENV_VARS: tuple[str, ...] = (
     "AWS_ACCESS_KEY_ID",
@@ -45,7 +49,8 @@ class ParsedURI:
     ``gs``...) or the scheme of a provider's data source."""
     path: str
     """Local: absolute path. Remote: what follows ``://`` without surrounding slashes
-    (``bucket/key``). HF: ``org/name``."""
+    (``bucket/key``); for ``http`` and ``https`` the whole URL, which is how fsspec's filesystem
+    for them names a file. HF: ``org/name``."""
     revision: str | None = None
     """HF only: ``@revision``."""
     subpath: str | None = None
@@ -57,7 +62,7 @@ class ParsedURI:
 
     def with_path(self, path: str) -> str:
         """Render a URI for a path on the same filesystem (used for per-file ids and browse)."""
-        if self.kind == "local":
+        if self.kind == "local" or self.scheme in HTTP_SCHEMES:
             return path
         return f"{self.scheme}://{path}"
 
@@ -75,6 +80,8 @@ def parse_uri(uri: str) -> ParsedURI:
         scheme, _, rest = uri.partition("://")
         if not scheme.isidentifier():
             raise DataError(f"unsupported dataset uri {uri!r}")
+        if scheme in HTTP_SCHEMES:
+            return ParsedURI(raw=uri, kind="remote", scheme=scheme, path=uri)
         return ParsedURI(raw=uri, kind="remote", scheme=scheme, path=rest.strip("/") if rest != "" else "")
     return ParsedURI(raw=uri, kind="local", scheme="file", path=str(Path(uri).expanduser().absolute()))
 

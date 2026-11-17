@@ -441,7 +441,8 @@ def patches_apply(
 @data_app.command("inspect")
 def data_inspect(
     uri: str = typer.Argument(
-        ..., help="Local path, hf://org/name, s3://bucket/key, or the scheme of a --provider's data source."
+        ...,
+        help="Local path, hf://org/name, s3://bucket/key, http(s)://host/file, or the scheme of a --provider's data source.",
     ),
     limit: int = typer.Option(5, "--limit", "-n", min=1, help="Rows / samples to show."),
     split: str | None = typer.Option(None, "--split", help="Split for Hub datasets."),
