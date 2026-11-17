@@ -605,7 +605,16 @@ class RemoteEnv:
             if parsed.calls:
                 tool_calls = [dict(c) for c in parsed.calls]
         payload = self._call(ep, step_request(ep.id, action, tool_calls))
-        messages, reward, done, info = validate_step_response(payload)
+        try:
+            messages, reward, done, info = validate_step_response(payload)
+        except ProtocolError as e:
+            # Nothing of this response is used: the episode ends here, at the server too.
+            self.close()
+            where = getattr(ep.transport, "url", None) or " ".join(getattr(ep.transport, "command", []))
+            raise EnvironmentError_(
+                f"environment {self.spec.name!r} ({where}) sent an invalid step response for "
+                f"episode {ep.id}: {e.message}"
+            ) from e
         ep.turn += 1
         if not done and ep.turn >= self.max_turns:
             done = True

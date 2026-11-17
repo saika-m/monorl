@@ -41,6 +41,7 @@ SDKs under ``envs/sdk`` implement the same shapes. ``PROTOCOL_VERSION`` must mat
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -168,12 +169,24 @@ def validate_messages(messages: Any) -> list[Message]:
     return out
 
 
+def validate_reward(value: Any) -> float:
+    """The reward of a step as a float. :class:`ProtocolError` unless it is a JSON number with a
+    finite value: ``NaN`` and ``Infinity`` (which Python's JSON parser reads, and ``1e999``
+    becomes) would turn every advantage of the reward's group and the step's loss into NaN."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProtocolError("protocol", f"reward must be a number, got {repr(value)[:80]}")
+    try:
+        reward = float(value)
+    except OverflowError:
+        reward = math.inf
+    if not math.isfinite(reward):
+        raise ProtocolError("protocol", f"reward must be a finite number, got {repr(value)[:80]}")
+    return reward
+
+
 def validate_step_response(payload: dict[str, Any]) -> tuple[list[Message], float, bool, dict[str, Any]]:
     msgs = validate_messages(payload.get("messages", []))
-    try:
-        reward = float(payload.get("reward", 0.0))
-    except (TypeError, ValueError) as e:
-        raise ProtocolError("protocol", f"reward must be a number: {payload.get('reward')!r}") from e
+    reward = validate_reward(payload.get("reward", 0.0))
     done = bool(payload.get("done", True))
     info = payload.get("info") or {}
     if not isinstance(info, dict):

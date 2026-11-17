@@ -49,7 +49,10 @@ Semantics:
 - `step` returns the messages to append *after* the assistant turn (tool results, the next user
   turn) and `done`. The orchestrator stops after `done` or `spec.max_turns` assistant turns.
   `reward` is the per-turn reward; the orchestrator folds the turns into one trajectory
-  return (`Σ gamma^k · reward_k`, `algorithm.gamma`) reported as `reward/env`.
+  return (`Σ gamma^k · reward_k`, `algorithm.gamma`) reported as `reward/env`. It must be a
+  finite JSON number (left out, it is 0). The client fails the episode on anything else,
+  including `NaN` and `Infinity`, which some JSON encoders write and which would turn the loss
+  of the training step into NaN.
 - Episodes are identified by `episode_id`. Servers may host many concurrently
   (`spec.parallel_episodes` tells the client how many); the client never sends two requests
   for the same episode at once. `close` is idempotent. Calling `reset` on a live id replaces
@@ -247,6 +250,12 @@ env:
 Spec, sampling, rewards and advantages work exactly as with Python envs: the env's per-turn
 rewards become the `env` term of the trajectory reward (discounted by `algorithm.gamma`) and are
 added to the score of any `rewards:` entries you configure.
+
+The client checks what a server sends before the run uses it:
+
+- A step whose `reward` is not a finite number fails the episode with an error that names the
+  environment, its address and the episode, and the client closes the episode at the server.
+  Like every failed episode it fails the run unless `env.max_failed_frac` tolerates it.
 
 The http servers of the Go and C++ SDKs answer every client that can connect, whatever the
 `Host`, `Origin` and `Content-Type` of its request, which includes a web page open in a browser
