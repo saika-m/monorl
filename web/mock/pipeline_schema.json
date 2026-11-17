@@ -606,7 +606,7 @@
       "properties": {
         "run_root": {
           "default": "~/.monorl/runs",
-          "description": "Directory that holds run directories.",
+          "description": "Directory that holds run directories; the default is `runs` under `$MONORL_HOME`.",
           "title": "Run Root",
           "type": "string"
         },

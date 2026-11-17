@@ -21,15 +21,16 @@ from pydantic import ValidationError
 
 from monorl.config.recipes import recipes_dir
 from monorl.core.errors import ConfigError, MonorlError
+from monorl.core.home import monorl_home
 from monorl.server.auth import AccessGuard, allowed_hosts_from_env, resolve_token, write_token
-from monorl.server.jobs import JobActive, JobManager, JobNotFound, default_home
+from monorl.server.jobs import JobActive, JobManager, JobNotFound
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @dataclass
 class ServerSettings:
-    home: Path = field(default_factory=default_home)
+    home: Path = field(default_factory=monorl_home)
     recipes_dir: Path = field(default_factory=recipes_dir)
     web_dist: Path = field(
         default_factory=lambda: Path(os.environ.get("MONORL_WEB_DIST") or REPO_ROOT / "web" / "dist")

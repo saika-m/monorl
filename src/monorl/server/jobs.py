@@ -34,6 +34,7 @@ from monorl.config.loader import mask_secrets
 from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
 from monorl.config.schema import RunConfig
 from monorl.core.errors import MonorlError
+from monorl.core.home import monorl_home, run_root
 from monorl.core.reporting import CONFIG_FILE, LOG_FILE, read_status
 from monorl.pipeline.stages import PIPELINE_CONFIG_FILE, default_pipeline_name
 from monorl.server.auth import TOKEN_ENV
@@ -53,10 +54,6 @@ class JobNotFound(MonorlError):
 
 class JobActive(MonorlError):
     """Raised when an operation needs a finished job but the process is still running."""
-
-
-def default_home() -> Path:
-    return Path(os.environ.get("MONORL_HOME") or "~/.monorl").expanduser()
 
 
 def train_command() -> list[str]:
@@ -109,7 +106,7 @@ class JobManager:
         pipeline_cmd: list[str] | None = None,
         grace_seconds: float | None = None,
     ) -> None:
-        self.home = Path(home).expanduser() if home is not None else default_home()
+        self.home = Path(home).expanduser() if home is not None else monorl_home()
         self.home.mkdir(parents=True, exist_ok=True)
         self.path = self.home / JOBS_FILE
         self._train_cmd = train_cmd
@@ -152,12 +149,12 @@ class JobManager:
         return (name if n == 1 else f"{name}-{n}"), candidate
 
     def _resolve_run_dir(self, config: RunConfig) -> tuple[str, Path]:
-        root = Path(config.logging.run_root).expanduser()
+        root = run_root(config.logging.run_root)
         name = _SAFE_NAME.sub("-", config.run_name) if config.run_name else default_run_name(config)
         return self._unique_run_dir(root, name)
 
     def _resolve_pipeline_dir(self, config: PipelineConfig) -> tuple[str, Path]:
-        root = Path(config.base.logging.run_root).expanduser()
+        root = run_root(config.base.logging.run_root)
         name = _SAFE_NAME.sub("-", config.name) if config.name else default_pipeline_name(config)
         return self._unique_run_dir(root, name)
 

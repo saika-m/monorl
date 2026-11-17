@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode
 
 from monorl.core.errors import ConfigError
+from monorl.core.home import monorl_home
 
 TOKEN_ENV = "MONORL_SERVER_TOKEN"
 ALLOWED_HOSTS_ENV = "MONORL_ALLOWED_HOSTS"
@@ -72,9 +73,7 @@ def write_token(home: Path, token: str) -> Path:
 
 def read_token(home: Path | None = None) -> str:
     """The token of the server that last started with this ``MONORL_HOME``, for API clients."""
-    from monorl.server.jobs import default_home
-
-    path = token_path(home if home is not None else default_home())
+    path = token_path(home if home is not None else monorl_home())
     try:
         return path.read_text().strip()
     except FileNotFoundError:

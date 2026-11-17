@@ -115,19 +115,19 @@ stays a string. The merged config is then validated by the schema, which rejects
 converts compatible strings (YAML reads `2e-6` as a string; the `float` field accepts it). List
 items cannot be addressed (`rewards.0.weight=2` is refused): replace the whole list.
 
-`logging.run_root` defaults to `~/.monorl/runs`. `run_name` defaults to
+`logging.run_root` defaults to `~/.monorl/runs`, which stands for `runs` under `$MONORL_HOME` when
+that variable is set (the server's jobs file and the caches are there too). `run_name` defaults to
 `<model basename>-<algorithm.name>-<YYYYmmdd-HHMMSS>`, for example
 `SmolLM2-135M-Instruct-grpo-20261112-224338`, and the default run directory is
-`<logging.run_root>/<run_name>`. The shipped recipes set a fixed `run_name`, so without
-`--run-dir` every run of a recipe uses the same directory. A run started in an existing directory
-without `--resume` starts at step 0 and appends to `metrics.jsonl`, `trajectories.jsonl`, `run.log`
-(a last line that a killed run left unfinished is removed first, so that the first row of the new
-run is not glued to it). It replaces `config.yaml`, `status.json`, `final/` and the checkpoints of
-the steps it saves. Everything else of the earlier run stays: its rows, and its checkpoints of
-other steps, which a later `--resume` takes for this run's when they are newer. Run here with the
-test fakes: 4 steps, then 2 steps without `--resume`, left the rows of steps 1, 2, 3, 4, 1, 2 and
-`step-4` of the first run, from which `--resume` then continued. Give a new run a directory of its
-own.
+`<logging.run_root>/<run_name>`. The shipped recipes set a fixed `run_name`, so without `--run-dir`
+every run of a recipe uses the same directory. A run started in an existing directory without
+`--resume` starts at step 0 and appends to `metrics.jsonl`, `trajectories.jsonl`, `run.log` (a last
+line that a killed run left unfinished is removed first, so that the first row of the new run is not
+glued to it). It replaces `config.yaml`, `status.json`, `final/` and the checkpoints of the steps it
+saves. Everything else of the earlier run stays: its rows, and its checkpoints of other steps, which
+a later `--resume` takes for this run's when they are newer. Run here with the test fakes: 4 steps,
+then 2 steps without `--resume`, left the rows of steps 1, 2, 3, 4, 1, 2 and `step-4` of the first
+run, from which `--resume` then continued. Give a new run a directory of its own.
 
 ### Resume
 

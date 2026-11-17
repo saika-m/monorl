@@ -16,6 +16,7 @@ from pathlib import Path
 
 from monorl.config.schema import RunConfig
 from monorl.core.errors import BackendUnavailable, ConfigError, DataError, RegistryError
+from monorl.core.home import run_root
 from monorl.core.registry import ensure_providers, registry
 from monorl.core.reporting import (
     CONFIG_FILE,
@@ -44,8 +45,9 @@ def default_run_name(config: RunConfig) -> str:
 
 
 def resolve_run_dir(config: RunConfig) -> Path:
-    """``<logging.run_root>/<run_name>`` (run_name defaults to ``<model>-<algorithm>-<timestamp>``)."""
-    return Path(config.logging.run_root).expanduser() / (config.run_name or default_run_name(config))
+    """``<logging.run_root>/<run_name>`` (run_name defaults to ``<model>-<algorithm>-<timestamp>``;
+    the default run root is ``runs`` under ``$MONORL_HOME``, :func:`monorl.core.home.run_root`)."""
+    return run_root(config.logging.run_root) / (config.run_name or default_run_name(config))
 
 
 def check_local_model(config: RunConfig) -> None:

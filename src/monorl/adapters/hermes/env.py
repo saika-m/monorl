@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Any
 
 from monorl.core.errors import BackendUnavailable
+from monorl.core.home import monorl_home
 from monorl.core.types import Completion, Message, Sample, StepResult, ToolCall, message_text
 from monorl.envs.tool_calling import parse_tool_calls
 
@@ -191,7 +192,7 @@ def load_skill_prompts(names: Sequence[str], skills_dir: str | os.PathLike[str] 
 
 def default_workspace_root() -> Path:
     """``$MONORL_HOME/hermes-workspaces`` (``~/.monorl`` by default): parent of per-episode workspaces."""
-    return Path(os.environ.get("MONORL_HOME") or "~/.monorl").expanduser() / "hermes-workspaces"
+    return monorl_home() / "hermes-workspaces"
 
 
 def sandbox_overrides(sandbox: Mapping[str, Any] | None) -> tuple[str, dict[str, Any]]:

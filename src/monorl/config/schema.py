@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from monorl.config.loader import mask_secrets
 from monorl.core.errors import ConfigError
+from monorl.core.home import DEFAULT_RUN_ROOT
 
 #: A dotted module path, as an import statement takes it.
 _MODULE_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
@@ -528,7 +529,10 @@ class ClusterConfig(_Model):
 
 
 class LoggingConfig(_Model):
-    run_root: str = Field("~/.monorl/runs", description="Directory that holds run directories.")
+    run_root: str = Field(
+        DEFAULT_RUN_ROOT,
+        description="Directory that holds run directories; the default is `runs` under `$MONORL_HOME`.",
+    )
     log_every: int = Field(
         1, ge=1, description="Write metrics every this many steps (the last step is always written)."
     )

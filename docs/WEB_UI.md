@@ -259,7 +259,7 @@ installed frameworks with patch status, registered components per namespace.
 
 | | |
 |---|---|
-| `MONORL_HOME` | jobs database and default run root (`~/.monorl`) |
+| `MONORL_HOME` | jobs database, server token and the default run root, `$MONORL_HOME/runs` (default `~/.monorl`) |
 | `logging.run_root` | where run directories go (`<run_root>/<run_name>`) |
 | `MONORL_RECIPES_DIR`, `MONORL_WEB_DIST`, `MONORL_ENVS_BIN`, `MONORL_ENVS_SDK` | override discovery paths |
 | `AWS_*`, `HF_TOKEN` | data connectors (read by the server process) |

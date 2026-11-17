@@ -19,6 +19,7 @@ from typing import Any
 
 from monorl.config.pipeline import EvalStage, PipelineConfig, RejectionSampleStage, TrainStage
 from monorl.core.errors import ConfigError, MonorlError
+from monorl.core.home import run_root
 from monorl.core.registry import ensure_providers
 from monorl.core.reporting import RunReporter
 from monorl.core.signals import signal_guard
@@ -59,7 +60,7 @@ def resolve_pipeline_run_dir(config: PipelineConfig, run_dir: Path | None = None
     name = config.name or default_pipeline_name(config)
     if run_dir is not None:
         return name, Path(run_dir).expanduser()
-    return name, Path(config.base.logging.run_root).expanduser() / name
+    return name, run_root(config.base.logging.run_root) / name
 
 
 def run_pipeline(

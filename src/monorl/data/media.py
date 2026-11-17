@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from monorl.core.errors import DataError
+from monorl.core.home import monorl_home
 from monorl.core.types import ContentPart, ImagePart
 from monorl.data.uri import storage_options_for
 
@@ -66,8 +67,7 @@ _PART_TYPE_ALIASES = {
 
 
 def media_cache_dir() -> Path:
-    home = Path(os.environ.get("MONORL_HOME") or "~/.monorl").expanduser()
-    return home / "cache" / "media"
+    return monorl_home() / "cache" / "media"
 
 
 def is_pil_image(value: Any) -> bool:

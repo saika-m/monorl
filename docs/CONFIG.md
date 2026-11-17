@@ -216,7 +216,7 @@ See: [RUNS.md](RUNS.md)
 
 | Key | Type, default | Description |
 | --- | --- | --- |
-| `logging.run_root` | string; default `~/.monorl/runs` | Directory that holds run directories. |
+| `logging.run_root` | string; default `~/.monorl/runs` | Directory that holds run directories; the default is `runs` under `$MONORL_HOME`. |
 | `logging.log_every` | integer, >= 1; default `1` | Write metrics every this many steps (the last step is always written). |
 | `logging.save_trajectories` | boolean; default `true` | Write sampled rollouts to trajectories.jsonl. |
 | `logging.trajectories_per_step` | integer, >= 0; default `8` | Rollouts saved per logged step at most; 0 saves none. |
