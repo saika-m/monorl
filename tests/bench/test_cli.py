@@ -180,3 +180,58 @@ def test_plan_command_rejects_unknown_preset(runner, recipe: Path, monkeypatch) 
     assert result.exit_code == 1
     assert "unknown hardware preset" in result.output
     assert calls == []
+
+
+def _flat(output: str) -> str:
+    """The output without the line breaks the console put in."""
+    return " ".join(output.split())
+
+
+def test_help_offers_no_completion_install(runner) -> None:
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "completion" not in result.output
+
+
+def test_rollout_with_a_missing_dataset_is_an_error_and_shuts_the_engine_down(
+    runner, registered_fake_engine, recipe: Path, tmp_path: Path
+) -> None:
+    result = runner.invoke(
+        app, ["rollout", "--config", str(recipe), "--set", f"data.uri={tmp_path / 'missing.jsonl'}"]
+    )
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "error: dataset path not found" in _flat(result.output)
+    assert registered_fake_engine.shutdowns == 1
+
+
+def test_json_path_that_cannot_be_written_is_an_error(runner, tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    result = runner.invoke(
+        app, ["sync", "--fake-params", "10", "--repeats", "1", "--json", str(blocker / "out.json")]
+    )
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "error: cannot write --json" in _flat(result.output)
+
+
+def test_text_in_brackets_is_printed_as_text(runner) -> None:
+    result = runner.invoke(app, ["env", "--url", "http://h", "--parallel", "[bold]1[/bold],[/x]"])
+    assert result.exit_code == 2
+    assert "got '[bold]1[/bold],[/x]'" in _flat(result.output)
+    result = runner.invoke(app, ["sync", "--fake-params", "10", "--strategy", "[/x]"])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "No weight_sync named '[/x]'" in _flat(result.output)
+
+
+def test_plan_given_a_pipeline_config_says_so(runner, run_config_dict, tmp_path: Path) -> None:
+    path = tmp_path / "pipeline.yaml"
+    stage = {"name": "rl", "type": "train"}
+    path.write_text(yaml.safe_dump({"name": "p", "base": run_config_dict, "stages": [stage]}))
+    result = runner.invoke(app, ["plan", "--config", str(path)])
+    assert result.exit_code == 1
+    out = _flat(result.output)
+    assert "is a pipeline config" in out and "config.yaml" in out
+    assert "invalid RunConfig" not in out
