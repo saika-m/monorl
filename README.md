@@ -121,7 +121,7 @@ Needs Python 3.12 and [uv](https://docs.astral.sh/uv/). Optional: Node 24 and pn
 UI, Go and clang++ for the example environments, Docker for sandboxed episodes.
 
 ```bash
-make install                # .venv + monorl[dev,trl,distributed,rewards,openenv,hermes]
+make install                # .venv with the packages of requirements.lock, and monorl
 source .venv/bin/activate
 monorl doctor               # what is installed, which patches apply, what is registered
 
@@ -141,8 +141,14 @@ A run writes `~/.monorl/runs/<run_name>/`: `config.yaml`, `status.json`, `metric
 `trajectories.jsonl`, `run.log`, `checkpoints/` and the exported model in `final/`. `--resume`
 continues from the latest checkpoint.
 
-GPU engines and backends are extras (`.[vllm]`, `.[sglang]`, `.[verl]`; `.[multimodal]` for
-images). Unsloth gets its own venv (`make install-unsloth`) and NeMo-RL is a git checkout
+`make install` installs the versions pinned in [`requirements.lock`](requirements.lock), the ones
+CI runs the tests on: monorl's dependencies with the extras `dev`, `trl`, `distributed`,
+`rewards`, `openenv`, `hermes` and `multimodal` (image prompts), and PyTorch's CPU build (on
+macOS the regular build, MPS included). `make sync` brings an existing `.venv` back to the lock
+after a pull.
+
+GPU engines and backends are extras (`.[vllm]`, `.[sglang]`, `.[verl]`) and are not part of the
+lock. Unsloth gets its own venv (`make install-unsloth`) and NeMo-RL is a git checkout
 (`NEMO_RL_HOME`); see [`docs/BACKENDS.md`](docs/BACKENDS.md).
 
 ## Recipes

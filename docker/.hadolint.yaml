@@ -3,7 +3,8 @@ ignored:
   # Base images are pinned by explicit version tags passed through ARG (hadolint cannot resolve ARGs).
   - DL3006
   - DL3007
-  # apt/pip/uv package versions are governed by pyproject.toml and the upstream images, not pinned here.
+  # apt/pip/uv package versions are governed by requirements.lock, pyproject.toml and the upstream
+  # images, not pinned here.
   - DL3008
   - DL3013
   - DL3042

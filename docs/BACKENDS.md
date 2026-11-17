@@ -175,7 +175,7 @@ vLLM/SGLang adapters yet.
   `monorl.adapters.unsloth.reconcile_trl_patches()` re-applies monorl's TRL patchset to the
   trainer classes Unsloth regenerates, so `trainer.backend: trl` also works with Unsloth imported.
   **Pin conflict:** unsloth 2026.10.11 declares `trl<=1.15.0` and `transformers<=5.17.0`, while
-  monorl's environment pins trl 1.17.1 / transformers 5.22; `pip install unsloth` into the monorl
+  `requirements.lock` has trl 1.17.1 / transformers 5.23.0; `pip install unsloth` into the monorl
   venv therefore downgrades (or refuses) those packages. Run Unsloth in its own environment:
   `make install-unsloth` creates `.venv-unsloth` with `monorl[unsloth,dev]` and the unsloth version
   pinned in `third_party/pins.toml` (uv resolves that to trl 1.15.0 / transformers 5.17.0 for Linux

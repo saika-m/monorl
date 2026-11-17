@@ -7,7 +7,7 @@ contracts between components are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
 ## Setup
 
 ```bash
-make install                # .venv (uv, Python 3.12) with the extras CI installs
+make install                # .venv (uv, Python 3.12) with the packages of requirements.lock
 scripts/dev/bootstrap.sh    # the same, plus the example environments and the web build
 ```
 
@@ -17,6 +17,29 @@ pnpm for the web UI. Run Python through `.venv/bin/python`, or activate the venv
 Development happens on macOS (arm64, no CUDA) and CI runs on Linux x86, CPU only. vLLM, SGLang,
 verl, NeMo-RL and Unsloth are not installed in either place, which shapes the testing rules
 below.
+
+## Dependencies
+
+`requirements.lock` pins every package of that environment: monorl's dependencies with the extras
+`dev`, `trl`, `distributed`, `multimodal`, `rewards`, `openenv` and `hermes`, and what builds
+monorl, each at one version with the hashes of its files. It is one file for every platform and
+for Python 3.11 and 3.12, with PyTorch's CPU builds. `make install`, CI and the CPU image install
+from it and resolve nothing themselves, so a release published upstream changes nothing here
+until a commit changes the lock.
+
+| When | Command |
+|---|---|
+| A dependency or an extra changed in `pyproject.toml`, or a pin in `third_party/pins.toml` | `make lock`, then `make sync` |
+| Take the newest allowed release of everything | `make lock-upgrade`, then `make sync` and the tests |
+| Take the newest allowed release of one package | `.venv/bin/python scripts/lock.py -P transformers` |
+| A pull changed the lock | `make sync` |
+
+`make lock` keeps every version that still fits, so its diff shows what the edit needed.
+`scripts/lock.py` describes what goes into the file. `tests/test_requirements_lock.py` fails when
+`pyproject.toml` or a pin asks for something the lock does not hold, and `make sync` ends with
+`uv pip check`. The GPU frameworks are not in the lock: each needs an environment of its own (its
+extra, `make install-unsloth`, the images under `docker/`), and a CUDA build of PyTorch comes with
+them.
 
 ## Checks
 
@@ -31,8 +54,9 @@ below.
 | Web UI | `cd web && pnpm install --frozen-lockfile && pnpm build && pnpm lint` |
 | Config reference is current | `.venv/bin/python -m monorl.config.reference --check docs/CONFIG.md` |
 
-CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: Python lint and
-`pytest tests -n 4 -m 'not slow and not network and not gpu'`, the Go and C++ SDK builds and tests,
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: `make install`,
+Python lint and `pytest tests -n 4 -m 'not slow and not network and not gpu'`, the Go and C++ SDK
+builds and tests,
 the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, and builds of the
 `envs` and `cpu` images. A newer push cancels the run of an older one.
 
