@@ -214,7 +214,8 @@ rewards:
 ### `composite`
 
 A weighted sum of member rewards as one entry: `params.rewards` (required) is a list shaped like
-top-level `rewards`. As a top-level entry only its total, under its `name`, is in the breakdown.
+top-level `rewards`. As a top-level entry its total is in the breakdown under its `name` and each
+member's score under `<name>/<member key>` (metric `reward/<name>/<member key>`).
 
 ```yaml
 rewards:

@@ -5,6 +5,7 @@ import pytest
 from monorl.config.schema import RewardSpec
 from monorl.core.interfaces import RewardFunction
 from monorl.core.registry import registry
+from monorl.orchestrator.metrics import reward_metrics
 from monorl.rewards import build_reward
 from monorl.rewards.base import extract_boxed, extract_code_block, extract_last_number
 
@@ -169,6 +170,55 @@ def test_build_reward_accepts_dicts_and_registered_composite(traj):
     assert nested([traj("4", "4")])[0].score == 3.0
     with pytest.raises(ValueError):
         build_reward([])
+
+
+def test_nested_composite_keeps_its_total_and_shows_its_members(traj):
+    style = {
+        "type": "composite",
+        "weight": 0.5,
+        "params": {
+            "name": "style",
+            "rewards": [
+                {"type": "format", "params": {"patterns": [r"^#"]}},
+                {"type": "format", "weight": 2.0, "params": {"patterns": [r"!$"], "name": "bang"}},
+            ],
+        },
+    }
+    fn = build_reward([{"type": "exact_match"}, style])
+    trajectories = [traj("# answer 4!", "4"), traj("# nope", "4")]
+    good, bad = fn(trajectories)
+    assert good.score == pytest.approx(1.0 + 0.5 * 3.0)
+    assert good.breakdown == {"exact_match": 1.0, "style": 3.0, "style/format": 1.0, "style/bang": 1.0}
+    assert bad.score == pytest.approx(0.5 * 1.0)
+    assert bad.breakdown == {"exact_match": 0.0, "style": 1.0, "style/format": 1.0, "style/bang": 0.0}
+
+    for t, res in zip(trajectories, (good, bad), strict=True):
+        t.reward, t.reward_breakdown = res.score, res.breakdown
+    metrics = reward_metrics(trajectories)
+    assert metrics["reward/style"] == 2.0
+    assert metrics["reward/style/format"] == 1.0 and metrics["reward/style/bang"] == 0.5
+
+
+def test_nested_composite_members_at_depth_two_and_next_to_a_colliding_name(traj):
+    inner = {"type": "composite", "params": {"name": "inner", "rewards": [{"type": "exact_match"}]}}
+    outer = {
+        "type": "composite",
+        "params": {"name": "outer", "rewards": [inner, {"type": "format", "params": {"patterns": ["4"]}}]},
+    }
+    # A top-level reward may already be called what a nested member would be reported as: its
+    # score stays under that name wherever it is listed, and the nested member gets a suffix.
+    taken = {"type": "format", "weight": 0.0, "params": {"patterns": ["never"], "name": "outer/format"}}
+    expected = {
+        "outer": 2.0,
+        "outer/inner": 1.0,
+        "outer/inner/exact_match": 1.0,
+        "outer/format#2": 1.0,
+        "outer/format": 0.0,
+    }
+    for specs in ([outer, taken], [taken, outer]):
+        [res] = build_reward(specs)([traj("4", "4")])
+        assert res.score == 2.0
+        assert res.breakdown == expected
 
 
 def test_rewards_reject_non_trajectories():
