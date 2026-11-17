@@ -16,6 +16,7 @@ Supported shapes:
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,19 @@ def filesystem_for(parsed: ParsedURI):
         raise DataError("hf:// datasets are loaded through `datasets`, not fsspec")
     scheme = "file" if parsed.kind == "local" else parsed.scheme
     try:
-        return fsspec.filesystem(scheme, **storage_options_for(scheme))
+        cls = fsspec.get_filesystem_class(scheme)
+        # A filesystem is opened from its scheme and the environment. One that takes more than
+        # that (ftp and smb a host, github an org and a repo) cannot be, and is not constructed.
+        needs = [
+            name
+            for name, param in list(inspect.signature(cls.__init__).parameters.items())[1:]
+            if param.default is param.empty and param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
+        ]
+        if not needs:
+            return cls(**storage_options_for(scheme))
     except (ValueError, ImportError) as e:  # unknown protocol or driver missing
         raise DataError(f"no fsspec driver for scheme {scheme!r} ({e}); install the matching package") from e
+    raise DataError(
+        f"{scheme}:// is not supported as a dataset location: its fsspec filesystem needs "
+        f"{', '.join(needs)}, and monorl opens a filesystem from its scheme and the environment"
+    )

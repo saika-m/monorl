@@ -153,6 +153,12 @@ def test_a_file_without_rows_says_so(tmp_path: Path) -> None:
         _open(tmp_path / "numbers.jsonl")
 
 
+def test_a_filesystem_that_needs_more_than_its_scheme_is_refused_by_name() -> None:
+    """fsspec's ftp filesystem takes a host: constructing it from the scheme was a TypeError."""
+    with pytest.raises(DataError, match="ftp:// is not supported as a dataset location.*needs host"):
+        open_source(DataConfig(uri="ftp://example.invalid/train.jsonl"))
+
+
 def test_local_streaming_is_lazy_and_len_raises(qa_jsonl: Path) -> None:
     src = _open(qa_jsonl, streaming=True)
     with pytest.raises(DataError):
