@@ -463,21 +463,89 @@ with the current weights and reports `eval/loss`, `eval/nll_token`, `eval/ppl` a
 
 ## Logging sinks
 
-`metrics.jsonl` is always written. `src/monorl/orchestrator/sinks.py` adds two optional sinks to
-the native loops; each receives the numeric metrics of every `metrics.jsonl` row, at the same step.
+`metrics.jsonl` is always written. `src/monorl/orchestrator/sinks.py` adds two optional sinks. Each
+gets every row of `metrics.jsonl` when it is written: every value the row records as a number,
+under the name it has there, at the row's step. Text and null values stay in `metrics.jsonl` only.
 
 | Key (default) | Package | Writes |
 |---|---|---|
-| `logging.wandb_project` (unset) | `wandb` | a W&B run in that project, named `run_name`, with the full config (`dir` is the run directory, `resume="allow"`); metrics under their names |
-| `logging.tensorboard` (false) | `tensorboard` | event files in `<run_dir>/tensorboard`; metrics under their names |
+| `logging.wandb_project` (unset) | `wandb` | a W&B run in that project, named `run_name`, with the full config; its files are in `<run_dir>/wandb/` (`WANDB_DIR` is not used) |
+| `logging.tensorboard` (false) | `tensorboard` | event files in `<run_dir>/tensorboard/`, one per start of the run |
 
-Neither package is a dependency of monorl. When the package is missing or initialisation fails the
-sink is skipped and the run continues, as in this run without the package (logging to an
-installed W&B or TensorBoard was not run here):
+Neither package is a dependency of monorl or in `requirements.lock`. This section was run in a copy
+of `.venv` with `tensorboard` 2.21.0 and `wandb` 0.31.0 added, W&B offline (`WANDB_MODE=offline`);
+nothing was sent to a W&B server, so what the W&B site shows was not seen.
+
+```bash
+WANDB_MODE=offline .venv/bin/monorl train \
+  --config configs/recipes/grpo_gsm8k_smollm_cpu.yaml \
+  --set trainer.max_steps=3 --set data.limit=4 --set rollout.max_new_tokens=16 \
+  --set data.eval_uri=hf://openai/gsm8k --set trainer.eval_every=2 \
+  --set trainer.save_every=2 --set logging.tensorboard=true \
+  --set logging.wandb_project=monorl-docs --run-dir /tmp/monorl-docs-runs/sinks
+```
+
+`run.log` says where each sink writes:
 
 ```text
-... logging.tensorboard is set but `tensorboard` is not installed; skipping
+... wandb: new run etztty9w in project monorl-docs, files in .../sinks/wandb/<run>/files
+... tensorboard: events in .../sinks/tensorboard
 ```
+
+where `<run>` is `offline-run-20261117_021215-etztty9w`. The four rows of that run (steps 1 to 3
+and the evaluation of step 2) hold 135 values. The event file, read with TensorBoard's
+`EventAccumulator`, and the W&B run, read from its `run-etztty9w.wandb` file, each hold those 135
+values at the same steps under the same names, and the W&B run holds the config of `config.yaml`.
+
+- **Who logs.** The RL loop, the SFT loop, `trainer.backend: trl` and every stage of a pipeline.
+  A `train`, `rejection_sample` or `eval` stage has a W&B run of its own, named like its stage
+  directory (`01-rejection_sample`), and a `tensorboard/` in that directory. Run here: a pipeline
+  of an SFT, a rejection sampling and an evaluation stage (50, 15 and 13 values, all in both sinks)
+  and `configs/recipes/trl_grpo_cpu.yaml` with an evaluation (see the next point). The backends
+  `verl` and `nemo_rl` log through their framework, see the table below.
+- **One W&B row per step.** The train and the evaluation metrics of a step are one row, which W&B
+  writes when the next step is logged or the run ends. A name that several rows of one step carry
+  (TRL repeats `train/epoch` in its evaluation and closing rows) is one value in W&B, the last,
+  and one point per row in TensorBoard: of the 122 values of the TRL run's 6 rows, TensorBoard had
+  122 and W&B the 119 with distinct name and step.
+- **Non-finite values.** NaN and the infinities are stored as such in both sinks.
+- **How a run ends.** The sinks are closed when a run succeeds, fails or is cancelled, and both
+  held every logged row in each of these cases. The W&B run ends with exit code 0 (finished) after
+  a run that succeeded or that stopped after its step on a signal, and with exit code 1 (failed)
+  after a run that failed or that a second signal interrupted. With `trainer.backend: trl` this was
+  run for a failed run: exit code 1 and every logged step in both sinks. After `SIGKILL` at step 12
+  the event file had all 12 steps and the W&B file the first 10, and its run has no exit code.
+- **Resume.** The first row a start of the run logs marks its step, and TensorBoard hides what
+  earlier starts wrote to the directory for that step and later ones. The run above, resumed with
+  `--resume` and `trainer.max_steps=4`, starts at the checkpoint of step 2 and logs step 3 again:
+  `metrics.jsonl` then has two rows for step 3, `tensorboard/` two event files that show steps 1
+  to 4 once each (188 points), step 3 with the values of its second row. For the same reason a run
+  started again in its directory without `--resume` shows the new run only. In W&B every start is
+  a new run of the same name: `run.log` has a second `wandb: new run 4dzz4bhc ...` line, the
+  first run keeps steps 1 to 3 and the second has steps 3 and 4. With wandb's `WANDB_RUN_ID` set,
+  both starts use that id (two `offline-run-*` directories with one id); whether the server joins
+  them was not run.
+- **A sink that cannot write.** A missing package, an initialisation that fails and a failure
+  while logging each write one line to `run.log`; the sink is skipped from there on and the run
+  continues. The first four lines are from runs, the last from the tests, where a writer fails:
+
+```text
+... logging.wandb_project is set but `wandb` is not installed; skipping wandb
+... logging.tensorboard is set but `tensorboard` is not installed; skipping
+... wandb init failed (ValidationError: 1 validation error for ...); skipping wandb
+... tensorboard init failed (FileExistsError: [Errno 17] File exists: ...); skipping
+... tensorboard logging failed (OSError: [Errno 28] No space left on device); skipping
+    tensorboard for the rest of the run
+```
+
+`trainer.backend: verl` and `nemo_rl` do not use these sinks. monorl turns the two keys into
+settings of the framework's own loggers, which write under the framework's metric names (from the
+code, not run here: neither framework is installed):
+
+| Backend | `logging.wandb_project` | `logging.tensorboard` |
+|---|---|---|
+| `verl` | adds `wandb` to `trainer.logger`; the run is named `run_name` and its project is always `monorl`, not the value of the key | adds `tensorboard` to `trainer.logger`; monorl passes no directory |
+| `nemo_rl` | `logger.wandb_enabled`, with the project and `run_name` in `logger.wandb` | `logger.tensorboard_enabled`; `logger.log_dir` is `<run_dir>/nemo_rl/logs` |
 
 ## Pipeline backends and pipelines
 
