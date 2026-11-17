@@ -23,9 +23,9 @@ below.
 `requirements.lock` pins every package of that environment: monorl's dependencies with the extras
 `dev`, `trl`, `distributed`, `multimodal`, `rewards`, `openenv` and `hermes`, and what builds
 monorl, each at one version with the hashes of its files. It is one file for macOS on Apple
-silicon, Linux and Windows and for Python 3.11 and 3.12, with PyTorch's CPU builds. `make
-install`, CI and the CPU image install from it, from wheels only, and resolve nothing themselves,
-so a release published upstream changes nothing here until a commit changes the lock.
+silicon, Linux and Windows and for Python 3.11 and 3.12, with PyTorch's CPU builds.
+`make install`, CI and the CPU image install from it, from wheels only, and resolve nothing
+themselves, so a release published upstream changes nothing here until a commit changes the lock.
 
 | When | Command |
 |---|---|
