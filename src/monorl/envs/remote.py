@@ -7,6 +7,10 @@
     {"transport": "http", "url": "http://127.0.0.1:8080", "parallel": 16, "timeout_s": 60}
     {"transport": "http", "urls": ["http://env-1:8080", "http://env-2:8080"], "timeout_s": 60}
 
+What a server sends is checked before the run uses it: a response larger than
+``max_response_bytes`` (default 64 MiB; a stdio response line longer than that many characters) is
+not read to its end, and a step whose reward is not a finite number fails the episode.
+
 Stdio: the orchestrator spawns the env binary and speaks JSON lines over its stdin/stdout; stderr
 is forwarded to the ``monorl.envs.remote`` logger. One process serves up to
 ``spec.parallel_episodes`` (or ``params.parallel``) concurrent episodes; a process-pool keyed by
@@ -57,6 +61,19 @@ from monorl.envs.tool_calling import parse_tool_calls
 log = logging.getLogger("monorl.envs.remote")
 
 _EOF = object()
+_OVERSIZE = object()
+
+DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+"""Default of ``params.max_response_bytes``: the request limit of the Go SDK's http server. A
+response carries messages, and media in them by reference; a screenshot inlined as a ``data:``
+URL is a few MiB."""
+
+
+def _response_limit(params: Mapping[str, Any]) -> int:
+    value = params.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"remote env: params.max_response_bytes must be a positive integer, got {value!r}")
+    return value
 
 
 class Transport(Protocol):
@@ -81,6 +98,7 @@ class StdioTransport:
         env: Mapping[str, str] | None = None,
         timeout_s: float = 60.0,
         start_timeout_s: float | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         if not command:
             raise ValueError("stdio transport needs a non-empty command")
@@ -88,6 +106,7 @@ class StdioTransport:
         self.cwd = cwd
         self.env = dict(env) if env else None
         self.timeout_s = float(timeout_s)
+        self.max_response_bytes = int(max_response_bytes)
         self.start_timeout_s = (
             float(start_timeout_s) if start_timeout_s is not None else max(self.timeout_s, 30.0)
         )
@@ -121,7 +140,10 @@ class StdioTransport:
         self.generation += 1
         proc = self._proc
         threading.Thread(
-            target=self._pump_stdout, args=(proc, self._lines), daemon=True, name="mep-stdout"
+            target=self._pump_stdout,
+            args=(proc, self._lines, self.max_response_bytes),
+            daemon=True,
+            name="mep-stdout",
         ).start()
         threading.Thread(target=self._pump_stderr, args=(proc,), daemon=True, name="mep-stderr").start()
         log.info(
@@ -132,9 +154,16 @@ class StdioTransport:
         )
 
     @staticmethod
-    def _pump_stdout(proc: subprocess.Popen[str], lines: queue.Queue[Any]) -> None:
+    def _pump_stdout(proc: subprocess.Popen[str], lines: queue.Queue[Any], limit: int) -> None:
         assert proc.stdout is not None
-        for line in proc.stdout:
+        while True:
+            line = proc.stdout.readline(limit + 1)
+            if not line:
+                break
+            if len(line) > limit and not line.endswith("\n"):
+                # The rest of the line is not read: the request that sees this restarts the process.
+                lines.put(_OVERSIZE)
+                return
             lines.put(line)
         lines.put(_EOF)
 
@@ -209,6 +238,11 @@ class StdioTransport:
                     raise self._crash(f"no response within {timeout}s") from None
                 if line is _EOF:
                     raise self._crash("process closed stdout")
+                if line is _OVERSIZE:
+                    raise self._crash(
+                        f"a response line is longer than {self.max_response_bytes} characters "
+                        "(env.params.max_response_bytes) and was not read"
+                    )
                 if line.strip():
                     break
             try:
@@ -247,13 +281,25 @@ class HttpTransport:
     """Shared client for one MEP/1 http server; safe to use from many threads."""
 
     def __init__(
-        self, url: str, *, timeout_s: float = 60.0, headers: Mapping[str, str] | None = None
+        self,
+        url: str,
+        *,
+        timeout_s: float = 60.0,
+        headers: Mapping[str, str] | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         import httpx
 
         self.url = url.rstrip("/")
         self.timeout_s = float(timeout_s)
-        self._client = httpx.Client(base_url=self.url, timeout=self.timeout_s, headers=dict(headers or {}))
+        self.max_response_bytes = int(max_response_bytes)
+        # Uncompressed responses: the limit counts the bytes that arrive, and a few of them must
+        # not unpack into more.
+        self._client = httpx.Client(
+            base_url=self.url,
+            timeout=self.timeout_s,
+            headers={"accept-encoding": "identity", **dict(headers or {})},
+        )
         self._spec: EnvSpec | None = None
         self._spec_lock = threading.Lock()
 
@@ -262,22 +308,56 @@ class HttpTransport:
 
         body = dict(payload)
         op = body.pop("op")
+        request = (
+            self._client.build_request("GET", f"/{op}")
+            if op in ("spec", "health")
+            else self._client.build_request("POST", f"/{op}", json=body)
+        )
         try:
-            if op in ("spec", "health"):
-                resp = self._client.get(f"/{op}")
-            else:
-                resp = self._client.post(f"/{op}", json=body)
+            resp = self._client.send(request, stream=True)
+            try:
+                raw = self._read(op, resp)
+            finally:
+                resp.close()
         except httpx.HTTPError as e:
             raise EnvironmentError_(f"MEP http request {op} to {self.url} failed: {e}") from e
+        text = raw[:200].decode("utf-8", errors="replace")
         try:
-            payload_out = resp.json()
+            payload_out = json.loads(raw)
         except ValueError as e:
-            raise ProtocolError(
-                "protocol", f"non-JSON response (HTTP {resp.status_code}): {resp.text[:200]!r}"
-            ) from e
+            raise ProtocolError("protocol", f"non-JSON response (HTTP {resp.status_code}): {text!r}") from e
         if resp.status_code >= 400 and not (isinstance(payload_out, dict) and payload_out.get("error")):
-            raise ProtocolError("http", f"HTTP {resp.status_code}: {resp.text[:200]}")
+            raise ProtocolError("http", f"HTTP {resp.status_code}: {text}")
         return parse_response(payload_out)
+
+    def _read(self, op: str, resp: Any) -> bytes:
+        """The body of ``resp``, read no further than ``max_response_bytes``."""
+        limit = self.max_response_bytes
+        encoding = resp.headers.get("content-encoding", "identity").strip().lower()
+        if encoding not in ("", "identity"):
+            raise EnvironmentError_(
+                f"MEP http response to {op} from {self.url} is compressed ({encoding[:40]}) although "
+                "the request asked for none; refused, because its size cannot be bounded before "
+                "unpacking. Turn compression off at the server or the proxy in front of it"
+            )
+        declared = resp.headers.get("content-length", "")
+        too_large = declared.isdigit() and int(declared) > limit
+        chunks: list[bytes] = []
+        size = 0
+        if not too_large:
+            for chunk in resp.iter_raw():
+                size += len(chunk)
+                if size > limit:
+                    too_large = True
+                    break
+                chunks.append(chunk)
+        if too_large:
+            raise EnvironmentError_(
+                f"MEP http response to {op} from {self.url} is larger than {limit} bytes and was "
+                "not read; if this environment's observations are that large, raise "
+                "env.params.max_response_bytes"
+            )
+        return b"".join(chunks)
 
     def spec(self) -> EnvSpec:
         with self._spec_lock:
@@ -380,8 +460,14 @@ class StdioPool:
         env: Mapping[str, str] | None = None,
         timeout_s: float = 60.0,
         parallel: int | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
-        self._kwargs = {"cwd": cwd, "env": env, "timeout_s": timeout_s}
+        self._kwargs = {
+            "cwd": cwd,
+            "env": env,
+            "timeout_s": timeout_s,
+            "max_response_bytes": max_response_bytes,
+        }
         self.command = list(command)
         self._parallel_override = parallel
         self._slots: list[_Slot] = []
@@ -455,6 +541,7 @@ def _pool_key(params: Mapping[str, Any]) -> tuple[Any, ...]:
             tuple(_http_urls(params)),
             float(params.get("timeout_s", 60.0)),
             params.get("parallel"),
+            _response_limit(params),
         )
     env_items = tuple(sorted((str(k), str(v)) for k, v in dict(params.get("env") or {}).items()))
     return (
@@ -464,6 +551,7 @@ def _pool_key(params: Mapping[str, Any]) -> tuple[Any, ...]:
         env_items,
         float(params.get("timeout_s", 60.0)),
         params.get("parallel"),
+        _response_limit(params),
     )
 
 
@@ -481,10 +569,13 @@ def slot_source_for(params: Mapping[str, Any]) -> SlotSource:
         source = _POOLS.get(key)
         if source is None:
             timeout_s = float(params.get("timeout_s", 60.0))
+            limit = _response_limit(params)
             if transport == "http":
                 source = HttpSlotSource(
                     [
-                        HttpTransport(url, timeout_s=timeout_s, headers=params.get("headers"))
+                        HttpTransport(
+                            url, timeout_s=timeout_s, headers=params.get("headers"), max_response_bytes=limit
+                        )
                         for url in _http_urls(params)
                     ],
                     parallel=params.get("parallel"),
@@ -496,6 +587,7 @@ def slot_source_for(params: Mapping[str, Any]) -> SlotSource:
                     env=params.get("env"),
                     timeout_s=timeout_s,
                     parallel=params.get("parallel"),
+                    max_response_bytes=limit,
                 )
             _POOLS[key] = source
         return source

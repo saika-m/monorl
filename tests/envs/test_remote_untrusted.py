@@ -3,6 +3,7 @@ should: the servers here are scripted, since monorl's own server cannot be made 
 
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 import threading
@@ -14,7 +15,7 @@ import pytest
 
 from monorl.core.errors import EnvironmentError_
 from monorl.core.types import Completion, Sample
-from monorl.envs.remote import RemoteEnv, shutdown_pools
+from monorl.envs.remote import RemoteEnv, StdioTransport, shutdown_pools, slot_source_for
 
 SPEC = '{"name": "scripted-env", "protocol": "MEP/1", "max_turns": 3, "parallel_episodes": 4}'
 RESET = '{"messages": [{"role": "user", "content": "hi"}], "info": {}}'
@@ -31,6 +32,7 @@ class ScriptedServer:
     def __init__(self) -> None:
         self.paths: list[str] = []
         self.respond: Callable[[BaseHTTPRequestHandler], None] = lambda h: self.send(h, _step("0"))
+        self.sent = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -62,6 +64,21 @@ class ScriptedServer:
             handler.send_header(name.replace("_", "-"), value)
         handler.end_headers()
         handler.wfile.write(body)
+
+    def stream(self, handler: BaseHTTPRequestHandler, total: int) -> None:
+        """A body of ``total`` bytes without a declared length, sent until the client hangs up."""
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.end_headers()
+        chunk = b" " * 65536
+        try:
+            handler.wfile.write(b'{"messages": [], "reward": 0, "done": false, "info": {}')
+            while self.sent < total:
+                handler.wfile.write(chunk)
+                self.sent += len(chunk)
+            handler.wfile.write(b"}")
+        except OSError:
+            pass
 
     def close(self) -> None:
         self.httpd.shutdown()
@@ -150,3 +167,62 @@ def test_a_non_finite_reward_stops_the_run(server, make_config):
     error = result.error.splitlines()[0]
     assert "environment 'scripted-env'" in error and "reward must be a finite number, got nan" in error
     assert not result.checkpoints
+
+
+# -- response size ---------------------------------------------------------------------------
+
+
+def test_http_response_larger_than_the_limit_is_refused(server):
+    server.respond = lambda h: server.send(h, _step("0", padding=5000))
+    env = _episode({"transport": "http", "url": server.url, "max_response_bytes": 2000})
+    with pytest.raises(EnvironmentError_, match="larger than 2000 bytes.*env.params.max_response_bytes"):
+        env.step(_c())
+    assert env.episode_id is None
+
+    roomy = _episode({"transport": "http", "url": server.url, "max_response_bytes": 10_000})
+    assert len(roomy.step(_c()).info["pad"]) == 5000
+    roomy.close()
+
+
+def test_http_response_without_a_length_is_not_read_past_the_limit(server):
+    total = 32 * 1024 * 1024
+    server.respond = lambda h: server.stream(h, total)
+    env = _episode({"transport": "http", "url": server.url, "max_response_bytes": 100_000})
+    with pytest.raises(EnvironmentError_, match="larger than 100000 bytes"):
+        env.step(_c())
+    # the client hung up; what the server got rid of is what the sockets buffer
+    assert server.sent < total
+
+
+def test_http_compressed_response_is_refused(server):
+    # 4 kB on the wire that unpack to 4 MB
+    packed = gzip.compress(_step("0", padding=4 * 1024 * 1024).encode())
+    server.respond = lambda h: server.send(h, packed, Content_Encoding="gzip")
+    env = _episode({"transport": "http", "url": server.url})
+    with pytest.raises(EnvironmentError_, match="compressed \\(gzip\\)"):
+        env.step(_c())
+
+
+def test_stdio_response_line_longer_than_the_limit_restarts_the_process(tmp_path: Path):
+    script = tmp_path / "long_env.py"
+    script.write_text(
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    op = json.loads(line)['op']\n"
+        f"    answers = {{'spec': {SPEC!r}, 'health': '{{\"ok\": true}}', 'reset': {_step('0', 50_000)!r}}}\n"
+        "    print(answers.get(op, '{}'), flush=True)\n"
+    )
+    transport = StdioTransport([sys.executable, str(script)], timeout_s=30, max_response_bytes=10_000)
+    try:
+        assert transport.spec().name == "scripted-env"
+        with pytest.raises(EnvironmentError_, match="longer than 10000 characters.*max_response_bytes"):
+            transport.request({"op": "reset", "episode_id": "e", "sample": {"id": "s"}})
+        assert transport.restarts == 1 and transport.health()
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("value", [0, -1, "64MB", 1.5, True])
+def test_max_response_bytes_must_be_a_positive_integer(value):
+    with pytest.raises(ValueError, match="max_response_bytes must be a positive integer"):
+        slot_source_for({"transport": "http", "url": "http://127.0.0.1:9", "max_response_bytes": value})

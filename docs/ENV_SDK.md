@@ -256,6 +256,11 @@ The client checks what a server sends before the run uses it:
 - A step whose `reward` is not a finite number fails the episode with an error that names the
   environment, its address and the episode, and the client closes the episode at the server.
   Like every failed episode it fails the run unless `env.max_failed_frac` tolerates it.
+- A response larger than `params.max_response_bytes` (default `67108864`, 64 MiB) is not read
+  to its end and fails the episode. Over stdio the limit counts the characters of a response
+  line, and the process is restarted. Over http the client asks for an uncompressed response
+  and refuses a compressed one, whose size it could not bound. Raise the limit for an
+  environment whose observations inline media as `data:` URLs of that size.
 
 The http servers of the Go and C++ SDKs answer every client that can connect, whatever the
 `Host`, `Origin` and `Content-Type` of its request, which includes a web page open in a browser
