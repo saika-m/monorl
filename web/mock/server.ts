@@ -191,7 +191,7 @@ const RECIPES: { name: string; description: string; kind: "run" | "pipeline"; co
       data: { uri: "hf://HuggingFaceM4/VQAv2-sample", image_field: "image", prompt_field: "question", answer_field: "answer", format: "prompt_answer", prompt_template: "<image>\n{prompt}\nAnswer with a single word." },
       rollout: { backend: "vllm", group_size: 4, max_new_tokens: 32 },
       trainer: { max_steps: 100 },
-      rewards: [{ type: "exact_match", weight: 1.0, params: { normalize: true } }],
+      rewards: [{ type: "exact_match", weight: 1.0, params: { normalize: ["whitespace", "case"] } }],
       cluster: { gpus_per_node: 1, placement: "colocated" },
     },
   },
