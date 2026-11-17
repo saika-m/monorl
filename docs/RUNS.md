@@ -113,7 +113,7 @@ missing mappings) and parses the value with `yaml.safe_load`, so `10` is an int,
 `null` is None, `[a, b]` a list, `{type: exact_match}` a mapping, and text that is not valid YAML
 stays a string. The merged config is then validated by the schema, which rejects unknown keys and
 converts compatible strings (YAML reads `2e-6` as a string; the `float` field accepts it). List
-items cannot be addressed (`rewards.0.weight=2` fails validation): replace the whole list.
+items cannot be addressed (`rewards.0.weight=2` is refused): replace the whole list.
 
 `logging.run_root` defaults to `~/.monorl/runs`. `run_name` defaults to
 `<model basename>-<algorithm.name>-<YYYYmmdd-HHMMSS>`, for example
@@ -258,7 +258,8 @@ here). Without a checkpoint the run logs
 
 `src/monorl/core/reporting.py` owns the layout and has the readers the server and CLI use:
 `read_status`, `iter_metrics`, `iter_trajectories` and `list_checkpoints`. Besides the files below,
-`<run_dir>/tensorboard/` exists when the TensorBoard sink is active.
+`<run_dir>/tensorboard/` and `<run_dir>/wandb/` exist when those sinks are active
+([Logging sinks](#logging-sinks)).
 
 ### `config.yaml`
 
