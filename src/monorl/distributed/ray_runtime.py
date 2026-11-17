@@ -24,8 +24,9 @@ Topology
 Weight sync (``plan.weight_sync``)
 ----------------------------------
 * ``inprocess`` → :class:`RayObjectStoreWeightSync`: rank-0 trainer actor chunks its exported
-  weights into the object store (``cluster.extra.sync_chunk_bytes``, default 64 MiB, CPU tensors);
-  every engine actor pulls and applies them.
+  weights into the object store (``cluster.extra.sync_chunk_bytes``, default 64 MiB); every engine
+  actor pulls and applies them. A tensor is stored as its raw bytes out of band
+  (:func:`_store_chunk`), so a reader maps it instead of unpickling a copy (:func:`_stored_weights`).
 * ``broadcast`` → :class:`RayBroadcastWeightSync`: rendezvous (node IP + free port) obtained from
   the rank-0 trainer actor; engine actors join as ranks ``1 + i*tp + r``; NCCL with GPUs, gloo without.
 * ``cuda_ipc`` → :class:`RayCudaIpcWeightSync`: rank-0 trainer actor exports IPC handles (kept
@@ -44,6 +45,7 @@ import os
 import socket
 import sys
 import time
+import warnings
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -65,6 +67,7 @@ from monorl.distributed.weight_sync import (
     IpcHandle,
     open_ipc_handles,
 )
+from monorl.mtp import is_wire_name
 
 if TYPE_CHECKING:
     from monorl.core.interfaces import RolloutEngine, Trainer, WeightSync
@@ -104,6 +107,43 @@ def _group_env(master_addr: str, master_port: int, rank: int, world_size: int) -
         "WORLD_SIZE": str(world_size),
         "LOCAL_RANK": "0",
     }
+
+
+# -- weights in the object store ------------------------------------------------------------------
+#
+# Ray pickles a torch tensor in band: its bytes are copied into the pickle stream on ``ray.put``
+# and out of it, twice, on ``ray.get``. A numpy array travels out of band instead: ``ray.put``
+# writes its bytes straight into the store and ``ray.get`` returns an array over the stored bytes.
+# numpy has no bfloat16, so every tensor is stored as a flat uint8 view next to its dtype and shape.
+
+
+def _store_chunk(chunk: list[tuple[str, torch.Tensor]]) -> Any:
+    """``ray.put`` contiguous CPU tensors as ``(name, dtype, shape, bytes)`` records. The store
+    holds its own copy when this returns: the tensors may change afterwards."""
+    import ray
+
+    return ray.put(
+        [(name, t.dtype, tuple(t.shape), t.reshape(-1).view(torch.uint8).numpy()) for name, t in chunk]
+    )
+
+
+def _stored_weights(ref: Any, *, private: bool) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tensors of one :func:`_store_chunk` object.
+
+    They are views of the store's memory, which every reader of the object shares and which stays
+    allocated for as long as one of them is alive: valid to read and to copy from, never to write
+    to or to keep. ``private`` yields copies the consumer owns instead; so do the MTP layers'
+    weights (:func:`monorl.mtp.is_wire_name`) in either case, because the loader that puts them
+    into a drafter adopts the tensors it is given as parameters
+    (:meth:`monorl.mtp.MtpLayers.load_checkpoint_weights`)."""
+    import ray
+
+    for name, dtype, shape, raw in ray.get(ref):
+        with warnings.catch_warnings():
+            # torch warns that it cannot mark the tensor read-only; the contract above does that.
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            tensor = torch.from_numpy(raw).view(dtype).view(shape)
+        yield name, tensor.clone() if private or is_wire_name(name) else tensor
 
 
 # -- actors (plain classes; wrapped with ray.remote lazily so importing this module is Ray-free) --
@@ -178,13 +218,11 @@ class RolloutEngineActor:
 
     # weight sync entry points
     def pull_weights(self, refs: list[Any]) -> int:
-        import ray
-
         counted = [0]
 
         def stream() -> Iterator[tuple[str, torch.Tensor]]:
             for ref in refs:
-                for name, tensor in ray.get(ref):
+                for name, tensor in _stored_weights(ref, private=False):
                     counted[0] += tensor.numel() * tensor.element_size()
                     yield name, tensor
 
@@ -272,24 +310,23 @@ class TrainerActor:
 
     # weight export paths
     def export_weight_chunks(self, chunk_bytes: int) -> tuple[list[Any], int]:
-        """``ray.put`` CPU chunks of the exported weights; returns ``(refs, total_bytes)``."""
-        import ray
-
+        """Put the exported weights into the object store in chunks (:func:`_store_chunk`);
+        returns ``(refs, total_bytes)``."""
         refs: list[Any] = []
         chunk: list[tuple[str, torch.Tensor]] = []
         pending = 0
         total = 0
         for name, tensor in self._trainer().export_weights():
-            t = tensor.detach().cpu().contiguous()
+            t = tensor.detach().cpu().contiguous().resolve_conj().resolve_neg()
             size = t.numel() * t.element_size()
             if chunk and pending + size > chunk_bytes:
-                refs.append(ray.put(chunk))
+                refs.append(_store_chunk(chunk))
                 chunk, pending = [], 0
             chunk.append((name, t))
             pending += size
             total += size
         if chunk:
-            refs.append(ray.put(chunk))
+            refs.append(_store_chunk(chunk))
         return refs, total
 
     def export_weights_list(self) -> list[tuple[str, torch.Tensor]]:
@@ -461,7 +498,7 @@ class RayTrainer:
 
         refs, _ = ray.get(self.actors[0].export_weight_chunks.remote(DEFAULT_SYNC_CHUNK_BYTES))
         for ref in refs:
-            yield from ray.get(ref)
+            yield from _stored_weights(ref, private=True)
 
     def save_checkpoint(self, path: Path) -> None:
         import ray

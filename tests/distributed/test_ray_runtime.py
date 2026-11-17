@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
-from distributed_fakes import make_weights, weight_sum
+from distributed_fakes import FakeEngine, FakeTrainer, make_weights, weight_sum
 
 from monorl.core.batch import TrainBatch
 from monorl.core.interfaces import RolloutEngine, Trainer
-from monorl.core.types import SamplingParams, SpeculationStats
+from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats
 from monorl.distributed import build_runtime
 from monorl.distributed.ray_runtime import RayBroadcastWeightSync, RayObjectStoreWeightSync
+from monorl.mtp import WIRE_PREFIX
 
 ray = pytest.importorskip("ray")
 
@@ -22,6 +27,83 @@ def ray_session():
     ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
     yield
     ray.shutdown()
+
+
+# -- a provider for the actors (``cluster.extra.providers = ["test_ray_runtime"]``) ---------------
+
+MTP_NAME = WIRE_PREFIX + "mtp.head.weight"
+
+
+def mixed_state() -> dict[str, torch.Tensor]:
+    """Every kind of tensor a state holds, in the forms a trainer may hand out: dtypes with and
+    without a numpy counterpart, views that are not contiguous, a parameter, no dimension, no
+    element, and values that only survive a byte-exact transfer."""
+    g = torch.Generator().manual_seed(7)
+    return {
+        "f32.weight": torch.nn.Parameter(torch.randn(8, 4, generator=g)),
+        "f32.transposed": torch.randn(6, 5, generator=g).t(),
+        "f32.strided": torch.randn(16, generator=g)[1::3],
+        "f32.special": torch.tensor([float("nan"), -0.0, float("inf"), 1e-45]),
+        "bf16.weight": torch.randn(5, 3, generator=g).to(torch.bfloat16),
+        "f16.weight": torch.randn(3, generator=g).to(torch.float16),
+        "i64.ids": torch.arange(-3, 4, dtype=torch.int64) * (2**40 + 1),
+        "bool.mask": torch.tensor([True, False, True]),
+        "scalar": torch.tensor(2.5),
+        "empty": torch.empty(0, 3),
+        # larger than Ray inlines into the owner's memory, like real weights: read from the store
+        "f32.large": torch.randn(300, 200, generator=g),
+        MTP_NAME: torch.randn(250, 200, generator=g),
+    }
+
+
+def fingerprint(state: dict[str, torch.Tensor]) -> dict[str, list[Any]]:
+    """Name → dtype, shape, the values' bytes (their digest when there are many) and whether
+    autograd tracks the tensor."""
+    out = {}
+    for name, tensor in state.items():
+        t = tensor.detach()
+        widened = t.to(torch.float32) if t.dtype == torch.bfloat16 else t  # exact; numpy has no bf16
+        raw = widened.contiguous().numpy().tobytes()
+        shown = raw.hex() if len(raw) <= 64 else hashlib.sha256(raw).hexdigest()
+        out[name] = [str(t.dtype), list(t.shape), shown, tensor.requires_grad]
+    return out
+
+
+class StateTrainer(FakeTrainer):
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(1, **kw)
+        self.weights = mixed_state()
+
+    def export_weights(self) -> Iterator[tuple[str, torch.Tensor]]:
+        yield from self.weights.items()
+
+
+class StateEngine(FakeEngine):
+    """Holds copies of what it was given, and treats the MTP layers' tensors as its own the way a
+    drafter does that adopts them as parameters: it writes to them."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(0, **kw)
+        self.held: dict[str, torch.Tensor] = {}
+
+    def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        self.held = {}
+        for name, tensor in weights:
+            self.held[name] = tensor.clone()
+            if name == MTP_NAME:
+                tensor.zero_()
+
+    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+        return [[Completion(text=json.dumps(fingerprint(self.held)), token_ids=[])] for _ in prompts]
+
+
+def register(registry: Any) -> None:
+    registry.register("rollout_engine", "state", lambda config, **kw: StateEngine(**kw))
+    registry.register("trainer", "state", lambda config, **kw: StateTrainer(**kw))
+
+
+def _held(engine: RolloutEngine) -> dict[str, list[Any]]:
+    return json.loads(engine.generate([[1]], SamplingParams(n=1))[0][0].text)
 
 
 def _batch(n: int = 4, t: int = 3) -> TrainBatch:
@@ -95,6 +177,43 @@ def test_ray_runtime_object_store_sync(ray_session, make_config, tmp_path: Path)
     for actor in actors:
         with pytest.raises(ray.exceptions.RayActorError):
             ray.get(actor.node_ip.remote(), timeout=30)
+
+
+def test_object_store_sync_delivers_every_tensor_exactly(ray_session, make_config):
+    """Dtype, shape and bytes of every tensor of a mixed state reach the engine through the object
+    store, detached; and what one reader does with its tensors does not reach the next reader."""
+    cfg = make_config(
+        rollout={"backend": "state"},
+        trainer={"backend": "state"},
+        cluster={"mode": "ray", "extra": {"providers": ["test_ray_runtime"], "sync_chunk_bytes": 64}},
+    )
+    state = mixed_state()
+    sent = {name: [*described[:3], False] for name, described in fingerprint(state).items()}
+    rt = build_runtime(cfg)
+    try:
+        engine, trainer = rt.engines[0], rt.trainer
+        assert _held(engine) == {}
+        metrics = rt.weight_sync.sync(trainer, rt.engines)
+        assert _held(engine) == sent
+        assert list(_held(engine)) == list(state)  # in the order the trainer exports them
+        assert metrics["weight_sync/bytes"] == sum(t.numel() * t.element_size() for t in state.values())
+        # 64-byte chunks: five tensors that exceed one alone, and the seven small ones in three
+        assert metrics["weight_sync/chunks"] == 7
+
+        # The same objects again, after the engine wrote to the MTP tensors it was given.
+        refs, _ = trainer.export_weight_refs(64)
+        for _ in range(2):
+            engine.pull_weights_async(refs).result()
+            assert _held(engine) == sent
+
+        # The driver's view of the trainer's weights: the same tensors, the caller's to change.
+        exported = dict(trainer.export_weights())
+        assert fingerprint(exported) == sent
+        exported["i64.ids"].add_(1)
+        exported["f32.large"].zero_()
+        assert fingerprint(dict(trainer.export_weights())) == sent
+    finally:
+        rt.close()
 
 
 def test_ray_actors_load_the_providers_of_the_run_config(ray_session, make_config):
