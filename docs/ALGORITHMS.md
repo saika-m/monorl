@@ -198,9 +198,13 @@ k1 = d            k2 = 0.5 * d^2            k3 = exp(-d) + d - 1
 **`dynamic_sampling`.** After scoring (overlong penalty included), `_drop_uniform_groups` removes
 every group with more than one member whose rewards are all equal. While fewer than
 `prompts_per_step` groups remain, the loop draws `prompts_per_step` random prompts (seeded by
-seed, step and round), rolls them out, filters them the same way and keeps as many groups as are
-missing, for at most `rollout.extra.dynamic_sampling_max_rounds` rounds (default 3). A batch can
-therefore hold fewer groups; with none left the step makes no update (`rollout/skipped: 1`).
+seed, step and round) and rolls out a prefix of that draw: first as many prompts as groups are
+missing, then, while groups are still missing, a slice twice as long as the last one. Each slice
+is filtered the same way and gives as many groups as are missing, for at most
+`rollout.extra.dynamic_sampling_max_rounds` draws (default 3). A step that lost one group
+therefore usually costs one more prompt, not a whole step. A batch can
+hold fewer groups; with none left the step makes no update (`rollout/skipped: 1`).
+`rollout/groups_dropped` counts the groups that were rolled out and dropped.
 
 ## SFT
 
