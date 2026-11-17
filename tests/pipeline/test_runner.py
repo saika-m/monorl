@@ -228,10 +228,36 @@ def test_warnings_of_a_sampling_stage_are_in_the_log_of_that_stage(make_pipeline
 
 
 def test_invalid_override_fails_before_running(make_pipeline: Any) -> None:
-    stages = [{"type": "train", "name": "bad", "overrides": {"trainer": {"max_steps": "many"}}}]
+    stages = [
+        {"type": "train", "name": "good", "overrides": {"trainer": {"max_steps": 1}}},
+        {"type": "train", "name": "bad", "overrides": {"trainer": {"max_steps": "many", "max_stps": 1}}},
+        {"type": "eval", "name": "worse", "rollout_overrides": {"temprature": 0.5}},
+    ]
     result = run_pipeline(make_pipeline(stages))
-    assert result.state == "failed" and "invalid stage configuration" in (result.error or "")
-    assert result.stages[0]["state"] == "pending"
+    assert result.state == "failed"
+    assert (result.error or "").splitlines() == [
+        "invalid stage configuration: stage 2/3 'bad' (train), the base with the stage's overrides: "
+        "invalid RunConfig, 2 problems:",
+        "  trainer.max_steps: Input should be a valid integer, unable to parse string as an integer "
+        "(got 'many')",
+        "  trainer.max_stps: unknown key; did you mean max_steps?",
+    ]
+    assert read_status(result.run_dir)["message"] == result.error
+    assert [stage["state"] for stage in result.stages] == ["pending"] * 3
+    assert not fakes.TRAINERS
+
+
+def test_an_invalid_override_of_a_sampling_stage_names_the_stage(make_pipeline: Any) -> None:
+    stages = [
+        {"type": "train", "name": "good", "overrides": {"trainer": {"max_steps": 1}}},
+        {"type": "eval", "name": "scores", "rollout_overrides": {"temprature": 0.5}},
+    ]
+    result = run_pipeline(make_pipeline(stages))
+    assert (result.error or "").splitlines() == [
+        "invalid stage configuration: stage 2/2 'scores' (eval), the base with the stage's overrides: "
+        "invalid RunConfig, 1 problem:",
+        "  rollout.temprature: unknown key; did you mean temperature?",
+    ]
     assert not fakes.TRAINERS
 
 

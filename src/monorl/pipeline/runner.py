@@ -90,7 +90,7 @@ def run_pipeline(
         )
         try:
             validate_stage_configs(config, stages_root)
-        except (ConfigError, ValueError, TypeError) as e:
+        except ConfigError as e:
             return runner.finish("failed", f"invalid stage configuration: {e}")
         try:
             runner.run_all()
