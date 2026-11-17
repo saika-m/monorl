@@ -46,7 +46,7 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 |---|---|
 | transformers | – |
 | reference trainer (torch) | – |
-| vLLM | worker extension `monorl_update_weights` / `monorl_load_weights_from_path` via `collective_rpc` (vLLM's `GPUWorker` already owns `update_weights`), per-token logprob extraction, `SamplingParams` mapping, `sleep(level)`/`wake_up` journaling, `/update_named_param` + `/load_weights_from_path` mounted on the API server |
+| vLLM | worker extension `monorl_update_weights` / `monorl_load_weights_from_path` via `collective_rpc` (vLLM's `GPUWorker` already owns `update_weights`), per-token logprob extraction, `SamplingParams` mapping, `sleep(level)`/`wake_up` journaling, `/monorl/update_weights` + `/load_weights_from_path` mounted on the API server |
 | SGLang | `sglang.logprob_floats` (float/int coercion in `TokenizerManager.detokenize_logprob_tokens`), `sglang.seeded_parallel_sampling` (`Engine.generate` with `sampling_seed` + `n>1` gets one seed per sample), `sglang.release_memory_guard` / `sglang.resume_memory_guard` (no-op without CUDA or `enable_memory_saver`), `sglang.update_weights_named_tensors` (dict/generator inputs, contiguous detached tensors) |
 | Unsloth | `FastLanguageModel` inside the reference loop; `unsloth.trl.*` patches reconcile Unsloth's TRL rewrites with monorl's TRL patchset. **Pin conflict:** declares `trl<=1.15.0`, `transformers<=5.17.0` vs monorl's trl 1.17.1 / transformers 5.22 — see below |
 | TRL | `GRPOTrainer` reporter hook → `metrics.jsonl`/`status.json`; env rollouts in place of plain generation |
@@ -71,8 +71,10 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
   trainer and engine share GPUs. `rollout.extra.mode: server` talks over HTTP to
   `python -m monorl.adapters.vllm.server`, which starts the OpenAI-compatible server with
   `VLLM_SERVER_DEV_MODE=1` (vLLM's own `/sleep`, `/wake_up`, `/is_sleeping`,
-  `/reset_prefix_cache`) plus monorl's `/update_named_param` (raw tensor bytes) and
-  `/load_weights_from_path`.
+  `/reset_prefix_cache`) plus monorl's `/monorl/update_weights` (many tensors per request, raw
+  bytes, at most `rollout.extra.weight_request_bytes` of them, default 64 MiB) and
+  `/load_weights_from_path`. Image prompts are one chat request each, in flight together; an
+  image is encoded to a data URL once per run (`rollout.extra.image_cache_bytes`).
 * `sglang` — `sglang.srt.entrypoints.engine.Engine` (colocate, default) or an httpx client for
   `sglang.launch_server` (`rollout.extra.mode: server`, `url`/`urls`) using `/generate` and
   `/update_weights_from_tensor`; the tensor route only works when trainer and server share a host
