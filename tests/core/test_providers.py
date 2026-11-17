@@ -83,3 +83,15 @@ def test_a_missing_module_can_be_loaded_once_it_exists(project: Callable[..., st
     project(COUNTING, name=name)
     registry.load_providers([name])
     assert registry.get("reward", "from_provider")({}) == ("reward", {})
+
+
+def test_an_unknown_name_lists_what_adapters_register_and_the_name_it_resembles() -> None:
+    registry = Registry()
+    with pytest.raises(RegistryError) as typo:
+        registry.get("rollout_engine", "vlm")
+    assert "did you mean 'vllm'?" in str(typo.value)
+    assert "Known: hf, sglang, vllm" in str(typo.value)
+    with pytest.raises(RegistryError) as other:
+        registry.get("trainer", "nope")
+    assert "did you mean" not in str(other.value)
+    assert "Known: reference, unsloth" in str(other.value)

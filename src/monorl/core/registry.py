@@ -22,6 +22,7 @@ Usage::
 
 from __future__ import annotations
 
+import difflib
 import importlib
 import os
 import sys
@@ -81,25 +82,21 @@ class Registry:
     def get(self, namespace: str, name: str) -> Factory:
         self._check_ns(namespace)
         with self._lock:
-            factory = self._items[namespace].get(name)
+            factory = self._find(namespace, name)
             if factory is None:
-                self._load_builtins()
-                factory = self._items[namespace].get(name)
-            if factory is None:
-                self._load_adapter_for(name)
-                factory = self._items[namespace].get(name)
-            if factory is None:
+                known = self._known_names(namespace)
+                close = difflib.get_close_matches(name, known, n=1)
                 raise RegistryError(
-                    f"No {namespace} named {name!r}. Available: {sorted(self._items[namespace])}"
+                    f"No {namespace} named {name!r}"
+                    + (f"; did you mean {close[0]!r}?" if close else ".")
+                    + f" Known: {', '.join(known) or '(none)'}"
                 )
             return factory
 
     def contains(self, namespace: str, name: str) -> bool:
-        try:
-            self.get(namespace, name)
-            return True
-        except RegistryError:
-            return False
+        self._check_ns(namespace)
+        with self._lock:
+            return self._find(namespace, name) is not None
 
     def names(self, namespace: str, *, load_builtins: bool = True) -> list[str]:
         self._check_ns(namespace)
@@ -172,6 +169,31 @@ class Registry:
         module_path = provider_for_name(name)
         if module_path is not None:
             self.load_provider(module_path)
+
+    def _find(self, namespace: str, name: str) -> Factory | None:
+        """The factory of a name, after loading what may register it: the built-in providers, then
+        the adapter that owns the name."""
+        factory = self._items[namespace].get(name)
+        if factory is None:
+            self._load_builtins()
+            factory = self._items[namespace].get(name)
+        if factory is None:
+            self._load_adapter_for(name)
+            factory = self._items[namespace].get(name)
+        return factory
+
+    def _known_names(self, namespace: str) -> list[str]:
+        """Every name of a namespace, for the message about one that is not there: what is
+        registered and what the adapters register, which are loaded for it (registering imports no
+        framework). An adapter that fails to load contributes nothing."""
+        from monorl.adapters import PROVIDERS
+
+        for module_path in PROVIDERS.values():
+            try:
+                self.load_provider(module_path)
+            except Exception:  # noqa: BLE001 - RegistryError or anything the provider raised
+                continue
+        return sorted(self._items[namespace])
 
 
 registry = Registry()
