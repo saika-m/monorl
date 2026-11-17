@@ -1,8 +1,10 @@
-"""Optional metric sinks (Weights & Biases, TensorBoard). Neither package is required: a missing
-import is logged once and the sink is skipped; ``metrics.jsonl`` stays the source of truth."""
+"""Optional metric sinks (Weights & Biases, TensorBoard). Neither package is required: a sink whose
+package is missing, whose initialisation fails or that fails while logging writes one line to
+``run.log`` and is skipped from there on; ``metrics.jsonl`` stays the source of truth."""
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +15,7 @@ if TYPE_CHECKING:
 
 class MetricSinks:
     def __init__(self, config: RunConfig, run_dir: Path, reporter: RunReporter) -> None:
+        self._reporter = reporter
         self._wandb: Any = None
         self._tb_dir = run_dir / "tensorboard"
         self._tb_writer: Any = None  # the SummaryWriter class while the TensorBoard sink is on
@@ -74,27 +77,47 @@ class MetricSinks:
         if self._wandb is not None:
             try:
                 self._wandb.log(named, step=step)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                self._drop("wandb", e)
         if self._tb_writer is not None:
-            if self._tb is None:
-                # purge_step: TensorBoard hides what an earlier process wrote to the directory for
-                # this step and later ones. A resumed run logs the steps after its checkpoint
-                # again, and they would show twice.
-                self._tb = self._tb_writer(log_dir=str(self._tb_dir), purge_step=step)
-            for tag, number in named.items():
-                self._tb.add_scalar(tag, number, step)
+            try:
+                if self._tb is None:
+                    # purge_step: TensorBoard hides what an earlier process wrote to the directory for
+                    # this step and later ones. A resumed run logs the steps after its checkpoint
+                    # again, and they would show twice.
+                    self._tb = self._tb_writer(log_dir=str(self._tb_dir), purge_step=step)
+                for tag, number in named.items():
+                    self._tb.add_scalar(tag, number, step)
+            except Exception as e:  # noqa: BLE001
+                self._drop("tensorboard", e)
+
+    def _drop(self, name: str, error: Exception) -> None:
+        self._reporter.log(
+            f"{name} logging failed ({type(error).__name__}: {error}); skipping {name} for the rest of the run"
+        )
+        if name == "wandb":
+            self._close_wandb(failed=True)
+        else:
+            self._close_tb()
 
     def close(self) -> None:
+        """Closes both sinks. Called while an exception is on its way out (the loops call it from
+        ``finally``), the W&B run ends as failed (exit code 1) instead of finished."""
+        self._close_tb()
+        self._close_wandb(failed=sys.exception() is not None)
+
+    def _close_tb(self) -> None:
         if self._tb is not None:
             try:
                 self._tb.close()  # flushes
             except Exception:  # noqa: BLE001
                 pass
         self._tb = self._tb_writer = None
+
+    def _close_wandb(self, *, failed: bool) -> None:
         if self._wandb is not None:
             try:
-                self._wandb.finish()
+                self._wandb.finish(exit_code=1 if failed else 0)
             except Exception:  # noqa: BLE001
                 pass
             self._wandb = None

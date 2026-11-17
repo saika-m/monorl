@@ -19,6 +19,7 @@ import torch
 import yaml
 from sink_support import (
     FakeSinkPackages,
+    FakeWandbRun,
     install_fake_sink_packages,
     metric_points,
     read_offline_wandb_runs,
@@ -175,6 +176,44 @@ def test_a_resumed_run_logs_which_wandb_run_it_writes_to(
     assert f"wandb: new run {resumed.id} in project p" in log
 
 
+def test_a_failed_run_ends_its_wandb_run_as_failed(make_config: Any, packages: FakeSinkPackages) -> None:
+    failed = run(make_config(trainer={"max_steps": 3, "extra": {"fake_fail_at": 2}}, logging=BOTH))
+    assert failed.state == "failed"
+    (wandb_run,) = packages.runs
+    assert list(wandb_run.history) == [1] and wandb_run.exit_code == 1
+    assert all(writer.closed for writer in packages.writers)
+
+    succeeded = run(make_config(run_name="fine", logging=BOTH))
+    assert succeeded.state == "succeeded" and packages.run_named("fine").exit_code == 0
+
+
+@pytest.mark.parametrize("broken", ["tensorboard", "wandb"])
+def test_a_sink_that_fails_while_logging_is_dropped_and_the_run_goes_on(
+    make_config: Any, packages: FakeSinkPackages, monkeypatch: pytest.MonkeyPatch, broken: str
+) -> None:
+    def no_space(*args: Any, **kwargs: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    if broken == "tensorboard":
+        monkeypatch.setattr(packages.SummaryWriter, "add_scalar", no_space)
+    else:
+        monkeypatch.setattr(FakeWandbRun, "log", no_space)
+    result = run(make_config(trainer={"max_steps": 3}, logging=BOTH))
+
+    assert result.state == "succeeded" and result.final_step == 3
+    run_dir = Path(result.run_dir)
+    lines = [line for line in (run_dir / "run.log").read_text().splitlines() if "logging failed" in line]
+    assert len(lines) == 1
+    assert f"{broken} logging failed (OSError: [Errno 28] No space left on device)" in lines[0]
+    (wandb_run,) = packages.runs
+    if broken == "tensorboard":  # the other sink has every step
+        assert list(wandb_run.history) == [1, 2, 3] and wandb_run.exit_code == 0
+        assert all(writer.closed for writer in packages.writers)
+    else:
+        assert wandb_run.exit_code == 1
+        assert _shown(packages.shown[str(run_dir / "tensorboard")]) == _last(metric_points(run_dir))
+
+
 # -- against the real packages --------------------------------------------------------------
 
 
@@ -232,3 +271,15 @@ def test_real_offline_wandb_run_holds_the_config_and_every_metric(
     assert ("eval/reward_mean", 2) in expected
     assert offline["history"] == pytest.approx(_last(expected))
     assert f"wandb: new run {offline['id']} in project p" in (run_dir / "run.log").read_text()
+
+
+def test_real_offline_wandb_run_of_a_failed_run_ends_with_exit_code_1(
+    make_config: Any, offline_wandb: None
+) -> None:
+    failed = run(
+        make_config(trainer={"max_steps": 3, "extra": {"fake_fail_at": 2}}, logging={"wandb_project": "p"})
+    )
+    assert failed.state == "failed"
+    (offline,) = read_offline_wandb_runs(Path(failed.run_dir))
+    assert offline["exit_code"] == 1
+    assert {step for _, step in offline["history"]} == {1}
