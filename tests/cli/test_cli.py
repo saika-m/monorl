@@ -401,11 +401,11 @@ def test_train_given_a_recipe_name_says_where_the_recipe_is(runner: CliRunner) -
     assert result.output.strip() == "error: config file not found: no_such_recipe"
 
 
-def test_train_reports_the_error_of_a_failed_run_without_repeating_its_traceback(
+def test_train_reports_a_mistake_in_the_config_once_and_without_a_traceback(
     runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
 ) -> None:
-    """A failed run reports its message followed by the traceback, which the run log has shown and
-    keeps: the command ends with the message and where the traceback is."""
+    """A run that fails because its config has to change says what, in the log and at the end of
+    the command: there is no traceback to point to."""
     run_config_dict["data"]["prompt_field"] = "no_such_column"
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(yaml.safe_dump(run_config_dict))
@@ -414,11 +414,39 @@ def test_train_reports_the_error_of_a_failed_run_without_repeating_its_traceback
         app, ["train", "--config", str(cfg_path), "--run-dir", str(run_dir)], env={"COLUMNS": "1000"}
     )
     assert result.exit_code == 1
+    message = "DataError: column 'no_such_column' not found; available: ['answer', 'prompt']"
+    summary = result.output.partition("state: failed")[2].strip().splitlines()
+    assert summary == ["final step: 0", message]
+    log = (run_dir / "run.log").read_text()
+    assert log.splitlines()[-1].endswith(f"[failed] {message}") and "Traceback" not in log
+
+
+def test_train_reports_the_error_of_a_failed_run_without_repeating_its_traceback(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
+) -> None:
+    """A run that fails with anything else reports its message followed by the traceback, which
+    the run log has shown and keeps: the command ends with the message and where the traceback is."""
+    from monorl.core.registry import registry
+
+    def broken(params: dict[str, Any], **_: Any) -> Any:
+        raise RuntimeError("the reward cannot start")
+
+    registry.register("reward", "cli_test_broken", broken)
+    run_config_dict["rewards"] = [{"type": "cli_test_broken"}]
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    run_dir = tmp_path / "rd"
+    try:
+        result = runner.invoke(
+            app, ["train", "--config", str(cfg_path), "--run-dir", str(run_dir)], env={"COLUMNS": "1000"}
+        )
+    finally:
+        registry._items["reward"].pop("cli_test_broken")
+    assert result.exit_code == 1
     summary = result.output.partition("state: failed")[2].strip().splitlines()
     assert summary == [
         "final step: 0",
-        "DataError: column 'no_such_column' not found; available: ['answer', 'prompt'] "
-        f"(traceback in {run_dir.resolve() / 'run.log'})",
+        f"RuntimeError: the reward cannot start (traceback in {run_dir.resolve() / 'run.log'})",
     ]
     assert "Traceback (most recent call last)" in (run_dir / "run.log").read_text()
 
