@@ -7,8 +7,8 @@ contracts between components are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
 ## Setup
 
 ```bash
-make install                # .venv (uv, Python 3.12) with the packages of requirements.lock
-scripts/dev/bootstrap.sh    # the same, plus the example environments and the web build
+make install              # .venv (uv, Python 3.12) with the packages of requirements.lock
+scripts/dev/bootstrap.sh  # the same, plus the example environments and the web build
 ```
 
 Optional toolchains: Go for the Go SDK and its examples, clang++ for the C++ SDK, Node 24 and
@@ -55,10 +55,10 @@ them.
 | Config reference is current | `.venv/bin/python -m monorl.config.reference --check docs/CONFIG.md` |
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: `make install`,
-Python lint and `pytest tests -n 4 -m 'not slow and not network and not gpu'`, the Go and C++ SDK
-builds and tests,
-the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, and builds of the
-`envs` and `cpu` images. A newer push cancels the run of an older one.
+Python lint and `pytest tests -n 4 -m 'not slow and not network and not gpu'`, `go vet` and
+`go test` for the Go SDK, builds of the Go and C++ examples, the web build and lint, the MEP/1
+conformance tests, hadolint over `docker/`, and builds of the `envs` and `cpu` images. A newer
+push cancels the run of an older one.
 
 ## Tests
 
