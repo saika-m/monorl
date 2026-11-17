@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from monorl.config.loader import apply_overrides, load_yaml
+from monorl.config.loader import apply_overrides, load_yaml, mask_secrets
 from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, MonorlError
@@ -761,7 +761,7 @@ def recipes_show(
                     "name": recipe.name,
                     "description": recipe.description,
                     "kind": kind,
-                    "config": cfg.to_dict(),
+                    "config": mask_secrets(cfg.to_dict()),
                 },
                 indent=2,
             )

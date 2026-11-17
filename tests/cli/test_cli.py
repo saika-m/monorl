@@ -211,6 +211,24 @@ def test_recipes_dir_env_override(runner: CliRunner, tmp_path: Path, monkeypatch
 RECIPE_BODY = "model: {name_or_path: x}\ndata: {uri: y}\nrewards: [{type: exact_match}]\n"
 
 
+def test_recipes_show_json_names_the_variable_of_a_secret(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--json`` prints the loaded config; what it read from ``${JUDGE_API_KEY}`` stays out of a
+    terminal or a CI log, as it stays out of ``config.yaml``."""
+    from monorl.config import loader
+
+    body = RECIPE_BODY.replace("{type: exact_match}", "{type: exact_match, params: {k: '${JUDGE_API_KEY}'}}")
+    (tmp_path / "judged.yaml").write_text("# Judged.\n" + body)
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("MONORL_RECIPES_DIR", str(tmp_path))
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-cli-0123456789abcdef")
+    result = runner.invoke(app, ["recipes", "show", "judged", "--json"])
+    assert result.exit_code == 0, result.output
+    assert "sk-cli-0123456789abcdef" not in result.output
+    assert json.loads(result.output)["config"]["rewards"][0]["params"] == {"k": "${JUDGE_API_KEY}"}
+
+
 def test_recipes_list_shows_a_description_with_brackets_as_written(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
