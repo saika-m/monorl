@@ -21,6 +21,12 @@ requests that arrive together. Nothing waits for a slow environment, and nothing
 Engines are independent: with several engines every engine batches the turns of its own episodes
 and shares ``max_parallel`` evenly with the others (at least one episode each).
 
+``max_parallel`` is how many episodes are open at a time. Without one, episodes in lockstep are
+all open at once, so that an engine call holds every prompt of the batch (an environment that
+admits fewer says so, see ``max_concurrent_episodes`` in
+:class:`~monorl.core.interfaces.Environment`); episodes that hold a thread for their whole run
+are limited to :data:`THREADED_EPISODES`.
+
 Text prompts are sent to the engine as token ids: turn 0 is rendered with :func:`chat_prompt_ids`
 (with the environment's tool schemas, if any), every later turn is built by
 :func:`monorl.rollout.render.continue_prompt_ids`. With ``rollout.turn_rendering: tokens`` the
@@ -83,6 +89,14 @@ CANCEL_INTERVAL_S = 0.05
 """How often ``run_episodes`` re-issues ``engine.cancel()`` while an abort is being carried out."""
 
 TurnBatching = Literal["lockstep", "arrival"]
+
+THREADED_EPISODES = 64
+"""Episodes at a time when the caller sets no limit and every episode holds a thread from its
+start to its end (``arrival`` batching, agent harnesses)."""
+
+ENVIRONMENT_THREADS = 64
+"""Threads for the environment work of episodes that take their turns in lockstep: between two
+engine calls an episode needs one only for its ``step`` and its next prompt."""
 
 _Request = tuple[PromptInput, SamplingParams]
 """What an episode asks the engine for: one prompt and the sampling parameters of that turn."""
@@ -289,20 +303,21 @@ class _Environments:
         self._made: list[Environment | EpisodeDriver] = []
         self._lock = threading.Lock()
 
-    def limit(self) -> int | None:
-        """``max_concurrent_episodes`` of the environments (``None``: they do not say, or the
-        first one could not be made, which the episode that needs it will report)."""
+    def ask(self) -> tuple[bool, int | None]:
+        """Whether the environments run their episodes themselves (:class:`EpisodeDriver`), and
+        their ``max_concurrent_episodes`` (``None``: they do not say). ``(False, None)`` when the
+        first one cannot be made, which the episode that needs it will report."""
         try:
             env = self._factory()
         except Exception:  # noqa: BLE001
-            return None
+            return False, None
         with self._lock:
             self._made.append(env)
         try:
             limit = getattr(env, "max_concurrent_episodes", None)
         except Exception:  # noqa: BLE001 - the same failure will be the episode's
-            return None
-        return max(1, int(limit)) if limit is not None else None
+            limit = None
+        return hasattr(env, "run_episode"), max(1, int(limit)) if limit is not None else None
 
     def make(self) -> Environment | EpisodeDriver:
         with self._lock:
@@ -364,7 +379,8 @@ class _Run:
     def run(self) -> None:
         try:
             if self.capacity > 1:
-                self.pool = ThreadPoolExecutor(self.capacity, thread_name_prefix="monorl-episode")
+                threads = min(self.capacity, ENVIRONMENT_THREADS) if self.lockstep else self.capacity
+                self.pool = ThreadPoolExecutor(threads, thread_name_prefix="monorl-episode")
             while True:
                 while self.queue and len(self.live) < self.capacity and not self.outcome.halt.is_set():
                     index, spec = self.queue.popleft()
@@ -527,7 +543,7 @@ def run_episodes(
     env_factory: Callable[[], Environment | EpisodeDriver],
     tokenizer: Any,
     params: SamplingParams,
-    max_parallel: int,
+    max_parallel: int | None = None,
     abort: threading.Event | None = None,
     turn_rendering: str = "tokens",
     max_context_tokens: int | None = None,
@@ -535,8 +551,8 @@ def run_episodes(
     failures: list[EpisodeFailure] | None = None,
     turn_batching: TurnBatching = "lockstep",
 ) -> list[Trajectory]:
-    """Run every spec to completion, ``max_parallel`` episodes at a time; order is preserved.
-    ``turn_batching`` decides how their turns reach the engines (module docstring).
+    """Run every spec to completion, ``max_parallel`` episodes at a time (``None``: see the module
+    docstring); order is preserved. ``turn_batching`` decides how their turns reach the engines.
 
     Without ``failures`` an episode failure ends the call: it is re-raised once the environment
     work in flight has finished (the failure of the earliest spec, if several failed). With a
@@ -553,19 +569,25 @@ def run_episodes(
     """
     if not specs:
         return []
-    workers = max(1, min(int(max_parallel), len(specs)))
-    lockstep = turn_batching == "lockstep"
-    parts: list[list[tuple[int, EpisodeSpec]]] = [list(enumerate(specs))]
     environments = _Environments(env_factory)
+    lockstep, limit = turn_batching == "lockstep", None
+    if lockstep:
+        drives, limit = environments.ask()
+        lockstep = not drives  # a harness decides itself when it calls the policy
+    parts: list[list[tuple[int, EpisodeSpec]]] = [list(enumerate(specs))]
     if lockstep:
         by_engine: dict[int, list[tuple[int, EpisodeSpec]]] = {}
         for item in parts[0]:
             by_engine.setdefault(id(item[1].engine), []).append(item)
         parts = list(by_engine.values())
+    if max_parallel is None:
+        max_parallel = len(specs) if lockstep else THREADED_EPISODES
+    workers = max(1, min(int(max_parallel), len(specs)))
+    if lockstep and limit is not None:
         # An episode that waited in ``reset`` for another one to end would hold up the turn that
         # lets it end. With fewer places than engines every engine runs one episode at a time,
         # which waits for a place while it holds none.
-        workers = min(workers, environments.limit() or workers)
+        workers = min(workers, limit)
     outcome = _Outcome(trajectories=[None] * len(specs))
     runs = [
         _Run(

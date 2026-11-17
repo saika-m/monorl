@@ -235,3 +235,19 @@ def test_lockstep_opens_no_more_episodes_than_the_environment_admits() -> None:
     assert len(trajectories) == 6 and max(open_at_once) == 2
     assert [len(batch) for batch in engine.batches[:2]] == [2, 2]
     assert server.active_episodes == 0
+
+
+def test_without_a_limit_an_engine_call_holds_every_prompt_of_the_batch() -> None:
+    """A step of 8 episodes is one call of 8 prompts, not calls of however many episodes a
+    default limit lets run at a time; a limit still limits."""
+    engine = OrderSensitiveEngine()
+    kwargs: dict[str, Any] = {"tokenizer": engine.tokenizer, "params": SamplingParams(n=1)}
+    run_episodes(_specs([engine], 8), env_factory=lambda: JitteryEnv(random.Random(0)), **kwargs)
+    assert engine.batches[0] == [f"e{i}t0" for i in range(8)]
+    assert [len(batch) for batch in engine.batches] == [8, 5, 2]  # 1, 2 or 3 turns per episode
+
+    capped = OrderSensitiveEngine()
+    run_episodes(
+        _specs([capped], 8), env_factory=lambda: JitteryEnv(random.Random(0)), max_parallel=2, **kwargs
+    )
+    assert max(len(batch) for batch in capped.batches) == 2

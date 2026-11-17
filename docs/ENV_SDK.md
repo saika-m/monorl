@@ -250,9 +250,9 @@ added to the score of any `rewards:` entries you configure.
 
 ### Scaling parallel episodes
 
-The orchestrator runs up to `rollout.extra.max_parallel_episodes` (default 64) episodes at a
-time and batches their generation calls. Three knobs determine how many env episodes can be in
-flight:
+The orchestrator opens all episodes of a step at once and batches their generation calls,
+unless `rollout.extra.max_parallel_episodes` limits it (with `rollout.turn_batching: arrival`
+the default is 64). Three knobs determine how many env episodes can be in flight:
 
 1. **The server's `spec.parallel_episodes`.** Both SDKs serialise calls per episode and run
    different episodes concurrently; set it to the number of episodes one process can hold
@@ -269,8 +269,8 @@ flight:
    episode's state lives in one process, so each episode is pinned to one replica (the least
    loaded) for all of its requests — a single load-balanced or round-robin address in `url`
    would scatter them and fail with `unknown_episode`.
-3. **`rollout.extra.max_parallel_episodes`** caps the orchestrator side; raise it together with
-   `parallel_episodes` and the rollout engine's batch size.
+3. **`rollout.extra.max_parallel_episodes`** caps the orchestrator side when set; over http
+   the orchestrator never opens more episodes than the servers have places.
 
 ```yaml
 env:

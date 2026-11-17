@@ -55,7 +55,9 @@ class PolicySampler:
             max_wait_ms=float(extra.get("batch_max_wait_ms", 10.0)),
         )
         self.tokenizer = self.raw_engine.tokenizer
-        self.max_parallel = int(extra.get("max_parallel_episodes", 64))
+        self.max_parallel: int | None = (
+            int(extra["max_parallel_episodes"]) if extra.get("max_parallel_episodes") is not None else None
+        )
         specs = list(config.rewards) if reward_specs is None else list(reward_specs)
         self.reward_fn = _loop._resolve_build_reward()(specs, config=config) if specs else None
         make_env = _loop._resolve_make_env()

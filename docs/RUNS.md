@@ -36,20 +36,22 @@ The component loop runs steps `1..trainer.max_steps`. Each step:
 After the last step the policy is exported to `final/`. With `rollout.async_steps_ahead > 0`
 rollouts for later steps are generated while earlier steps train ([DISTRIBUTED.md](DISTRIBUTED.md)).
 
-Repeatability: Python and torch are seeded with `seed` at the start, and with `seed + step` when
-a run resumes at `step` (a resumed run therefore does not continue the random stream of the run
-it resumes). On the `hf` engine a run repeats for the same config and seed. The prompts of a step
-are a function of `(seed, step)`, a single-turn step is one engine call, and with
-`rollout.turn_batching: lockstep` (the default) the turns of concurrent episodes reach the
-engine in batches that do not depend on timing
-([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)). Run here: two runs of
-`grpo_remote_env_go_wordle.yaml` (6 turns per episode, 2 steps) gave 16 of 16 identical episodes
-and identical metrics apart from the timings; with `turn_batching: arrival` 4 of 16 were
-identical. What it takes besides: environments and rewards that are functions of their inputs
-(an `llm_judge` is not). What does not repeat, from the code: agent harnesses (`harness`,
-`hermes`), which call the policy when they please, and `rollout.async_steps_ahead > 0`, where
-the weights a rollout sees depend on how far training got. `vllm` and `sglang` receive the same
-batches in the same order; whether they then sample the same was not run here.
+Repeatability: Python and torch are seeded with `seed` at the start, and with `seed + step` when a
+run resumes at `step` (a resumed run therefore does not continue the random stream of the run it
+resumes). On the `hf` engine a run repeats for the same config and seed. The prompts of a step are a
+function of `(seed, step)`, a single-turn step is one engine call, and with `rollout.turn_batching:
+lockstep` (the default) the turns of concurrent episodes reach the engine in batches that do not
+depend on timing ([ENVIRONMENTS.md](ENVIRONMENTS.md#the-episode-model)). Run here: two runs of
+`grpo_remote_env_go_wordle.yaml` (6 turns per episode, 2 steps) gave 16 of 16 identical episodes and
+identical metrics apart from the timings; with `turn_batching: arrival` 4 of 16 were identical. Two
+runs of `grpo_gsm8k_smollm_cpu.yaml` (2 steps, on a busy machine) were identical as well, where
+batching by arrival differed already in the first step: there the order of the rows of a call is the
+order in which the episode threads got to it. What it takes besides: environments and rewards that
+are functions of their inputs (an `llm_judge` is not). What does not repeat, from the code: agent
+harnesses (`harness`, `hermes`), which call the policy when they please, and
+`rollout.async_steps_ahead > 0`, where the weights a rollout sees depend on how far training got.
+`vllm` and `sglang` receive the same batches in the same order; whether they then sample the same
+was not run here.
 
 The SFT loop has no rollouts, rewards, environments or weight sync. Each step encodes
 `trainer.prompts_per_step` dataset samples with their target responses and calls `train_step`

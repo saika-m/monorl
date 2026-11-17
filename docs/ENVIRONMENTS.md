@@ -31,10 +31,12 @@ in the trajectory's `reward_breakdown` and reported as `reward/env` ([RUNS.md](R
 `rewards:` may be empty for every type except `single_turn`. See also
 [CREDIT_ASSIGNMENT.md](CREDIT_ASSIGNMENT.md) (per-turn credit) and [ALGORITHMS.md](ALGORITHMS.md).
 
-Parallel episodes: at most `rollout.extra.max_parallel_episodes` (default 64) run at a time,
-each with its own environment instance; `reset`, `step` and prompt rendering run on a thread
-pool. An exception from one of them is a failure of that episode's environment; aborts and
-rollout engine failures always end the batch.
+Parallel episodes: all episodes of a step are open at once, each with its own environment
+instance, unless `rollout.extra.max_parallel_episodes` sets a limit or the environment admits
+fewer (the agent harnesses and `turn_batching: arrival` run 64 at a time by default, because
+there an episode holds a thread from start to end). `reset`, `step` and prompt rendering run on
+a pool of at most 64 threads. An exception from one of them is a failure of that episode's
+environment; aborts and rollout engine failures always end the batch.
 
 Turn batching: `rollout.turn_batching` decides how the turns of those episodes reach the engine.
 

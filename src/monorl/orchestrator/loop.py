@@ -152,7 +152,9 @@ class ComponentLoop:
             )
             for engine in self.raw_engines
         ]
-        self.max_parallel = int(extra.get("max_parallel_episodes", 64))
+        self.max_parallel: int | None = (
+            int(extra["max_parallel_episodes"]) if extra.get("max_parallel_episodes") is not None else None
+        )
 
         self.samples = list(_resolve_open_source()(config.data, tokenizer=self.tokenizer, seed=seed))
         if not self.samples:
