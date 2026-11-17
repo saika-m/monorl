@@ -321,9 +321,9 @@ propagates and ends the run. The 0.0 is the same number as a grade of 0 in `rewa
 - One warning per call of the reward, which the loop makes once with all trajectories of a step,
   through Python's `logging` under `monorl.rewards.llm_judge`:
   `reward <name>: N of M judgments failed and scored 0 (<count>x <error>, ...)`, followed by the
-  body of the first error response. It goes to stderr and carries no time: that is the terminal
-  of `monorl train`, and `run.log` for a job started by `monorl serve`, whose stderr is that file
-  (from `src/monorl/server/jobs.py`; run here with the same redirection, not through the server).
+  body of the first error response. During a run it is a line of `run.log`, with the time, and
+  the terminal shows that line (see [`run.log`](RUNS.md#runlog)); outside a run, as in the
+  snippet above, it goes to stderr and carries no time.
 - In `trajectories.jsonl`, `info.reward_info.<name>` of a row holds `error` (`no_score`, or the
   exception's name and message, for a status `HTTPStatusError: 503 Service Unavailable`), `body`
   (the first 300 characters of an error response), `judge_output` for a reply without a score,
@@ -333,12 +333,14 @@ propagates and ends the run. The 0.0 is the same number as a grade of 0 in `rewa
 Run here, one step of four episodes and an evaluation of four on a tiny random model against a
 local endpoint that always answers 503 with `Retry-After: 3`: the run succeeded with
 `reward/mean` 0.0, `reward/llm_judge/failed` and `eval/reward/llm_judge/failed` 1.0 and
-`time/reward` 9.11, stderr had
+`time/reward` 9.11, the warning
 `reward llm_judge: 4 of 4 judgments failed and scored 0 (4x HTTPStatusError: 503 Service
-Unavailable)` with the response body after it, once for the step and once for the evaluation,
-`run.log` did not (it did with stderr appended to it), and the rows had `attempts: 4` and
-`llm_judge/failed` 1.0. Against an endpoint that answered every fourth request with 429, all
-rewards were the judge's 0.6, `reward/llm_judge/failed` was 0.0 and nothing was logged.
+Unavailable)` with the response body after it was logged once for the step and once for the
+evaluation, and the rows had `attempts: 4` and `llm_judge/failed` 1.0. (That run read the
+warning on stderr; that it is a line of `run.log` was run with the CPU recipe against a port
+nobody listens on, see [`run.log`](RUNS.md#runlog).) Against an endpoint that answered every
+fourth request with 429, all rewards were the judge's 0.6, `reward/llm_judge/failed` was 0.0 and
+nothing was logged.
 
 A judgment that waits keeps its worker thread and nothing else; the other workers go on. When a
 call ends early (an error with `on_error: raise`, a `KeyboardInterrupt`), the waiting judgments
