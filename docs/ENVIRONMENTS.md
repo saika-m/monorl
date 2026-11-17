@@ -104,12 +104,26 @@ tool schemas are also passed to the chat template as `tools`.
   `sin`, `cos`, `tan`, `floor`, `ceil`, `pi` and `e`. An exponent above 1000 in absolute value, or
   anything else (names, attributes, strings), returns `error: ...`.
 - `python_exec` (argument `code`) runs `sys.executable -I -c <code>`: the interpreter that runs
-  monorl, in isolated mode (no `PYTHON*` variables, no user site), with an environment of only
-  `PATH`, `PYTHONHASHSEED=0` and `PYTHONDONTWRITEBYTECODE=1`, stdin from `/dev/null` and the
-  system temp directory as working directory. It is killed after `python_timeout_s` seconds of
-  wall-clock time (`error: execution timed out after 5.0s`). The result is stdout, then `stderr:`
-  and `exit code: N` when present, or `(no output)`. This is not a sandbox: the code runs as your
-  user with file system, network and installed packages, and has no memory or CPU limit.
+  monorl, with `-I` (no `PYTHON*` variables, no user site), stdin from `/dev/null` and an
+  environment of only `PATH`, `HOME`, `TMPDIR`, `PYTHONHASHSEED=0` and
+  `PYTHONDONTWRITEBYTECODE=1`. Every call gets a new directory as its working directory, `HOME`
+  and `TMPDIR`, deleted when the call returns, and a process group of its own. The group is
+  killed when the program ends (so a process it started and left running ends with it), after
+  `python_timeout_s` seconds of wall-clock time (`error: execution timed out after 5.0s`), or
+  when the resident memory of the program and the processes it started passes
+  `python_memory_mb` (`error: execution used more than the memory limit of 512 MB`). The memory
+  is read every 20 ms, that of started processes every 250 ms, so a fast allocation passes the
+  limit for that long. The result is stdout, then `stderr:` and `exit code: N` when present, or
+  `(no output)`.
+
+  These limits clean up after a program; they do not confine it. What the policy writes runs
+  on the machine that runs the environment, as the user who runs it: it reads and writes that
+  user's files by absolute path, uses the network and the installed packages, has no CPU limit,
+  and a program that starts a session of its own (`os.setsid()`) leaves the process group and
+  can outlive the call. Offer `python_exec` only where that user may run whatever the policy
+  writes, for example in a container or a virtual machine made for the run. `tools` left unset
+  includes `python_exec`; list the tools (`tools: [calculator, lookup]`) to leave it out.
+  Episodes in Docker containers are what `env.type: harness` has ([SANDBOX.md](SANDBOX.md)).
 - `lookup` (argument `query`) returns the `env.params.corpus` value of an exact key match,
   otherwise up to `lookup_max_results` lines `key: value` whose key or value contains the query
   (case-insensitive), otherwise `no results for '<query>'`.
@@ -135,6 +149,7 @@ not counted as an invalid call. Two call syntaxes are accepted:
 | `max_calls_per_turn` | `8` | calls executed per turn; more are ignored and make the turn invalid |
 | `max_turns` | `4` | turn limit when `env.max_turns` is not set |
 | `python_timeout_s` | `5.0` | `python_exec` timeout |
+| `python_memory_mb` | `512` | `python_exec` memory limit in MB; `0` for none |
 | `max_tool_output_chars` | `4000` | cap on a built-in tool's result (custom tools: always 4000) |
 | `corpus` | `{}` | mapping searched by `lookup` |
 | `lookup_max_results` | `3` | lines returned by a `lookup` substring search |

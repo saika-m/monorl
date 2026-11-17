@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sys
+import tempfile
+import time
 import types
+import uuid
+from pathlib import Path
 
+import psutil
 import pytest
 
 from monorl.core.types import Completion, Sample
@@ -105,6 +112,82 @@ def test_python_exec_runs_and_times_out():
     out = python_exec("import sys; print('e', file=sys.stderr); sys.exit(2)")
     assert "stderr:\ne" in out and "exit code: 2" in out
     assert "timed out" in python_exec("import time; time.sleep(5)", timeout_s=0.5)
+
+
+def _ended(pid: int, within_s: float = 5.0) -> bool:
+    """Whether process ``pid`` ends within ``within_s`` (it may still wait to be collected)."""
+    deadline = time.monotonic() + within_s
+    while True:
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            return True
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)  # the test's own cleanup
+            return False
+        time.sleep(0.05)
+
+
+def test_python_exec_works_in_a_directory_of_its_own_that_is_removed():
+    name = f"monorl-test-{uuid.uuid4().hex}.txt"
+    shared = Path(tempfile.gettempdir()) / name  # where every program of this user puts files
+    code = (
+        "import os, tempfile\n"
+        f"open({name!r}, 'w').write('x')\n"
+        "for path in (os.getcwd(), tempfile.gettempdir(), os.path.expanduser('~')):\n"
+        "    print(os.path.realpath(path))\n"
+    )
+    try:
+        cwd, tmp, home = python_exec(code).splitlines()
+        assert not shared.exists()
+    finally:
+        shared.unlink(missing_ok=True)
+    assert cwd == tmp == home and Path(cwd) != Path(tempfile.gettempdir()).resolve()
+    assert not Path(cwd).exists()
+    # the next call starts in an empty directory again
+    assert python_exec(f"import os; print(os.listdir('.'), os.path.exists({name!r}))") == "[] False\n"
+
+
+def test_python_exec_timeout_ends_the_processes_the_program_started(tmp_path):
+    pidfile = tmp_path / "pid"
+    code = (
+        "import subprocess, time\n"
+        "child = subprocess.Popen(['sleep', '60'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    assert python_exec(code, timeout_s=2.0) == "error: execution timed out after 2.0s"
+    assert _ended(int(pidfile.read_text()))
+
+
+def test_python_exec_leaves_no_process_behind_and_does_not_wait_for_one(tmp_path):
+    """A program that starts a process and ends: the process holds the program's stdout."""
+    pidfile = tmp_path / "pid"
+    code = (
+        "import subprocess\n"
+        "child = subprocess.Popen(['sleep', '60'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+        "print('started')\n"
+    )
+    started = time.monotonic()
+    out = python_exec(code, timeout_s=5.0)
+    waited = time.monotonic() - started
+    assert _ended(int(pidfile.read_text()))
+    assert out == "started\n" and waited < 4.5
+
+
+def test_python_exec_memory_limit_ends_the_program():
+    hog = (
+        "import time\n"
+        "block = bytearray(300 * 1024 * 1024)\n"
+        "for i in range(0, len(block), 4096):\n"
+        "    block[i] = 1\n"
+        "time.sleep(60)\n"
+    )
+    limited = load_tools({"tools": ["python_exec"], "python_memory_mb": 100, "python_timeout_s": 10})[0]
+    assert limited.call({"code": hog}) == "error: execution used more than the memory limit of 100 MB"
+    assert limited.call({"code": "block = bytearray(10 * 1024 * 1024); print(len(block))"}) == "10485760\n"
 
 
 def test_lookup():
