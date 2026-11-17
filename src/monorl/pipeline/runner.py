@@ -10,12 +10,9 @@ its own handlers for the duration of a train stage and restores ours afterwards)
 from __future__ import annotations
 
 import gc
-import signal
 import threading
 import time
 import traceback
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +21,7 @@ from monorl.config.pipeline import EvalStage, PipelineConfig, RejectionSampleSta
 from monorl.core.errors import ConfigError, MonorlError
 from monorl.core.registry import ensure_providers
 from monorl.core.reporting import RunReporter
+from monorl.core.signals import signal_guard
 from monorl.core.types import RunState
 from monorl.pipeline.rejection import run_eval, run_rejection_sampling
 from monorl.pipeline.stages import (
@@ -86,7 +84,7 @@ def run_pipeline(
 
     cancel = threading.Event()
     runner = _StageRunner(config, manifest, reporter, stages_root, cancel=cancel, resume=resume)
-    with _signal_guard(cancel, reporter):
+    with signal_guard(cancel, reporter, "cancelling the pipeline after the current stage step"):
         reporter.set_status(
             "running", f"pipeline {name}: {len(config.stages)} stages (resume={resume})", step=0
         )
@@ -324,36 +322,6 @@ class _StageRunner:
         record.summary = outcome.summary()
         record.finished_at = time.time()
         record.state = "cancelled" if outcome.cancelled else "succeeded"
-
-
-# -- signals ----------------------------------------------------------------------------------
-
-
-@contextmanager
-def _signal_guard(cancel: threading.Event, reporter: RunReporter) -> Iterator[None]:
-    """First SIGINT/SIGTERM sets ``cancel`` (the active sampling stage stops at the next chunk,
-    the pipeline stops before the next stage); a second one raises ``KeyboardInterrupt``. Train
-    stages temporarily replace these handlers with the orchestrator's own. Only the main thread
-    may install handlers."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-
-    def handler(signum: int, _frame: object) -> None:
-        name = signal.Signals(signum).name
-        if cancel.is_set():
-            raise KeyboardInterrupt(name)
-        cancel.set()
-        reporter.log(f"received {name}: cancelling the pipeline after the current stage step")
-
-    previous = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        previous[sig] = signal.signal(sig, handler)
-    try:
-        yield
-    finally:
-        for sig, prev in previous.items():
-            signal.signal(sig, prev)
 
 
 __all__ = ["PipelineResult", "resolve_pipeline_run_dir", "run_pipeline"]
