@@ -13,7 +13,8 @@ What is locked:
 * What builds monorl itself (``[build-system] requires``). An install passes the file as
   ``--build-constraint`` too, so the build backend is the locked one.
 * For every platform and for Python :data:`PYTHON` and later: one file, with environment markers
-  where a platform or a Python version needs another package or version.
+  where a platform or a Python version needs another package or version. An install takes wheels
+  only (``--no-build``); every pin has them for macOS on Apple silicon, Linux and Windows.
 * torch from PyTorch's CPU builds, which is what CI and the CPU image run. Installing the file takes
   the same setting: ``uv pip sync --torch-backend cpu requirements.lock``.
 * Every distribution of ``third_party/pins.toml`` at the version pinned there, so that the release
