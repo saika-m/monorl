@@ -63,7 +63,7 @@ def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False)
         try:
             ensure_providers(config)
             if config.is_pipeline_backend:
-                result = _run_pipeline(config, reporter)
+                result = _run_pipeline(config, reporter, resume)
             elif config.is_sft:
                 result = SFTLoop(config, reporter, cancel=cancel, resume=resume).run()
             else:
@@ -97,9 +97,9 @@ def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False)
     return result
 
 
-def _run_pipeline(config: RunConfig, reporter: RunReporter) -> RunResult:
+def _run_pipeline(config: RunConfig, reporter: RunReporter, resume: bool) -> RunResult:
     backend = registry.get("pipeline_backend", config.trainer.backend)(config)
-    result = backend.run(config, reporter.run_dir, reporter=reporter)
+    result = backend.run(config, reporter.run_dir, reporter=reporter, resume=resume)
     if not result.checkpoints:
         result.checkpoints = list_checkpoints(reporter.run_dir)
     return result

@@ -87,7 +87,7 @@ def test_grpo_snapshot(make_config, tmp_path: Path):
         "trainer.experiment_name": "verl-test",
         "trainer.logger": "[console]",
         "trainer.default_local_dir": str(run_dir / "checkpoints"),
-        "trainer.resume_mode": "auto",
+        "trainer.resume_mode": "disable",
     }
     for key, value in expected.items():
         assert ov[key] == value, key

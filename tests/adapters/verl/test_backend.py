@@ -17,10 +17,11 @@ from monorl.adapters.verl.backend import (
     final_model_path,
     latest_step,
     link_checkpoints,
+    resume_step,
 )
 from monorl.core.errors import BackendUnavailable
 from monorl.core.registry import registry
-from monorl.core.reporting import RunReporter, list_checkpoints, read_status
+from monorl.core.reporting import RunReporter, iter_metrics, list_checkpoints, read_status
 
 _FAKE_ENTRY = """
 import json, os, signal, sys, time
@@ -28,20 +29,29 @@ from pathlib import Path
 
 run_dir = Path(os.environ["MONORL_RUN_DIR"])
 mode = os.environ.get("FAKE_ENTRY_MODE", "ok")
+overrides = dict(arg.split("=", 1) for arg in sys.argv[1:])
+# verl/trainer/ppo/ray_trainer.py _load_checkpoint: "disable" loads nothing; "auto" continues after
+# the step of latest_checkpointed_iteration.txt when its global_step_<n> exists, else from scratch.
+tracker = run_dir / "checkpoints" / "latest_checkpointed_iteration.txt"
+start = 0
+if overrides["trainer.resume_mode"] == "auto" and tracker.exists():
+    start = int(tracker.read_text())
+    if not (run_dir / "checkpoints" / f"global_step_{start}").exists():
+        start = 0
 print("fake verl entry argv:", sys.argv[1:], flush=True)
 print("RAY_ADDRESS=", os.environ.get("RAY_ADDRESS"), flush=True)
 if mode == "fail":
     print("boom", file=sys.stderr, flush=True)
     sys.exit(3)
 with open(run_dir / "metrics.jsonl", "a") as f:
-    for step in (1, 2):
+    for step in (start + 1, start + 2):
         f.write(json.dumps({"step": step, "time": 0.0, "phase": "train", "reward/mean": 0.25 * step, "actor/lr": 1e-6}) + "\\n")
         f.flush()
         if mode == "hang":
             time.sleep(0.2)
-ckpt = run_dir / "checkpoints" / "global_step_2" / "actor" / "huggingface"
-ckpt.mkdir(parents=True)
-(run_dir / "checkpoints" / "latest_checkpointed_iteration.txt").write_text("2")
+ckpt = run_dir / "checkpoints" / f"global_step_{start + 2}" / "actor" / "huggingface"
+ckpt.mkdir(parents=True, exist_ok=True)
+tracker.write_text(str(start + 2))
 if mode == "hang":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     time.sleep(60)
@@ -130,6 +140,66 @@ def test_run_succeeds_and_collects_checkpoints(make_config, tmp_path: Path, fake
     assert (run_dir / "checkpoints" / "step-2").resolve() == (
         run_dir / "checkpoints" / "global_step_2"
     ).resolve()
+
+
+def _steps(run_dir: Path) -> list[int]:
+    return [row["step"] for _, row in iter_metrics(run_dir)]
+
+
+def _stopped_after_step_3(make_config, run_dir: Path):
+    """A verl run with a checkpoint of step 2 that was stopped after it wrote the row of step 3."""
+    cfg = make_config()
+    assert _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False)).state == "succeeded"
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write(json.dumps({"step": 3, "time": 0.0, "phase": "train", "reward/mean": 0.9}) + "\n")
+    return cfg
+
+
+def test_resume_continues_from_the_checkpoint_and_drops_the_rows_after_it(
+    make_config, tmp_path: Path, fake_entry: Path
+):
+    run_dir = tmp_path / "run"
+    cfg = _stopped_after_step_3(make_config, run_dir)
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write('{"step": 4, "time": 0.0, "pha')  # killed in the middle of the row of step 4
+    assert resume_step(run_dir) == 2
+
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False), resume=True)
+    assert result.state == "succeeded", result.error
+    assert result.final_step == 4
+    log = (run_dir / "run.log").read_text()
+    assert "'trainer.resume_mode=auto'" in log.rsplit("fake verl entry argv:", 1)[1]
+    assert "continues after step 2" in log
+    rows = [row for _, row in iter_metrics(run_dir)]
+    assert [row["step"] for row in rows] == [1, 2, 3, 4]  # step 3 once, and no unreadable line
+    assert rows[2]["reward/mean"] == 0.75  # the row of this run, not the one of the killed run
+    assert len((run_dir / "metrics.jsonl").read_text().splitlines()) == 4
+    assert [Path(p).name for p in result.checkpoints] == ["global_step_2", "global_step_4"]
+
+
+def test_run_without_resume_starts_over_in_a_used_directory(make_config, tmp_path: Path, fake_entry: Path):
+    run_dir = tmp_path / "run"
+    cfg = _stopped_after_step_3(make_config, run_dir)
+    rows_before = _steps(run_dir)
+
+    result = _backend(cfg).run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert result.state == "succeeded", result.error
+    log = (run_dir / "run.log").read_text()
+    assert "'trainer.resume_mode=disable'" in log.rsplit("fake verl entry argv:", 1)[1]
+    assert result.final_step == 2  # trained steps 1 and 2 again instead of continuing at step 3
+    assert _steps(run_dir)[len(rows_before) :] == [1, 2]
+
+
+def test_resume_step_follows_verls_marker(tmp_path: Path):
+    root = tmp_path / "checkpoints"
+    (root / "global_step_4").mkdir(parents=True)
+    assert resume_step(tmp_path) == 0  # verl resumes from the marker, not from the directories
+    (root / "latest_checkpointed_iteration.txt").write_text("6")
+    assert resume_step(tmp_path) == 0  # global_step_6 is not there: verl trains from scratch
+    (root / "latest_checkpointed_iteration.txt").write_text("4")
+    assert resume_step(tmp_path) == 4
+    (root / "latest_checkpointed_iteration.txt").write_text("four")
+    assert resume_step(tmp_path) is None
 
 
 def test_run_failure_reports_exit_code(

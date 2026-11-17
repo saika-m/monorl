@@ -20,6 +20,7 @@ from monorl.adapters.nemo_rl.backend import (
     list_checkpoints,
     monorl_src_root,
     nemo_rl_home,
+    resume_step,
 )
 from monorl.adapters.nemo_rl.data import MODULE_NAME
 from monorl.adapters.nemo_rl.entry import HOME_ENV, parse_args, resolve_home
@@ -185,6 +186,57 @@ def test_run_end_to_end_with_fake_checkout(python_launch: RunConfig, fake_home: 
     assert "training done" in log and "LOG train step=1" in log and "launching (cwd=" in log
     assert (run_dir / "nemo_rl" / "train.jsonl").exists() and (run_dir / f"{MODULE_NAME}.py").exists()
     assert (run_dir / "nemo_rl" / "nemo_rl.yaml").exists()
+
+
+def _stopped_after_step_3(config: RunConfig, run_dir: Path) -> None:
+    """A NeMo-RL run with a checkpoint of step 2 that was killed in the middle of the row of step 4."""
+    result = NemoRLBackend(config).run(config, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert result.state == "succeeded", (run_dir / "run.log").read_text()
+    with open(run_dir / "metrics.jsonl", "a") as f:
+        f.write(json.dumps({"step": 3, "time": 0.0, "phase": "train", "reward/mean": 0.9}) + "\n")
+        f.write('{"step": 4, "time": 0.0, "pha')
+
+
+def test_resume_continues_from_the_checkpoint_and_drops_the_rows_after_it(
+    python_launch: RunConfig, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    _stopped_after_step_3(python_launch, run_dir)
+    assert resume_step(run_dir) == 2
+
+    reporter = RunReporter(run_dir, echo=False)
+    result = NemoRLBackend(python_launch).run(python_launch, run_dir, reporter=reporter, resume=True)
+    assert result.state == "succeeded", (run_dir / "run.log").read_text()
+    assert result.final_step == 4
+    assert [Path(p).name for p in result.checkpoints] == ["step_2", "step_4"]
+    rows = [r for _, r in iter_metrics(run_dir)]
+    assert [r["step"] for r in rows] == [1, 1, 2, 2, 3, 3, 4, 4]  # step 3 as this run wrote it
+    assert rows[4]["reward/mean"] == 0.75
+    assert len((run_dir / "metrics.jsonl").read_text().splitlines()) == 8  # and no unreadable line
+    assert "NeMo-RL continues after step 2" in (run_dir / "run.log").read_text()
+
+
+def test_run_without_resume_refuses_a_directory_nemo_rl_would_continue_in(
+    python_launch: RunConfig, tmp_path: Path
+) -> None:
+    """NeMo-RL has no way to start over next to its checkpoints, so the backend does not launch it."""
+    run_dir = tmp_path / "run"
+    _stopped_after_step_3(python_launch, run_dir)
+    records = (run_dir / "metrics.jsonl").read_bytes()
+    (run_dir / "child_env.json").unlink()
+
+    with pytest.raises(ConfigError, match=r"step_2.*--resume.*another run directory"):
+        NemoRLBackend(python_launch).run(python_launch, run_dir, reporter=RunReporter(run_dir, echo=False))
+    assert not (run_dir / "child_env.json").exists()  # the child was not started
+    assert (run_dir / "metrics.jsonl").read_bytes() == records
+
+
+def test_resume_step_is_the_checkpoint_nemo_rl_loads(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    assert resume_step(tmp_path) == 0
+    for name in ("step_2", "step_10", "tmp_step_12", "step_x", "step-30"):
+        (root / name).mkdir(parents=True)
+    assert resume_step(tmp_path) == 10  # by number, and only what finalize_checkpoint renamed
 
 
 def test_run_reports_failure(

@@ -88,6 +88,22 @@ def latest_step(run_dir: str | Path) -> int | None:
     return dirs[-1][0] if dirs else None
 
 
+def resume_step(run_dir: str | Path) -> int | None:
+    """The step verl continues after under ``trainer.resume_mode: auto``; 0 when it trains from
+    scratch. ``find_latest_ckpt_path`` (``verl/utils/checkpoint/checkpoint_manager.py``) reads the
+    step from ``latest_checkpointed_iteration.txt``, which is written once a checkpoint is
+    complete, and takes ``global_step_<n>`` only if that directory exists. ``None`` for a marker
+    that is not a number: verl stops on it."""
+    marker = Path(run_dir) / CHECKPOINT_DIR / LATEST_ITERATION_FILE
+    try:
+        step = int(marker.read_text())
+    except OSError:
+        return 0
+    except ValueError:
+        return None
+    return step if (marker.parent / f"{GLOBAL_STEP_PREFIX}{step}").exists() else 0
+
+
 def final_model_path(run_dir: str | Path) -> str | None:
     dirs = checkpoint_dirs(run_dir)
     if not dirs:
@@ -113,7 +129,7 @@ class VerlBackend:
         self._reporter: RunReporter | None = None
 
     # -- staging ------------------------------------------------------------------------
-    def prepare(self, config: RunConfig, run_dir: str | Path) -> list[str]:
+    def prepare(self, config: RunConfig, run_dir: str | Path, *, resume: bool = False) -> list[str]:
         """Write parquet data, reward module, tool config and the compiled tree; return overrides."""
         run_dir = Path(run_dir).expanduser().resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -126,7 +142,7 @@ class VerlBackend:
             write_reward_module(config, run_dir, config_path=config_path)
             if config.env.type == "tool_calling":
                 write_tool_config(config, run_dir)
-        tree = compile_config(config, run_dir, multimodal=multimodal)
+        tree = compile_config(config, run_dir, multimodal=multimodal, resume=resume)
         (run_dir / COMPILED_CONFIG_FILE).write_text(yaml.safe_dump(tree, sort_keys=False))
         overrides = to_overrides(tree)
         (run_dir / OVERRIDES_FILE).write_text("\n".join(overrides) + "\n")
@@ -158,12 +174,21 @@ class VerlBackend:
             if self._reporter is not None:
                 self._reporter.log("cancel requested: sent SIGTERM to verl driver")
 
-    def run(self, config: RunConfig, run_dir: Path, *, reporter: RunReporter) -> RunResult:
+    def run(
+        self, config: RunConfig, run_dir: Path, *, reporter: RunReporter, resume: bool = False
+    ) -> RunResult:
         run_dir = Path(run_dir).expanduser().resolve()
         if not self._custom_python and not is_available():
             raise BackendUnavailable("pipeline_backend 'verl' needs `pip install monorl[verl]` (verl>=0.9.1)")
         reporter.set_status("pending", "compiling verl config")
-        overrides = self.prepare(config, run_dir)
+        overrides = self.prepare(config, run_dir, resume=resume)
+        if resume and (step := resume_step(run_dir)) is not None:
+            reporter.log(
+                f"trainer.resume_mode=auto: verl continues after step {step}"
+                if step
+                else "resume requested but verl has no checkpoint to continue from; it starts from step 0"
+            )
+            reporter.drop_rows_after(step)
         cmd = self.build_command(overrides, sft=config.is_sft)
         reporter.log(
             "launching: " + " ".join(cmd[:3]) + f" (+{len(overrides)} overrides, see {OVERRIDES_FILE})"

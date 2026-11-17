@@ -198,7 +198,7 @@ def test_compile_sft_config_snapshot(make_config, tmp_path: Path, data_file: Pat
     assert trainer["total_training_steps"] == 30 and trainer["total_epochs"] == 30
     assert trainer["save_freq"] == 10 and trainer["test_freq"] == 5
     assert trainer["default_local_dir"] == str((run_dir / "checkpoints").resolve())
-    assert trainer["nnodes"] == 2 and trainer["n_gpus_per_node"] == 8 and trainer["resume_mode"] == "auto"
+    assert trainer["nnodes"] == 2 and trainer["n_gpus_per_node"] == 8 and trainer["resume_mode"] == "disable"
     assert trainer["project_name"] == "monorl" and trainer["experiment_name"] == "verl-test"
     overrides = to_overrides(tree)
     assert "data.messages_key=messages" in overrides and "trainer.total_epochs=30" in overrides

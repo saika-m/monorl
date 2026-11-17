@@ -169,7 +169,7 @@ def deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
 
 
 def compile_config(
-    config: RunConfig, run_dir: str | Path, *, multimodal: bool | None = None
+    config: RunConfig, run_dir: str | Path, *, multimodal: bool | None = None, resume: bool = False
 ) -> dict[str, Any]:
     """Build the verl override tree for ``config``; paths point into ``run_dir``.
 
@@ -177,9 +177,15 @@ def compile_config(
     :mod:`monorl.adapters.verl.data`, :mod:`.reward` and :mod:`.tools` (``VerlBackend.prepare``).
     ``multimodal`` (default: ``data.image_field`` is set) adds the VLM keys; ``algorithm.name='sft'``
     dispatches to :func:`compile_sft_config`.
+
+    ``resume`` is ``trainer.resume_mode``: ``auto`` continues from the ``global_step_<n>`` that
+    ``<run_dir>/checkpoints/latest_checkpointed_iteration.txt`` names and trains from scratch
+    without one, ``disable`` loads nothing (``_load_checkpoint`` in
+    ``verl/trainer/ppo/ray_trainer.py`` and ``v1/trainer_base.py``, ``_determine_resume_path`` in
+    ``verl/utils/checkpoint/checkpoint_handler.py`` for SFT).
     """
     if config.is_sft:
-        return compile_sft_config(config, run_dir, multimodal=multimodal)
+        return compile_sft_config(config, run_dir, multimodal=multimodal, resume=resume)
     if multimodal is None:
         multimodal = config.data.image_field is not None
     run_dir = Path(run_dir).expanduser().resolve()
@@ -316,7 +322,7 @@ def compile_config(
             "experiment_name": config.run_name or run_dir.name,
             "logger": loggers,
             "default_local_dir": str(run_dir / CHECKPOINT_DIR),
-            "resume_mode": "auto",
+            "resume_mode": "auto" if resume else "disable",
             "log_val_generations": logging.trajectories_per_step,
             "rollout_data_dir": str(run_dir / "rollouts") if logging.save_trajectories else None,
         },
@@ -415,7 +421,7 @@ SFT_ENGINE_DTYPE = {"bf16": "bfloat16", "fp16": "float16"}
 
 
 def compile_sft_config(
-    config: RunConfig, run_dir: str | Path, *, multimodal: bool | None = None
+    config: RunConfig, run_dir: str | Path, *, multimodal: bool | None = None, resume: bool = False
 ) -> dict[str, Any]:
     """Override tree for ``verl.trainer.sft_trainer_ray`` (``sft_trainer_engine.yaml``).
 
@@ -497,7 +503,7 @@ def compile_sft_config(
             "experiment_name": config.run_name or run_dir.name,
             "logger": loggers,
             "default_local_dir": str(run_dir / CHECKPOINT_DIR),
-            "resume_mode": "auto",
+            "resume_mode": "auto" if resume else "disable",
             "seed": config.seed,
         },
     }

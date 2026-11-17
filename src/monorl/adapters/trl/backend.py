@@ -6,12 +6,14 @@ monorl data → HF dataset (:mod:`.data`; ``images`` column + ``AutoProcessor`` 
 rewards → TRL reward function (:mod:`.rewards`), monorl environments → TRL ``rollout_func``
 (:mod:`.rollout`, multi-turn only; single-turn runs on TRL's native generation path), monorl
 reporter ← ``TrainerCallback`` + the ``trl.grpo.monorl_hooks`` patch (:mod:`.callbacks`,
-:mod:`.patches`). Both trainers share checkpointing (``checkpoints/step-<n>``), resume and the
-merged ``final/`` export.
+:mod:`.patches`). Both trainers share checkpointing (``checkpoints/step-<n>``), resume
+(``Trainer.train(resume_from_checkpoint=...)`` with the newest complete ``checkpoint-<n>``, only
+when the run was started with ``--resume``) and the merged ``final/`` export.
 """
 
 from __future__ import annotations
 
+import json
 import signal
 import sys
 import threading
@@ -94,6 +96,26 @@ def peft_config_for(config: RunConfig) -> Any | None:
     )
 
 
+def last_complete_checkpoint(output_dir: Path) -> tuple[int, Path | None]:
+    """``(step, path)`` of the newest ``checkpoint-<n>`` that a resume can load, ``(0, None)``
+    without one. ``Trainer._save_checkpoint`` writes ``trainer_state.json`` after the model, the
+    optimizer, the scheduler and the generator states, so a directory whose state file reads as
+    JSON was finished; one that a killed run left half-written is passed over, where
+    ``transformers.trainer_utils.get_last_checkpoint`` would pick it and the resume would fail."""
+    from transformers.trainer import TRAINER_STATE_NAME
+    from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+    found: list[tuple[int, Path]] = []
+    for path in output_dir.glob(f"{PREFIX_CHECKPOINT_DIR}-*"):
+        try:
+            step = int(path.name[len(PREFIX_CHECKPOINT_DIR) + 1 :])
+            json.loads((path / TRAINER_STATE_NAME).read_text())
+        except (ValueError, OSError):
+            continue
+        found.append((step, path))
+    return max(found) if found else (0, None)
+
+
 class TRLPipelineBackend:
     name = "trl"
 
@@ -102,7 +124,9 @@ class TRLPipelineBackend:
         self.trainer: Any = None
 
     # -- PipelineBackend ---------------------------------------------------------------------
-    def run(self, config: RunConfig, run_dir: Path, *, reporter: RunReporter) -> RunResult:
+    def run(
+        self, config: RunConfig, run_dir: Path, *, reporter: RunReporter, resume: bool = False
+    ) -> RunResult:
         run_dir = Path(run_dir)
         trl = _import_trl()
         device = resolve_device(config)
@@ -141,7 +165,7 @@ class TRLPipelineBackend:
             trainer = self._build_grpo_trainer(
                 trl, config, args, model, tokenizer, processing_class, train_ds, eval_ds, callback, reporter
             )
-        return self._train(trainer, args, tokenizer, callback, run_dir, reporter)
+        return self._train(trainer, args, tokenizer, callback, run_dir, reporter, resume)
 
     # -- internals ---------------------------------------------------------------------------
     def _build_grpo_trainer(
@@ -220,16 +244,22 @@ class TRLPipelineBackend:
         callback: ReporterCallback,
         run_dir: Path,
         reporter: RunReporter,
+        resume: bool,
     ) -> RunResult:
         from transformers import PrinterCallback
-        from transformers.trainer_utils import get_last_checkpoint
 
         trainer.remove_callback(PrinterCallback)  # metrics go to metrics.jsonl, not stdout
         self.trainer = trainer
 
-        resume_from = get_last_checkpoint(args.output_dir) if Path(args.output_dir).is_dir() else None
-        if resume_from:
-            reporter.log(f"resuming from {resume_from}")
+        resume_from: str | None = None
+        if resume:
+            step, checkpoint = last_complete_checkpoint(Path(args.output_dir))
+            if checkpoint is None:
+                reporter.log("resume requested but no complete checkpoint exists; starting from step 0")
+            else:
+                resume_from = str(checkpoint)
+                reporter.log(f"resuming from {resume_from}")
+            reporter.drop_rows_after(step)
 
         state = "succeeded"
         error: str | None = None

@@ -373,8 +373,8 @@ def test_pipeline_backend_dispatch(make_config: Any, monkeypatch: pytest.MonkeyP
         def __init__(self, config: Any) -> None:
             self.config = config
 
-        def run(self, config: Any, run_dir: Path, *, reporter: Any) -> RunResult:
-            calls.append((config, run_dir, reporter))
+        def run(self, config: Any, run_dir: Path, *, reporter: Any, resume: bool = False) -> RunResult:
+            calls.append((config, run_dir, reporter, resume))
             reporter.log_metrics(1, {"reward/mean": 0.5})
             return RunResult(state="succeeded", final_step=1, run_dir=str(run_dir))
 
@@ -384,14 +384,16 @@ def test_pipeline_backend_dispatch(make_config: Any, monkeypatch: pytest.MonkeyP
         cfg = make_config(trainer={"backend": "trl"})
         assert cfg.is_pipeline_backend
         result = run(cfg)
+        run(cfg, resume=True)
     finally:
         if previous is None:
             registry._items["pipeline_backend"].pop("trl", None)
         else:
             registry.register("pipeline_backend", "trl", previous, overwrite=True)
     assert result.state == "succeeded" and result.final_step == 1
-    config, run_dir, reporter = calls[0]
+    config, run_dir, reporter, _ = calls[0]
     assert config.trainer.backend == "trl" and run_dir == reporter.run_dir
+    assert [resume for *_, resume in calls] == [False, True]  # --resume reaches the backend
     assert read_status(run_dir)["state"] == "succeeded"
     assert (run_dir / "config.yaml").exists()
     assert fakes.TRAINERS == []  # the component loop never ran

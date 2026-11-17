@@ -479,7 +479,9 @@ installed W&B or TensorBoard was not run here):
 
 With `trainer.backend: trl | verl | nemo_rl` the framework owns the loop and writes through the
 same `RunReporter`, so `config.yaml`, `status.json`, `run.log` and its metrics land in the same
-run directory. Steps, metric names, checkpoints, cancelling and `--resume` (which `run()` does
-not forward to pipeline backends) are backend-specific: see [BACKENDS.md](BACKENDS.md).
+run directory. Steps, metric names, checkpoints and cancelling are backend-specific: see
+[BACKENDS.md](BACKENDS.md). `--resume` reaches the backend, which continues from its framework's
+newest checkpoint after taking the record files back to that step, or refuses; a run without it
+never continues an earlier one: see [Resume](BACKENDS.md#resume-with-a-pipeline-backend).
 
 Multi-stage pipelines write one such run directory per stage: see [PIPELINES.md](PIPELINES.md).

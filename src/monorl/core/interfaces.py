@@ -258,11 +258,19 @@ class WeightSync(Protocol):
 
 @runtime_checkable
 class PipelineBackend(Protocol):
-    """A framework that runs the entire RL loop itself (verl, NeMo-RL, TRL-native)."""
+    """A framework that runs the entire RL loop itself (verl, NeMo-RL, TRL-native).
+
+    ``resume`` is ``monorl train --resume``: continue the run of ``run_dir`` from its newest
+    checkpoint, after ``reporter.drop_rows_after`` took the record files back to that step.
+    Without it the run starts at step 0. A backend whose framework cannot do what was asked
+    raises :class:`~monorl.core.errors.ConfigError`; it never does the other thing instead.
+    """
 
     name: str
 
-    def run(self, config: RunConfig, run_dir: Path, *, reporter: RunReporter) -> RunResult: ...
+    def run(
+        self, config: RunConfig, run_dir: Path, *, reporter: RunReporter, resume: bool = False
+    ) -> RunResult: ...
 
 
 class RolloutEngineFactory(Protocol):

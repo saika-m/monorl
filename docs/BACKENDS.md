@@ -288,6 +288,63 @@ Hydra and NeMo-RL yaml, `GRPOConfig` kwargs for TRL).
   compiler derived), `nemo_rl_overrides` (hydra-style list), `nemo_rl_launcher` (`uv`|`python`),
   `nemo_rl_python`, `dtensor: {...}`, `megatron: {enabled: true, ...}` (Megatron policy config).
 
+### Resume with a pipeline backend
+
+`monorl train --resume` reaches the backend (`PipelineBackend.run(..., resume=True)`). The backend
+continues from the newest checkpoint its framework can load, and first takes `metrics.jsonl` and
+`trajectories.jsonl` back to the step of that checkpoint, as the loops do
+([RUNS.md](RUNS.md#the-record-files-after-a-resume)): rows of later steps and an unfinished last
+line are removed, because the framework writes those steps again. Without a checkpoint the run
+starts at step 0 and `run.log` says so. Without `--resume` no backend continues an earlier run.
+
+* **TRL.** `--resume` gives `Trainer.train(resume_from_checkpoint=...)` the newest
+  `checkpoints/checkpoint-<n>` whose `trainer_state.json` can be read. `Trainer` writes that file
+  last, so a checkpoint that a killed run left half-written is passed over. The trainer restores
+  the weights, the optimizer, the scheduler, its state and the random generators of the process.
+  Without `--resume` training starts at step 0, and a `checkpoint-<n>` that is there is written
+  over when its step is saved.
+  Run here on CPU: `trl_grpo_cpu.yaml` with `trainer.max_steps=4`, `trainer.save_every=2`,
+  `data.limit=8`, `rollout.max_new_tokens=24`, `trainer.learning_rate=1e-4` and the `length`
+  reward (`unit: chars, max_tokens: 100, penalty_per_token: 0.01`), once to the end, once with
+  `trainer.max_steps=2` followed by `--resume` to 4, and once killed with `kill -9` when
+  `metrics.jsonl` had the row of step 3 and resumed. In all three the rows of steps 1 to 4 were
+  the same apart from the wall-clock fields (`time`, `trl/step_time`), the 32 trajectory rows were
+  the same, and `final/model.safetensors` was identical in all 134,515,008 values. The resume of
+  the killed run removed 1 line of `metrics.jsonl` and 8 of `trajectories.jsonl` (TRL samples the
+  episodes of a step before it trains on them). The same finished directory started again without
+  `--resume` and with another learning rate trained its 4 steps with that rate.
+  What is not the uninterrupted run:
+  - The row `Trainer` logs when training ends holds `trl/train_loss`, which it averages over the
+    steps of the process: 0.00474 after the resume, 0.00358 for the run to the end. A run that
+    ended at step 2 and is resumed with a larger `trainer.max_steps` keeps its row of that kind.
+  - A checkpoint past the first pass over the dataset. `GRPOTrainer`'s sampler draws the prompt
+    order of every pass from a generator of its own, seeded when the sampler is built, and a
+    resumed `Trainer` starts at the pass of its checkpoint without the draws of the passes before
+    it. With `data.limit=4` (2 steps are one pass) the run resumed from step 2 trained steps 3
+    and 4 on the prompt order of steps 1 and 2, and its final weights differed from those of the
+    run to the end in 133,501,909 values (largest difference 3.1e-4).
+  - `algorithm.name: sft` on this backend was not run with `--resume`.
+* **verl.** `--resume` compiles `trainer.resume_mode: auto`, a run without it `disable`. At the
+  pin (`_load_checkpoint` in `verl/trainer/ppo/ray_trainer.py` and `v1/trainer_base.py`,
+  `_determine_resume_path` in `verl/utils/checkpoint/checkpoint_handler.py` for SFT) `auto` loads
+  the `global_step_<n>` that `checkpoints/latest_checkpointed_iteration.txt` names (actor, critic,
+  dataloader state) and continues with step `n + 1`, or trains from scratch when the marker or the
+  directory is missing; `disable` loads nothing. The marker is written when the checkpoint is
+  complete, and the backend takes the record files back to its step. PPO saves the checkpoint of
+  a step before it logs the step, so a run killed in between has no row of that step. Not run
+  here (no GPU): the tests use a stand-in entry that follows these rules. How closely a resumed
+  verl run repeats the run it resumes was not looked at.
+* **NeMo-RL.** It has no setting for this. Every algorithm sets itself up from
+  `CheckpointManager.get_latest_checkpoint_path()` (`nemo_rl/utils/checkpoint.py`, called in
+  `nemo_rl/algorithms/grpo.py` and `sft.py` at the pin): the `step_<n>` with the largest `n` in
+  `checkpointing.checkpoint_dir`, whenever there is one. So `--resume` is what NeMo-RL does in a
+  directory with checkpoints, with the record files taken back to step `n` first. A run without
+  `--resume` in such a directory is refused with a `ConfigError` before anything is launched,
+  because NeMo-RL cannot start at step 0 there: pass `--resume`, or use another run directory.
+  NeMo-RL renames a finished checkpoint from `tmp_step_<n>`, and writes it before the `train` row
+  of step `n`, so a run killed in between has no such row. Not run here: the tests use the fake
+  checkout, whose training script continues after the newest `step_<n>` as NeMo-RL does.
+
 ## Choosing
 
 * Laptop / CPU / MPS: `hf` + `reference` (or `trl`).

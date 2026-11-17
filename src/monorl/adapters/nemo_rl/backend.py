@@ -15,6 +15,7 @@ hydra-style overrides appended to the command), ``nemo_rl`` (config deep-merge, 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -134,6 +135,17 @@ def final_model_path(checkpoints: list[str]) -> str | None:
     return None
 
 
+def resume_step(run_dir: Path) -> int:
+    """The step NeMo-RL continues after in ``run_dir``; 0 when it starts at step 0. Every algorithm
+    (``nemo_rl/algorithms/grpo.py``, ``sft.py``) sets itself up from
+    ``CheckpointManager.get_latest_checkpoint_path()`` (``nemo_rl/utils/checkpoint.py``): the
+    ``step_<n>`` with the largest ``n`` in ``checkpointing.checkpoint_dir``, whenever there is one.
+    No key of its config turns that off. A checkpoint is written as ``tmp_step_<n>`` and renamed,
+    so a ``step_<n>`` is complete."""
+    names = (p.name for p in (run_dir / CHECKPOINT_DIR).glob("step_*"))
+    return max((int(name[5:]) for name in names if re.fullmatch(r"step_\d+", name)), default=0)
+
+
 def latest_step(run_dir: Path) -> int:
     step = 0
     for _, row in iter_metrics(run_dir):
@@ -175,10 +187,27 @@ class NemoRLBackend:
             _signal_group(proc, signal.SIGKILL)
 
     # -- run -----------------------------------------------------------------------------
-    def run(self, config: RunConfig, run_dir: Path, *, reporter: RunReporter) -> RunResult:
+    def run(
+        self, config: RunConfig, run_dir: Path, *, reporter: RunReporter, resume: bool = False
+    ) -> RunResult:
         run_dir = Path(run_dir).expanduser().resolve()
         home = nemo_rl_home(config)
         self._cancelled.clear()
+        step = resume_step(run_dir)
+        if resume:
+            reporter.log(
+                f"NeMo-RL continues after step {step}, from {run_dir / CHECKPOINT_DIR / f'step_{step}'}"
+                if step
+                else "resume requested but NeMo-RL has no checkpoint to continue from; it starts from step 0"
+            )
+            reporter.drop_rows_after(step)
+        elif step:
+            raise ConfigError(
+                f"{run_dir / CHECKPOINT_DIR} holds NeMo-RL checkpoints up to step_{step}, and NeMo-RL "
+                "continues from the newest checkpoint of its checkpoint directory whenever there is one: "
+                "it cannot start this run at step 0 there. Pass --resume to continue that run, or start "
+                "this one in another run directory (--run-dir, or another run_name)."
+            )
         reporter.set_status("pending", "compiling NeMo-RL config")
         exported = export_dataset(config, run_dir, tokenizer=_load_tokenizer(config, reporter))
         write_bridge_module(run_dir)
@@ -313,4 +342,5 @@ __all__ = [
     "make_backend",
     "monorl_src_root",
     "nemo_rl_home",
+    "resume_step",
 ]
