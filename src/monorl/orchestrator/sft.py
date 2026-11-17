@@ -38,7 +38,7 @@ from monorl.core.errors import ConfigError, DataError
 from monorl.core.registry import registry
 from monorl.core.reporting import list_checkpoints
 from monorl.core.types import Completion, Message, RunResult, Sample, Trajectory, Turn, message_text
-from monorl.orchestrator.loop import _checkpoint_complete
+from monorl.orchestrator.loop import _checkpoint_complete, preserved_rng, restore_loop_state, save_loop_state
 from monorl.orchestrator.sampler import PromptSampler
 from monorl.orchestrator.sinks import MetricSinks
 from monorl.rollout.render import render_chat
@@ -443,9 +443,12 @@ class SFTLoop:
         step = int(latest.name.removeprefix("step-"))
         self.trainer.load_checkpoint(latest)
         self._last_checkpoint_step = step
-        random.seed(self.config.seed + step)
-        torch.manual_seed(self.config.seed + step)
         self.reporter.log(f"resumed from {latest} at step {step}")
+        _, inexact = restore_loop_state(latest, seed=int(self.config.seed), step=step)
+        if inexact:
+            self.reporter.log(
+                f"the run will not continue exactly as the one it resumes: {'; '.join(inexact)}"
+            )
         return step
 
     # -- main loop ------------------------------------------------------------------------
@@ -564,6 +567,7 @@ class SFTLoop:
             shutil.rmtree(tmp)
         tmp.mkdir(parents=True)
         self.trainer.save_checkpoint(tmp)
+        save_loop_state(tmp, {})
         if path.exists():
             shutil.rmtree(path)
         os.replace(tmp, path)  # a crash mid-save leaves only step-N.tmp, never a half-written step-N
@@ -617,7 +621,10 @@ class SFTLoop:
         for start in range(0, len(self._eval_samples), per_step):
             chunk = self._eval_samples[start : start + per_step]
             batch, _, _ = self._encode(chunk, step)
-            logprobs = self.trainer.compute_logprobs(batch, reference=False)
+            # The generators are put back: the checkpoint of this step is on disk already, and the
+            # next step of a resumed run has to start from the same random state as this run's.
+            with preserved_rng():
+                logprobs = self.trainer.compute_logprobs(batch, reference=False)
             mask = batch.response_mask.to(logprobs.dtype)
             per_seq_tokens = mask.sum(dim=1)
             per_seq_nll = -(logprobs * mask).sum(dim=1)

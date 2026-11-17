@@ -15,10 +15,12 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from monorl.core.errors import ConfigError, DataError, EnvironmentError_
@@ -227,12 +229,23 @@ class ComponentLoop:
         step = int(latest.name.removeprefix("step-"))
         self.trainer.load_checkpoint(latest)
         self._last_checkpoint_step = step
-        random.seed(self.config.seed + step)
-        torch.manual_seed(self.config.seed + step)
         with self.engine_lock:
             self.weight_sync.sync(self.trainer, self.raw_engines)
             self.policy_version += 1
         self.reporter.log(f"resumed from {latest} at step {step}")
+        # Last, so that the generators are where the checkpoint left them when the next step starts.
+        state, inexact = restore_loop_state(latest, seed=int(self.config.seed), step=step)
+        if state is not None and "policy_version" in state:  # a checkpoint of the SFT loop has none
+            self.policy_version = int(state["policy_version"])
+        if self.config.rollout.async_steps_ahead > 0:
+            inexact.append(
+                "with rollout.async_steps_ahead > 0 the rollouts that ran ahead of the checkpoint are "
+                "not saved and are sampled again, from the weights of the checkpoint"
+            )
+        if inexact:
+            self.reporter.log(
+                f"the run will not continue exactly as the one it resumes: {'; '.join(inexact)}"
+            )
         return step
 
     # -- main loop ------------------------------------------------------------------------
@@ -691,6 +704,7 @@ class ComponentLoop:
             shutil.rmtree(tmp)
         tmp.mkdir(parents=True)
         self.trainer.save_checkpoint(tmp)
+        save_loop_state(tmp, {"policy_version": self.policy_version})
         if path.exists():
             shutil.rmtree(path)
         os.replace(tmp, path)  # a crash mid-save leaves only step-N.tmp, never a half-written step-N
@@ -747,7 +761,9 @@ class ComponentLoop:
         if not self._eval_samples:
             return
         t0 = time.perf_counter()
-        with self.engine_lock:
+        # The generators are put back: the checkpoint of this step is on disk already, and the next
+        # step of a resumed run has to start from the same random state as this run's.
+        with self.engine_lock, preserved_rng():
             specs = [
                 EpisodeSpec(
                     sample=s, group_id=f"eval-s{step}-{s.id}", engine=self.engines[i % len(self.engines)]
@@ -798,6 +814,100 @@ def _checkpoint_complete(path: Path) -> bool:
     """Checkpoints are written to ``step-N.tmp`` and renamed, so any non-empty ``step-N`` is complete
     (a crash mid-save leaves only the ``.tmp`` directory, which ``list_checkpoints`` ignores)."""
     return path.is_dir() and any(path.iterdir())
+
+
+# -- what a loop adds to a checkpoint ----------------------------------------------------------
+
+LOOP_STATE_FILE = "loop_state.pt"
+
+
+def rng_state() -> dict[str, Any]:
+    """The state of every global random generator of this process: Python, NumPy, and torch on the
+    CPU, on every CUDA device (once CUDA is in use here) and on MPS. Plain containers and tensors,
+    so that ``torch.load(weights_only=True)`` reads it back."""
+    numpy = np.random.get_state(legacy=False)
+    cuda = torch.cuda.is_available() and torch.cuda.is_initialized()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": numpy["bit_generator"],
+            "key": torch.from_numpy(numpy["state"]["key"].astype(np.int64)),
+            "pos": int(numpy["state"]["pos"]),
+            "has_gauss": int(numpy["has_gauss"]),
+            "gauss": float(numpy["gauss"]),
+        },
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if cuda else None,
+        "mps": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
+    }
+
+
+def set_rng_state(state: dict[str, Any]) -> list[str]:
+    """Put the generators back to ``state`` (:func:`rng_state`). Returns one sentence for every
+    generator of ``state`` this process cannot take (other accelerators than the saving process)."""
+    random.setstate(state["python"])
+    numpy = state["numpy"]
+    np.random.set_state(
+        {
+            "bit_generator": numpy["bit_generator"],
+            "state": {"key": numpy["key"].numpy().astype(np.uint32), "pos": numpy["pos"]},
+            "has_gauss": numpy["has_gauss"],
+            "gauss": numpy["gauss"],
+        }
+    )
+    torch.set_rng_state(state["torch"])
+    left_out: list[str] = []
+    if state["cuda"] is not None:
+        devices = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if devices == len(state["cuda"]):
+            torch.cuda.set_rng_state_all(state["cuda"])
+        else:
+            left_out.append(
+                f"the checkpoint holds the generators of {len(state['cuda'])} CUDA device(s) and this "
+                f"process has {devices}, so the CUDA generators were not restored"
+            )
+    if state["mps"] is not None:
+        if torch.backends.mps.is_available():
+            torch.mps.set_rng_state(state["mps"])
+        else:
+            left_out.append("the checkpoint holds an MPS generator and this process has no MPS device")
+    return left_out
+
+
+@contextmanager
+def preserved_rng() -> Iterator[None]:
+    """Leave the global generators as they were found, whatever the body draws."""
+    state = rng_state()
+    try:
+        yield
+    finally:
+        set_rng_state(state)
+
+
+def save_loop_state(checkpoint: Path, state: dict[str, Any]) -> None:
+    """Write ``state`` and the generators (:func:`rng_state`) into the checkpoint directory. Call it
+    after ``Trainer.save_checkpoint`` and before the directory gets its final name: the generators
+    are then where the next step finds them, and the checkpoint is complete or absent."""
+    torch.save({**state, "rng": rng_state()}, checkpoint / LOOP_STATE_FILE)
+
+
+def restore_loop_state(checkpoint: Path, *, seed: int, step: int) -> tuple[dict[str, Any] | None, list[str]]:
+    """Restore the generators from ``checkpoint``; call it after everything else of a resume, so
+    that nothing draws between this and the next step. Returns what :func:`save_loop_state` was
+    given, and the reasons why the run will not continue exactly as the run it resumes (none when
+    the generators of this process are all back). A checkpoint without loop state was written
+    before the loops saved it: ``(None, [why])``, with Python and torch reseeded from
+    ``seed + step`` as resumes were then."""
+    file = checkpoint / LOOP_STATE_FILE
+    if not file.exists():
+        random.seed(seed + step)
+        torch.manual_seed(seed + step)
+        return None, [
+            f"{checkpoint} holds no {LOOP_STATE_FILE} (it was written before the loop saved its state), "
+            f"so Python and torch were seeded with seed + step = {seed + step}"
+        ]
+    state = torch.load(file, map_location="cpu", weights_only=True)
+    return state, set_rng_state(state.pop("rng"))
 
 
 def _num_groups(trajectories: Sequence[Trajectory]) -> int:
