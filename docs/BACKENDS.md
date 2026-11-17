@@ -127,16 +127,57 @@ makes sglang send an abort per dispatched request. Both server clients close the
 flight, and the server aborts on the disconnect (vLLM at once via `with_cancellation`; SGLang's
 `/generate` waiter polls every `SGLANG_REQUEST_STATE_WAIT_TIMEOUT` seconds, 4 by default).
 
-#### Shared prompt prefill on HF
+#### Prompts that rows share on HF
 
-For text batches at least 128 padded tokens wide, the HF engine prefills identical prompts once
-per call and copies their KV-cache rows before sampling independent completions. This covers both
-`SamplingParams.n > 1` and duplicate prompts coalesced from parallel RL episodes. The final prompt
-token is left for normal generation; sampling, stop handling and logprob extraction are unchanged.
-The cache is never retained across calls or weight updates. Short batches, batches without repeated
-prompts, multimodal models, MTP drafting, remote-code models, non-default positional scaling and
-nonstandard cache configurations keep the ordinary path. The optimization targets full-attention
-text models with dynamic caches; its benefit depends on prompt length, group size and hardware.
+Rows of a batch that have the same prompt compute it once: the `n` samples of a prompt, and the
+equal prompts of episodes whose calls were batched together (the first turn of a group). The HF
+engine runs one forward pass over the distinct prompts without their last token, copies the
+key-value cache rows to the rows that have each prompt, and lets `generate` start at the last
+prompt token of every row. For a seed the tokens and finish reasons are those of a batch in which
+every row computes its prompt, and so are the log-probs up to float32 rounding (the largest
+difference measured below is 2.3e-5). The cache lives for the one call.
+
+The engine does this when it saves at least 256 positions: the rows that are copies, times the
+padded prompt length without the last token (`HFRolloutEngine.shared_prefill_min_positions`).
+Below that the one forward pass more costs about what it saves. Every row computes its prompt
+itself, as before, for prompts with images, with `model.mtp.rollout` (rows are drafted one by
+one), and for a model whose prompts cannot be computed apart from their last token:
+
+- a checkpoint with a processor, or with code of its own (`trust_remote_code`);
+- layers whose cache is not the keys and values of every position: sliding-window attention,
+  linear attention, state-space layers (tested with Mistral's `sliding_window`, Qwen3.5, Mamba);
+- a `rope_type` other than `default`, whose frequencies can depend on the length of a forward
+  pass (tested with `dynamic`);
+- a `cache_implementation` in the checkpoint's `generation_config.json`;
+- a model class whose `forward` takes no `past_key_values` or no `logits_to_keep`;
+- a PEFT adapter of virtual tokens (LoRA adapters share), and a model in training mode.
+
+Measured here on CPU (SmolLM2-135M, float32, 2 torch threads): 8 rows, 4 samples each of 2
+prompts, 16 new tokens, sampled with a seed. Positions are rows times tokens over the forward
+passes of the call; the time is the median CPU time of 7 calls, taken alternately with and
+without sharing while other jobs ran on the machine. The tokens were the same in every case.
+
+| Prompt tokens | Positions, every row its prompt | Positions, shared | CPU time | CPU time, shared |
+|---|---|---|---|---|
+| 32 | 362 | 176 | 0.93 s | 0.88 s |
+| 64 | 632 | 254 | 1.08 s | 0.97 s |
+| 128 | 1144 | 382 | 1.38 s | 1.16 s |
+| 256 | 2168 | 638 | 2.10 s | 1.38 s |
+| 512 | 4216 | 1150 | 3.80 s | 2.02 s |
+| 931 | 7568 | 1988 | 6.84 s | 3.02 s |
+
+The first row saves 186 positions and is below the threshold: it was measured with the threshold
+lowered, and is why the threshold is where it is.
+
+What it saves is prompt computation, so it shows where prompts are long next to what is
+generated. On the quickstart recipe (8 rows over 2 prompts per step, 69 to 104 tokens wide, 128
+new tokens) the model computes 3598 positions in three steps instead of 5176 and the 24 episodes
+are the same ones, but the rollout takes as long as before: its 384 passes of one token per row
+are what it spends its time on.
+
+On MPS the same model and batch gave the same tokens with and without sharing, and a call (median
+wall time of 5) took 0.67 s instead of 0.85 s for prompts of 300 tokens and 0.95 s instead of
+1.71 s for 931. Not measured: CUDA, and half-precision checkpoints.
 
 #### Multimodal (image) prompts
 

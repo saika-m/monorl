@@ -15,6 +15,10 @@ contains the media placeholder tokens, and ``generate`` receives ``pixel_values`
 ``mm_token_type_ids``. Raw-id prompts, text-only chats and text-only models take the tokenizer path
 unchanged.
 
+Rows of a batch that have the same prompt (the ``n`` samples of a prompt, the equal prompts of
+episodes that were batched together) compute it once and start from copies of its key-value cache
+(:meth:`HFRolloutEngine._shared_prompt_cache`).
+
 With ``model.mtp.rollout`` the checkpoint's MTP layers (:class:`monorl.mtp.MtpLayers`) draft the
 tokens after the next one and the policy verifies every draft (transformers' assisted decoding):
 tokens and logprobs are distributed and recorded exactly as without drafting, one policy pass just
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import inspect
 import logging
 import os
 import threading
@@ -368,6 +373,11 @@ class HFRolloutEngine:
     """``update_weights`` copies into the tensors it is given and leaves the others, and the model
     keeps its weights while the engine sleeps: weight sync may leave out what did not change."""
 
+    shared_prefill_min_positions = 256
+    """The fewest positions (rows times padded prompt tokens) that computing every distinct prompt
+    of a batch once has to save before the engine does it (:meth:`_shared_prompt_cache`); below
+    that the one forward pass more costs about what it saves."""
+
     def __init__(self, config: RunConfig, *, replica: int = 0) -> None:
         self.config = config
         self.replica = replica
@@ -691,6 +701,36 @@ class HFRolloutEngine:
             return None
         return rows if self.device.type == "mps" else 0
 
+    def _prefill_cache(self, model: torch.nn.Module, forward: Iterable[str]) -> DynamicCache | None:
+        """An empty cache to prefill prompts into once per distinct prompt
+        (:meth:`_shared_prompt_cache`), or ``None`` when every row has to compute its prompt: a
+        forward pass over a prompt without its last token has to leave what ``generate`` computes
+        for those tokens itself, in a cache whose rows can be copied. That is the case for a text
+        model of transformers' own code in evaluation mode (dropout would be drawn once per prompt
+        instead of once per row), whose default cache is a ``DynamicCache`` of plain layers (full
+        attention in every layer: no sliding window, no chunks, no state besides keys and values,
+        no layers that share theirs), and whose positions do not depend on how long the sequence
+        of a forward pass is (the dynamic RoPE scalings do). ``model`` is the transformers model
+        that generates and ``forward`` the names of the parameters of its forward pass."""
+        text_config = model.config.get_text_config(decoder=True)
+        rope = getattr(text_config, "rope_parameters", None) or vars(text_config).get("rope_scaling") or {}
+        cache = DynamicCache(config=model.config)  # the one generate builds itself
+        shared = (
+            self._processor is None  # such checkpoints keep state per row between steps (_slack)
+            and not self.model.training
+            and not type(model).__module__.startswith("transformers_modules")  # trust_remote_code
+            # an adapter of virtual tokens: its wrapper puts them in front of what generate is given
+            and not getattr(getattr(self.model, "active_peft_config", None), "is_prompt_learning", False)
+            and model._supports_default_dynamic_cache()
+            and model.generation_config.cache_implementation is None
+            and {"attention_mask", "past_key_values", "logits_to_keep"} <= set(forward)
+            # no RoPE, or the plain one (a mapping per layer type has no type of its own)
+            and (not rope or rope.get("rope_type", rope.get("type")) == "default")
+            and bool(cache.layers)
+            and all(type(layer) is DynamicLayer for layer in cache.layers)
+        )
+        return cache if shared else None
+
     def _shared_prompt_cache(
         self,
         prompt_ids: list[list[int]],
@@ -699,70 +739,48 @@ class HFRolloutEngine:
         n: int,
         switch: _CancelSwitch,
     ) -> DynamicCache | None:
-        """Prefill repeated text prompts once, then give every sample its own KV-cache rows.
+        """The key-value cache of every row of the batch (row ``i * n + j``: sample ``j`` of prompt
+        ``i``) for its prompt without the last token, when rows share prompts: each distinct
+        prompt is computed once and its cache rows are copied to the rows that have it, the ``n``
+        samples of a prompt and the equal prompts of other episodes that were batched with it.
+        ``generate`` then starts at the last prompt token of every row, where the rows first
+        differ, so sampling, stopping and the recorded log-probabilities are what they are without
+        the cache. ``None`` when the batch is decoded the ordinary way: that would save fewer than
+        :attr:`shared_prefill_min_positions` positions (none when no prompt repeats), or the
+        model's prompts cannot be computed apart from their last token (:meth:`_prefill_cache`).
 
-        Keep the last prompt token for ``generate`` to compute its first sampling logits. The
-        cache is local to this call: neither another request nor a weight update can reuse it.
-        Short prompts keep the ordinary path because a second forward pass costs more than it saves.
-        """
-        if (
-            input_ids.shape[1] < 128
-            or len(prompt_ids) * n < 2
-            or self.config is None
-            or self._processor is not None
-            or self.config.model.trust_remote_code
-            or self.model.training
-            or any(len(ids) < 2 for ids in prompt_ids)
-        ):
-            return None
-        model_config = self.model.config
-        rope = getattr(model_config, "rope_parameters", None)
-        if rope is None:
-            rope = vars(model_config).get("rope_scaling")
-        if (
-            model_config.is_encoder_decoder
-            or not self.model._supports_default_dynamic_cache()
-            or not self.model._supports_logits_to_keep()
-            or self.model.generation_config.cache_implementation is not None
-            or getattr(model_config, "sliding_window", None) is not None
-            or getattr(model_config, "attention_chunk_size", None) is not None
-            or any(kind != "full_attention" for kind in (getattr(model_config, "layer_types", None) or []))
-            or (rope is not None and rope.get("rope_type", rope.get("type")) != "default")
-        ):
-            return None
-
-        unique: dict[tuple[int, ...], int] = {}
-        first_rows: list[int] = []
-        sample_rows: list[int] = []
+        ``input_ids`` and ``attention_mask`` are the left-padded prompts, one row per prompt. The
+        cache lives for this call only: no other call and no later weights ever see it."""
+        distinct: dict[tuple[int, ...], int] = {}  # prompt -> its index among the distinct ones
+        first_rows: list[int] = []  # the row of input_ids that holds each distinct prompt
+        sources: list[int] = []  # per row of the batch, the distinct prompt it has
         for row, ids in enumerate(prompt_ids):
-            key = tuple(ids)
-            if key not in unique:
-                unique[key] = len(first_rows)
+            index = distinct.setdefault(tuple(ids), len(first_rows))
+            if index == len(first_rows):
                 first_rows.append(row)
-            sample_rows.extend([unique[key]] * n)
-        if len(first_rows) == len(sample_rows):
+            sources.extend([index] * n)
+        # The rows that are copies do not compute what precedes the last token of their prompt.
+        saved = (len(sources) - len(first_rows)) * (input_ids.shape[1] - 1)
+        if saved < max(self.shared_prefill_min_positions, 1):
             return None
-
-        if len(first_rows) != len(prompt_ids):
-            selection = torch.tensor(first_rows, device=input_ids.device)
-            input_ids = input_ids.index_select(0, selection)
-            attention_mask = attention_mask.index_select(0, selection)
-        prefix_mask = attention_mask[:, :-1]
-        position_ids = prefix_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(prefix_mask == 0, 0)
-        cache = DynamicCache()
-        inputs = self.model.prepare_inputs_for_generation(
-            input_ids[:, :-1],
-            attention_mask=prefix_mask,
-            position_ids=position_ids,
-            past_key_values=cache,
-            use_cache=True,
-            logits_to_keep=1,
-        )
+        model = self._generating_model()
+        forward = inspect.signature(model.forward).parameters
+        cache = self._prefill_cache(model, forward)
+        if cache is None:
+            return None
+        select = torch.tensor(first_rows, device=input_ids.device)
+        prefix_ids = input_ids.index_select(0, select)[:, :-1]
+        prefix_mask = attention_mask.index_select(0, select)[:, :-1]
+        inputs: dict[str, Any] = {"input_ids": prefix_ids, "attention_mask": prefix_mask}
+        if "position_ids" in forward:
+            # As generate numbers the tokens of a left-padded batch (prepare_inputs_for_generation).
+            inputs["position_ids"] = (prefix_mask.cumsum(-1) - 1).masked_fill_(prefix_mask == 0, 1)
         switch.check()
-        self.model(**inputs, return_dict=True)
+        # The model itself, not prepare_inputs_for_generation: what that wants for a cache it is
+        # handed differs between transformers releases, what forward takes does not.
+        self.model(**inputs, past_key_values=cache, use_cache=True, logits_to_keep=1, return_dict=True)
         switch.check()
-        cache.batch_select_indices(torch.tensor(sample_rows, device=input_ids.device))
+        cache.batch_select_indices(torch.tensor(sources, device=input_ids.device))
         return cache
 
     def _decode_batch(
@@ -774,7 +792,8 @@ class HFRolloutEngine:
         switch: _CancelSwitch,
     ) -> list[Completion]:
         """``n`` completions of every prompt, of at most ``caps[prompt]`` tokens, all rows
-        left-padded into one batch.
+        left-padded into one batch. Rows that have the same prompt start from one computation of
+        it (:meth:`_shared_prompt_cache`).
 
         ``generate`` computes every row of its batch until the last one has finished, so the batch
         is decoded by a chain of ``generate`` calls: a call returns when rows have finished, with
