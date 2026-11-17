@@ -874,6 +874,16 @@ def test_a_row_may_name_an_image_and_its_limits(
     assert argv[argv.index("--network") + 1] == "host" and "--read-only" in argv
 
 
+def test_an_image_cannot_be_an_option_of_the_docker_cli(
+    make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path
+) -> None:
+    config = _config(make_config, ["{python}", str(write_agent(tmp_path, AGENT)), str(tmp_path / "report")])
+    message = _refused(config, _row_samples(tmp_path, {"sandbox": {"image": "--privileged"}}), docker)
+    assert "sample 'row0'" in message and "image reference" in message
+    with pytest.raises(ConfigError, match="image reference"):
+        make_env(_config(make_config, ["true"], sandbox={"image": "--privileged"}))
+
+
 def test_tasks_read_only_the_host_variables_the_run_config_lists(
     make_config: Callable[..., RunConfig], docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

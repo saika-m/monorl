@@ -201,6 +201,13 @@ def _positive(name: str, kind: type = float) -> Any:
     return parse
 
 
+def _image(value: Any) -> str:
+    image = _text("image")(value)
+    if image.startswith("-"):  # it would be read as an option of `docker pull` and `docker run`
+        raise ConfigError(f"env.params.sandbox.image must be an image reference, got {value!r}")
+    return image
+
+
 def _backend(value: Any) -> str:
     backend = str(value).lower()
     if backend not in BACKENDS:
@@ -293,7 +300,7 @@ def _args(value: Any) -> tuple[str, ...]:
 
 _PARSERS: dict[str, Any] = {
     "backend": _backend,
-    "image": _text("image"),
+    "image": _image,
     "build": _build,
     "build_timeout": _positive("build_timeout"),
     "workdir": _workdir,
