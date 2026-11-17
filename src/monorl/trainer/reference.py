@@ -6,6 +6,16 @@ they are directly comparable with the rollout engines' temperature-scaled sampli
 The loss is any callable with the ``monorl.algorithms.policy_loss`` signature; by default that
 function is imported lazily.
 
+Output head
+-----------
+A loss reads the logits that predict the response tokens, often a small share of an agentic
+context, so the policy's output embedding is applied to the final hidden states of those positions
+alone: a forward pre-hook hands it the ``[N, H]`` rows instead of ``[B, T, H]`` and the model
+returns ``[N, V]`` logits (neither the ``[B, T, V]`` logits nor their gradient exist). That is
+right for a model that calls its output embedding once on the whole batch and does nothing to the
+logits that depends on their layout; the trainer checks it once, at construction, against the
+model's own full logits on a few tokens and otherwise computes the logits everywhere.
+
 Value baseline
 --------------
 ``algorithm.name: ppo`` adds a critic: a zero-initialised linear value head on the policy's final
@@ -189,6 +199,12 @@ def _default_loss_fn(algorithm: Any) -> LossFn:
     return select_loss_fn(algorithm)
 
 
+def head_rows(positions: torch.Tensor) -> torch.Tensor:
+    """``[B, T-1]`` bool for ``positions`` (``[B, T]``, nonzero where a token's logprob is wanted):
+    set where the logits of that position predict a wanted token, i.e. the next one."""
+    return positions[:, 1:].bool()
+
+
 def sequence_logprobs_and_entropy(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
@@ -197,21 +213,32 @@ def sequence_logprobs_and_entropy(
     entropy: bool,
     top_ids: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    vocab_mean: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """``[B,T]`` logprob of ``input_ids[:, t]`` given the prefix (position 0 is 0), optionally the
-    entropy of the predictive distribution at every position (position 0 is 0) and, for
-    ``top_ids`` (``[B,T,K]`` candidate tokens per position), their ``[B,T,K]`` logprobs under the
-    same distribution (position 0 is 0).
+    entropy of the predictive distribution at every position (position 0 is 0), for ``top_ids``
+    (``[B,T,K]`` candidate tokens per position) their ``[B,T,K]`` logprobs under the same
+    distribution (position 0 is 0) and, with ``vocab_mean``, the ``[B,T]`` mean log-probability
+    over the vocabulary (position 0 is 0; the label-smoothing term of ``sft``).
 
-    With ``positions`` (``[B,T]``, nonzero where wanted) all three are computed at those positions
+    With ``positions`` (``[B,T]``, nonzero where wanted) all four are computed at those positions
     only and are 0 elsewhere. The log-softmax over the vocabulary, what autograd keeps of it and
     the entropy are several ``[B,T,V]`` float tensors otherwise, and a loss reads them at the
-    response positions alone."""
+    response positions alone.
+
+    ``logits`` is ``[B,T,V]``, or only the ``[N,V]`` rows that predict the wanted positions:
+    ``logits[:, :-1][head_rows(positions)]`` of the former."""
     if positions is None:
         positions = torch.ones_like(input_ids, dtype=torch.bool)
     keep = positions.bool().clone()
     keep[:, 0] = False  # nothing predicts the first token
-    logp_all = torch.log_softmax(logits[:, :-1][keep[:, 1:]].float() / temperature, dim=-1)  # [N, V]
+    rows = logits if logits.dim() == 2 else logits[:, :-1][head_rows(positions)]
+    if rows.shape[0] != int(keep.sum().item()):
+        raise ValueError(
+            f"{rows.shape[0]} rows of logits for {int(keep.sum().item())} wanted positions: [N, V] logits "
+            "must be the rows head_rows(positions) selects"
+        )
+    logp_all = torch.log_softmax(rows.float() / temperature, dim=-1)  # [N, V]
     lp = logp_all.new_zeros(input_ids.shape)
     lp[keep] = logp_all.gather(-1, input_ids[keep][:, None]).squeeze(-1)
     ent = None
@@ -222,7 +249,11 @@ def sequence_logprobs_and_entropy(
     if top_ids is not None:
         top = logp_all.new_zeros(top_ids.shape)
         top[keep] = logp_all.gather(-1, top_ids[keep])
-    return lp, ent, top
+    mean = None
+    if vocab_mean:
+        mean = logp_all.new_zeros(input_ids.shape)
+        mean[keep] = logp_all.mean(dim=-1)
+    return lp, ent, top, mean
 
 
 class ReferenceTrainer:
@@ -310,6 +341,7 @@ class ReferenceTrainer:
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
         self._reference_model: nn.Module | None = None
+        self._narrow_head = self._head_narrows()
 
     def shutdown(self) -> None:
         """Leaves the process group this trainer created (no-op for single-process runs)."""
@@ -346,14 +378,70 @@ class ReferenceTrainer:
         )
         return get_peft_model(model, peft_config)
 
-    def _output_embedding(self) -> nn.Module:
-        module = self.hf_model.get_output_embeddings()
+    def _output_embedding(self, model: nn.Module | None = None) -> nn.Module:
+        """The output embedding of ``model``: the policy (default, also for its LoRA wrapper) or the
+        frozen reference copy."""
+        base = self.hf_model if model is None or model is self.model else model
+        module = base.get_output_embeddings()
         if module is None:
             raise ConfigError(
                 "algorithm.name='ppo' reads the value head's input at the model's output embedding (lm_head), "
-                f"which {type(self.hf_model).__name__} does not expose"
+                f"which {type(base).__name__} does not expose"
             )
         return module
+
+    @torch.no_grad()
+    def _head_narrows(self) -> bool:
+        """Whether the model's logits at chosen positions are what it returns when its output
+        embedding sees the final hidden states of those positions only (:meth:`_head_input`).
+        Compared on two short token sequences against the full logits; a model that calls the
+        embedding more than once, on something that is not ``[B, T, H]``, or that reshapes, slices
+        or normalises the logits across positions afterwards fails or disagrees."""
+        embedding = self.hf_model.get_input_embeddings()
+        if self.hf_model.get_output_embeddings() is None or embedding is None:
+            return False
+        # Plain tokens: an id the config gives a role (image placeholder, padding) is no text.
+        special = {v for k, v in self.hf_model.config.to_dict().items() if k.endswith("token_id")}
+        ids = [i for i in range(min(embedding.weight.shape[0], 64)) if i not in special][:12]
+        if len(ids) < 4:
+            return False
+        input_ids = torch.tensor([ids, ids[::-1]], dtype=torch.long)
+        wanted = torch.zeros_like(input_ids)
+        wanted[0, 1] = wanted[0, -1] = wanted[1, 2] = 1  # ragged: another count in every row
+        probe = TrainBatch(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            response_mask=wanted,
+            advantages=torch.zeros(input_ids.shape),
+            rewards=torch.zeros(2),
+            group_ids=["", ""],
+        ).to(self.device)
+        rows = head_rows(probe.response_mask)
+        was_training = self.model.training
+        self.model.eval()  # no dropout: both passes compute the same function, and draw no random numbers
+        try:
+            with self._autocast():
+                full = self._forward(self.model, probe)
+                with self._head_input(self.model, rows):
+                    narrow = self._forward(self.model, probe)
+        except (RuntimeError, IndexError, ValueError, TypeError) as exc:
+            log.info("output head is applied at every position: %s", exc)
+            return False
+        finally:
+            self.model.train(was_training)
+        if full.dim() != 3 or full.shape[:2] != input_ids.shape:
+            return False
+        expected = full[:, :-1][rows].float()
+        if narrow.shape != expected.shape:
+            log.info("output head is applied at every position: logits %s", tuple(narrow.shape))
+            return False
+        # The same rows through another matmul shape: equal up to rounding in the logits' dtype.
+        tolerance = 1e-4 if full.dtype in (torch.float32, torch.float64) else 2e-2
+        scale = float(expected.abs().max().item()) if expected.numel() else 0.0
+        same = float((narrow.float() - expected).abs().max().item()) <= tolerance * max(scale, 1.0)
+        if not same:
+            log.info("output head is applied at every position: its logits depend on the other positions")
+        return same
 
     def _build_value_head(self) -> nn.Linear:
         """``hidden -> 1`` in float32, zero-initialised: the first advantages are plain returns and
@@ -457,21 +545,29 @@ class ReferenceTrainer:
                 weight = micro_tokens / total_tokens if token_agg else micro_scored / total_scored
             if micro_tokens == 0 and micro_states == 0:
                 continue
+            rows = head_rows(micro.response_mask) if self._narrow_head else None
+            hidden = None
             with contextlib.ExitStack() as stack:
                 stack.enter_context(self._autocast())
-                hidden = stack.enter_context(self._final_hidden()) if micro_states else None
+                if rows is not None or micro_states:
+                    head_input = stack.enter_context(self._head_input(self.model, rows))
+                    hidden = head_input if micro_states else None
+                    del head_input
                 outputs = self._outputs(self.model, micro, **mtp_inputs)
             logits = outputs.logits
             last_layer = outputs.hidden_states[-1] if mtp is not None else None
             del outputs
-            logprobs, entropy, top_logprobs = sequence_logprobs_and_entropy(
+            smoothing = self.config.algorithm.name == "sft" and self.config.algorithm.sft_label_smoothing > 0
+            logprobs, entropy, top_logprobs, vocab_mean = sequence_logprobs_and_entropy(
                 logits,
                 micro.input_ids,
                 self.temperature,
                 entropy=True,
                 top_ids=micro.behavior_top_ids,
                 positions=micro.response_mask,
+                vocab_mean=smoothing,
             )
+            del logits
             loss_kwargs: dict[str, Any] = {}
             if micro.loss_weights is not None:
                 loss_kwargs["loss_weights"] = micro.loss_weights
@@ -480,13 +576,8 @@ class ReferenceTrainer:
             if top_logprobs is not None:
                 loss_kwargs["top_logprobs"] = top_logprobs
                 loss_kwargs["behavior_top_logprobs"] = micro.behavior_top_logprobs
-            if self.config.algorithm.name == "sft" and self.config.algorithm.sft_label_smoothing > 0:
-                from monorl.algorithms import mean_logprob_all_tokens
-
-                loss_kwargs["mean_logprob_all_tokens"] = mean_logprob_all_tokens(
-                    logits, self.temperature, positions=micro.response_mask
-                )
-            del logits
+            if vocab_mean is not None:
+                loss_kwargs["mean_logprob_all_tokens"] = vocab_mean
             mask = micro.response_mask.float()
             logprobs = logprobs * mask
             out = self.loss_fn(
@@ -614,11 +705,15 @@ class ReferenceTrainer:
             model.eval()
             for start in range(0, len(prepared), mbs):
                 micro = prepared.slice(start, start + mbs).trimmed()
-                with self._autocast():
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(self._autocast())
+                    if self._narrow_head:
+                        stack.enter_context(self._head_input(model, head_rows(micro.response_mask)))
                     logits = self._forward(model, micro)
-                lp, _, _ = sequence_logprobs_and_entropy(
+                lp = sequence_logprobs_and_entropy(
                     logits, micro.input_ids, self.temperature, entropy=False, positions=micro.response_mask
-                )
+                )[0]
+                del logits
                 out[start : start + len(micro), : lp.shape[1]] = lp
             model.train(was_training)
         return out.to(src_device)
@@ -640,7 +735,9 @@ class ReferenceTrainer:
         self.model.eval()
         for start in range(0, len(prepared), mbs):
             micro = prepared.slice(start, start + mbs).trimmed()
-            with self._autocast(), self._final_hidden() as hidden:
+            # The values need no logits: the output embedding gets no row at all where that is sound.
+            rows = torch.zeros_like(head_rows(micro.response_mask)) if self._narrow_head else None
+            with self._autocast(), self._head_input(self.model, rows) as hidden:
                 self._forward(self.model, micro)
             values = self._values(hidden, micro) * micro.attention_mask
             out[start : start + len(micro), : values.shape[1]] = values
@@ -826,15 +923,33 @@ class ReferenceTrainer:
         )
 
     @contextlib.contextmanager
-    def _final_hidden(self) -> Iterator[list[torch.Tensor]]:
-        """Collects the input of the policy's output embedding, i.e. the final hidden states
+    def _head_input(self, model: nn.Module, rows: torch.Tensor | None = None) -> Iterator[list[torch.Tensor]]:
+        """Collects the input of the output embedding of ``model``, i.e. the final hidden states
         ``[B, T, H]``, of every forward pass run inside the block. Reading it there costs no
         memory beyond the pass itself, unlike ``output_hidden_states``, which keeps every layer's
-        output alive (also under gradient checkpointing)."""
+        output alive (also under gradient checkpointing).
+
+        With ``rows`` (:func:`head_rows`, ``[B, T-1]`` bool) the embedding is applied to those ``N``
+        hidden states only, so the pass returns ``[N, V]`` logits; sound when
+        :meth:`_head_narrows` says so."""
         captured: list[torch.Tensor] = []
-        handle = self._output_embedding().register_forward_pre_hook(
-            lambda _module, args: captured.append(args[0])
-        )
+
+        def hook(_module: nn.Module, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
+            captured.append(args[0])
+            if rows is None:
+                return None
+            if (
+                args[0].dim() != 3
+                or args[0].shape[0] != rows.shape[0]
+                or args[0].shape[1] != rows.shape[1] + 1
+            ):
+                raise RuntimeError(
+                    f"the output embedding was called on {tuple(args[0].shape)}, not on the final hidden "
+                    f"states of the whole {(rows.shape[0], rows.shape[1] + 1)} batch"
+                )
+            return (args[0][:, :-1][rows], *args[1:])
+
+        handle = self._output_embedding(model).register_forward_pre_hook(hook)
         try:
             yield captured
         finally:
@@ -843,7 +958,7 @@ class ReferenceTrainer:
     def _values(
         self, hidden: list[torch.Tensor], micro: TrainBatch, positions: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Value-head estimates from the hidden states :meth:`_final_hidden` collected for
+        """Value-head estimates from the hidden states :meth:`_head_input` collected for
         ``micro``: ``[B, T]``, or one per ``True`` entry of ``positions`` (``[B, T]`` bool)."""
         if len(hidden) != 1 or hidden[0].shape[:2] != micro.input_ids.shape:
             raise RuntimeError(

@@ -98,9 +98,11 @@ def test_micro_batching_matches_single_pass(tiny_model_dir: Path, tokenizer) -> 
 
 
 def test_logprobs_at_chosen_positions_are_those_of_the_full_computation() -> None:
-    """The trainer computes the log-softmax at the response positions only; values and gradients
-    there have to be what the computation over every position gives, and zero elsewhere."""
-    from monorl.trainer.reference import sequence_logprobs_and_entropy
+    """The trainer computes the log-softmax at the response positions only, from the logits of
+    every position or from the rows that predict those positions alone; values and gradients there
+    have to be what the computation over every position gives, and zero elsewhere."""
+    from monorl.algorithms import mean_logprob_all_tokens
+    from monorl.trainer.reference import head_rows, sequence_logprobs_and_entropy
 
     generator = torch.Generator().manual_seed(0)
     logits = torch.randn((3, 7, 11), generator=generator, requires_grad=True)
@@ -112,20 +114,28 @@ def test_logprobs_at_chosen_positions_are_those_of_the_full_computation() -> Non
     wanted = positions.bool()
     wanted[:, 0] = False
 
-    full = sequence_logprobs_and_entropy(logits, input_ids, 0.7, entropy=True, top_ids=top_ids)
-    part = sequence_logprobs_and_entropy(
-        logits, input_ids, 0.7, entropy=True, top_ids=top_ids, positions=positions
-    )
-    for whole, chosen in zip(full, part, strict=True):
-        torch.testing.assert_close(chosen[wanted], whole[wanted])
-        assert not chosen[~wanted].any()
+    def compute(source: torch.Tensor, where: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
+        return sequence_logprobs_and_entropy(
+            source, input_ids, 0.7, entropy=True, top_ids=top_ids, positions=where, vocab_mean=True
+        )
 
     def gradient(values: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        lp, entropy, top = values
+        lp, entropy, top, mean = values
         scalar = (lp * wanted).sum() + 0.3 * (entropy * wanted).sum() + (top * wanted[..., None]).sum()
-        return torch.autograd.grad(scalar, logits, retain_graph=True)[0]
+        return torch.autograd.grad(scalar + 0.2 * (mean * wanted).sum(), logits, retain_graph=True)[0]
 
-    torch.testing.assert_close(gradient(part), gradient(full), atol=1e-6, rtol=1e-5)
+    full = compute(logits, None)
+    torch.testing.assert_close(full[3], mean_logprob_all_tokens(logits, 0.7))  # the sft smoothing term
+    rows = logits[:, :-1][head_rows(positions)]
+    assert rows.shape == (5, 11)
+    for part in (compute(logits, positions), compute(rows, positions)):
+        for whole, chosen in zip(full, part, strict=True):
+            torch.testing.assert_close(chosen[wanted], whole[wanted])
+            assert not chosen[~wanted].any()
+        torch.testing.assert_close(gradient(part), gradient(full), atol=1e-6, rtol=1e-5)
+    with pytest.raises(ValueError, match="5 wanted positions"):
+        compute(rows[:4], positions)
+    assert sequence_logprobs_and_entropy(logits, input_ids, 0.7, entropy=False)[1:] == (None, None, None)
 
 
 def test_a_step_does_not_depend_on_the_padding_of_the_batch(tiny_model_dir: Path, tokenizer) -> None:
