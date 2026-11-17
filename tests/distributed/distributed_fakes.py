@@ -194,14 +194,17 @@ def make_batch() -> TrainBatch:
 
 
 def register(registry: Any) -> None:
-    registry.register("rollout_engine", "fake", lambda config, **kw: FakeEngine(0, **kw))
-    registry.register("trainer", "fake", lambda config, **kw: FakeTrainer(1, **kw))
+    """Register the fakes, in place of whatever has their names: other test directories register
+    fakes of their own as ``fake``, and a process that ran their tests still has them."""
+    registry.register("rollout_engine", "fake", lambda config, **kw: FakeEngine(0, **kw), overwrite=True)
+    registry.register("trainer", "fake", lambda config, **kw: FakeTrainer(1, **kw), overwrite=True)
     registry.register(
         "rollout_engine",
         "flaky",
         lambda config, **kw: FlakyEngine(0, fail_flag=config.rollout.extra.get("fail_flag"), **kw),
+        overwrite=True,
     )
-    registry.register("trainer", "adapter", lambda config, **kw: AdapterTrainer(1, **kw))
+    registry.register("trainer", "adapter", lambda config, **kw: AdapterTrainer(1, **kw), overwrite=True)
 
 
 # -- helpers for multi-process weight-sync tests (importable by spawn) ------------------------
