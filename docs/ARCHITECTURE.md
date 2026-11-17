@@ -68,7 +68,8 @@ Read the file. Key points:
   policy over OpenAI chat completions, OpenAI Responses and Anthropic Messages (streamed or not,
   image inputs included) and records every call. The env factory may return either.
 - `RewardFunction(trajectories) -> list[RewardResult]` (batched).
-- `PipelineBackend.run(config, run_dir, reporter=...) -> RunResult` for trl/verl/nemo_rl.
+- `PipelineBackend.run(config, run_dir, reporter=..., resume=False) -> RunResult` for
+  trl/verl/nemo_rl; `resume` is `--resume` ([`BACKENDS.md`](BACKENDS.md)).
 - `TrainBatch` (`core/batch.py`): right-padded `[B,T]`, `response_mask` marks loss positions,
   `advantages` per-token, `old_logprobs`/`ref_logprobs` aligned with `input_ids`, optional
   `loss_weights` (per-token weights of the loss mean, set for `algorithm.loss_agg: rollout`).

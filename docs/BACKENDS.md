@@ -25,7 +25,7 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 | OpenEnv | 0.3.0 | environment | `env.type: openenv` |
 | Hermes Agent | 0.19.0 | environment | `env.type: hermes` |
 | Go / C++ / any (MEP/1) | – | environment | `env.type: remote` |
-| Ray | 2.59 | placement / worker groups | `cluster.mode: ray` |
+| Ray | 2.60 | placement / worker groups | `cluster.mode: ray` |
 
 | Framework | Runs here on CPU | Modes |
 |---|---|---|
@@ -48,7 +48,7 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
 | reference trainer (torch) | – |
 | vLLM | worker extension `monorl_update_weights` / `monorl_load_weights_from_path` via `collective_rpc` (vLLM's `GPUWorker` already owns `update_weights`), per-token logprob extraction, `SamplingParams` mapping, `sleep(level)`/`wake_up` journaling, `/monorl/update_weights` + `/load_weights_from_path` mounted on the API server |
 | SGLang | `sglang.logprob_floats` (float/int coercion in `TokenizerManager.detokenize_logprob_tokens`), `sglang.seeded_parallel_sampling` (`Engine.generate` with `sampling_seed` + `n>1` gets one seed per sample), `sglang.release_memory_guard` / `sglang.resume_memory_guard` (no-op without CUDA or `enable_memory_saver`), `sglang.update_weights_named_tensors` (dict/generator inputs, contiguous detached tensors) |
-| Unsloth | `FastLanguageModel` inside the reference loop; `unsloth.trl.*` patches reconcile Unsloth's TRL rewrites with monorl's TRL patchset. **Pin conflict:** declares `trl<=1.15.0`, `transformers<=5.17.0` vs monorl's trl 1.17.1 / transformers 5.22 — see below |
+| Unsloth | `FastLanguageModel` inside the reference loop; `unsloth.trl.*` patches reconcile Unsloth's TRL rewrites with monorl's TRL patchset. **Pin conflict:** declares `trl<=1.15.0`, `transformers<=5.17.0` vs monorl's trl 1.17.1 / transformers 5.23 — see below |
 | TRL | `GRPOTrainer` reporter hook → `metrics.jsonl`/`status.json`; env rollouts in place of plain generation |
 | verl | reward manager → monorl rewards; dataset → monorl data source; `python -m monorl.adapters.verl.entry` runs `main_ppo` with the compiled Hydra tree and applies the `Tracking` metrics patch inside the Ray actor |
 | NeMo-RL | `monorl.adapters.nemo_rl.env_actor.MonorlEnvironment` (`EnvironmentInterface`) bridge to monorl envs; reward bridge; config compiled to `<run_dir>/nemo_rl/nemo_rl.yaml` |
