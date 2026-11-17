@@ -119,6 +119,9 @@ def train(
     except MonorlError as e:
         _fail(str(e))
         return
+    except OSError as e:  # what a run does not record as its failure: its directory cannot be written
+        _fail(f"cannot write the run directory: {e}")
+        return
     console.print(f"run dir: {escape(result.run_dir)}")
     console.print(f"state: {result.state}  final step: {result.final_step}")
     if result.error:
@@ -173,6 +176,9 @@ def _run_pipeline(config: Path, data: dict[str, Any], run_dir: Path | None, resu
         result = run_pipeline(cfg, run_dir, resume=resume)
     except MonorlError as e:
         _fail(str(e))
+        return
+    except OSError as e:  # what a pipeline does not record as its failure: its directory cannot be written
+        _fail(f"cannot write the pipeline directory: {e}")
         return
     console.print(f"pipeline dir: {escape(result.run_dir)}")
     table = Table(title="stages", show_lines=False)

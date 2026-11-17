@@ -395,6 +395,24 @@ def test_train_reports_the_error_of_a_failed_run_without_repeating_its_traceback
     assert "Traceback (most recent call last)" in (run_dir / "run.log").read_text()
 
 
+@pytest.mark.parametrize("command", ["train", "pipeline"])
+def test_a_run_directory_that_cannot_be_created_is_an_error_not_a_traceback(
+    runner: CliRunner, tmp_path: Path, command: str
+) -> None:
+    base = {"model": {"name_or_path": "x"}, "data": {"uri": "d.jsonl"}, "rewards": [{"type": "exact_match"}]}
+    payload = base if command == "train" else {"base": base, "stages": [{"type": "train", "name": "a"}]}
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(payload))
+    (tmp_path / "taken").write_text("a file where the run directory's parent would be")
+    result = runner.invoke(
+        app, [command, "--config", str(cfg_path), "--run-dir", str(tmp_path / "taken" / "rd")]
+    )
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit), result.exception
+    flat = " ".join(result.output.split())
+    kind = "run" if command == "train" else "pipeline"
+    assert flat.startswith(f"error: cannot write the {kind} directory: ") and "Traceback" not in flat
+
+
 # -- env check ----------------------------------------------------------------------------
 
 
