@@ -29,9 +29,9 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from monorl.config.schema import DataConfig, RunConfig
+from monorl.config.schema import DataConfig, RunConfig, validation_message
 from monorl.core.errors import ConfigError
 
 
@@ -146,8 +146,8 @@ class PipelineConfig(_Model):
     def from_dict(cls, data: dict[str, Any]) -> PipelineConfig:
         try:
             return cls.model_validate(data)
-        except Exception as e:  # pydantic.ValidationError
-            raise ConfigError(str(e)) from e
+        except ValidationError as e:
+            raise ConfigError(validation_message(e, cls)) from e
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:

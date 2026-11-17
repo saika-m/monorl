@@ -95,12 +95,12 @@ def train(
         _fail(str(e))
         return
     if is_pipeline_payload(data):
-        _run_pipeline(data, run_dir, resume)
+        _run_pipeline(config, data, run_dir, resume)
         return
     try:
         cfg = RunConfig.from_dict(data)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(f"{config}: {e}")
         return
     from monorl.orchestrator import run
 
@@ -148,14 +148,14 @@ def pipeline(
     if not is_pipeline_payload(data):
         _fail(f"{config} is not a pipeline config (needs top-level `base:` and `stages:`)")
         return
-    _run_pipeline(data, run_dir, resume)
+    _run_pipeline(config, data, run_dir, resume)
 
 
-def _run_pipeline(data: dict[str, Any], run_dir: Path | None, resume: bool) -> None:
+def _run_pipeline(config: Path, data: dict[str, Any], run_dir: Path | None, resume: bool) -> None:
     try:
         cfg = PipelineConfig.from_dict(data)
     except ConfigError as e:
-        _fail(str(e))
+        _fail(f"{config}: {e}")
         return
     from monorl.pipeline import run_pipeline
 

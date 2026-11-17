@@ -335,6 +335,32 @@ def test_train_rejects_invalid_config(runner: CliRunner, tmp_path: Path) -> None
     assert "not found" in result.output
 
 
+def test_train_names_the_file_and_the_key_of_an_invalid_config(
+    runner: CliRunner, run_config_dict: dict[str, Any], tmp_path: Path
+) -> None:
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(run_config_dict))
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "--config",
+            str(cfg_path),
+            "--set",
+            "trainer.max_stps=1",
+            "--set",
+            "rollout.group_size=two",
+        ],
+        env={"COLUMNS": "1000"},
+    )
+    assert result.exit_code == 1
+    assert [line.strip() for line in result.output.strip().splitlines()] == [
+        f"error: {cfg_path}: invalid RunConfig, 2 problems:",
+        "rollout.group_size: Input should be a valid integer, unable to parse string as an integer (got 'two')",
+        "trainer.max_stps: unknown key; did you mean max_steps?",
+    ]
+
+
 # -- env check ----------------------------------------------------------------------------
 
 
