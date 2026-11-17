@@ -129,15 +129,44 @@ def test_a_written_config_names_the_variable_of_a_secret_and_loads_back_to_its_v
         RunConfig.from_yaml(written)
 
 
-def test_a_secret_that_came_from_the_default_is_not_written_either(
+def test_a_default_is_written_as_it_is_and_the_written_config_loads_where_the_original_did(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forget_secrets: None
 ) -> None:
+    """The default stands in the config file, so it is no secret: with the variable unset the
+    written file holds the text and loads to the same config in the same environment."""
     monkeypatch.delenv("JUDGE_TOKEN", raising=False)
-    cfg = RunConfig.from_yaml(_config_file(tmp_path, '{token: "${JUDGE_TOKEN:-fallback-token-0123}"}'))
-    assert cfg.rewards[0].params == {"token": "fallback-token-0123"}
-    text = cfg.to_yaml()
-    assert "fallback-token-0123" not in text
-    assert yaml.safe_load(text)["rewards"][0]["params"] == {"token": "${JUDGE_TOKEN}"}
+    source = _config_file(tmp_path, '{token: "${JUDGE_TOKEN:-fallback-token-0123}", field: answer}')
+    cfg = RunConfig.from_yaml(source)
+    written = tmp_path / "written.yaml"
+    cfg.to_yaml(written)
+    assert yaml.safe_load(written.read_text())["rewards"][0]["params"] == {
+        "token": "fallback-token-0123",
+        "field": "answer",
+    }
+    assert RunConfig.from_yaml(written) == cfg
+
+    # The variable set to the text of the default is a value of the environment like any other.
+    monkeypatch.setenv("JUDGE_TOKEN", "fallback-token-0123")
+    assert RunConfig.from_yaml(source) == cfg
+    assert yaml.safe_load(cfg.to_yaml())["rewards"][0]["params"]["token"] == "${JUDGE_TOKEN}"
+
+
+@pytest.mark.parametrize(
+    ("name", "masked"),
+    [
+        *[(n, True) for n in ("OPENAI_API_KEY", "HF_TOKEN", "WANDB_API_KEY", "DB_PASSWORD", "MY_SECRET")],
+        *[(n, True) for n in ("MYSQL_PASSWD", "DB_PWD", "aws_credentials", "Judge_Credential", "TOKEN")],
+        *[(n, False) for n in ("TOKENIZER_PATH", "KEYBOARD_LAYOUT", "MONKEY", "JUDGE_ENDPOINT")],
+    ],
+)
+def test_a_variable_is_named_like_a_secret_by_a_whole_word_between_underscores(
+    name: str, masked: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forget_secrets: None
+) -> None:
+    monkeypatch.setenv(name, "value-0123456789")
+    cfg = RunConfig.from_yaml(_config_file(tmp_path, f'{{setting: "${{{name}}}"}}'))
+    assert cfg.rewards[0].params == {"setting": "value-0123456789"}
+    written = yaml.safe_load(cfg.to_yaml())["rewards"][0]["params"]["setting"]
+    assert written == (f"${{{name}}}" if masked else "value-0123456789")
 
 
 def test_a_pipeline_config_is_written_without_the_secret_too(

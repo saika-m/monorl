@@ -1,7 +1,7 @@
 """YAML loading with ``${VAR}`` / ``${VAR:-default}`` environment interpolation and dotted
 ``key.path=value`` overrides (CLI ``--set``).
 
-A value read from a variable that is named like a secret is remembered for the life of the process,
+A value read from the environment through a variable that is named like a secret is remembered for the life of the process,
 and :func:`mask_secrets` puts ``${VAR}`` back wherever that value occurs: everything that writes a
 config to a file or sends it somewhere passes it through that function."""
 
@@ -17,7 +17,11 @@ import yaml
 from monorl.core.errors import ConfigError
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-_SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.IGNORECASE)
+_SECRET_WORDS = frozenset(
+    {"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PWD", "CREDENTIAL", "CREDENTIALS"}
+)
+"""A variable is named like a secret when one of the parts between its underscores is one of these:
+``OPENAI_API_KEY`` and ``HF_TOKEN`` are, ``TOKENIZER_PATH`` and ``MONKEY`` are not."""
 _MIN_SECRET_CHARS = 8
 """A shorter value is not remembered: replacing every ``1`` or ``true`` of a config would mangle it."""
 _secrets: dict[str, str] = {}
@@ -26,7 +30,9 @@ _secrets: dict[str, str] = {}
 
 def _remember_secret(name: str, value: str) -> None:
     global _secrets
-    if len(value) < _MIN_SECRET_CHARS or not _SECRET_NAME_RE.search(name) or value in _secrets:
+    if len(value) < _MIN_SECRET_CHARS or value in _secrets:
+        return
+    if _SECRET_WORDS.isdisjoint(name.upper().split("_")):
         return
     # Longest first, so that a value that contains another one is replaced as a whole. Built aside
     # and swapped in: another thread may be iterating the mapping in mask_secrets.
@@ -35,8 +41,10 @@ def _remember_secret(name: str, value: str) -> None:
 
 def mask_secrets(value: Any) -> Any:
     """``value`` with ``${NAME}`` in place of every value that :func:`interpolate_env` read from a
-    variable named like a secret (``NAME`` contains KEY, TOKEN, SECRET, PASSWORD, PASSWD or
-    CREDENTIAL, and the value has at least 8 characters), wherever it occurs inside a string.
+    variable named like a secret (a part of ``NAME`` between underscores is KEY, TOKEN, SECRET,
+    PASSWORD, PASSWD, PWD, CREDENTIAL or CREDENTIALS in any case, and the value has at least 8
+    characters), wherever it occurs inside a string. A ``:-default`` that was used is not such a
+    value: it is written in the config file.
     Mappings and lists are copied, their keys and items masked; anything else is returned as it is.
 
     The in-memory config keeps the real values. What is masked loads back to them through
@@ -62,13 +70,11 @@ def interpolate_env(value: Any) -> Any:
         def sub(m: re.Match[str]) -> str:
             name, default = m.group(1), m.group(2)
             if name in os.environ:
-                resolved = os.environ[name]
-            elif default is not None:
-                resolved = default
-            else:
-                raise ConfigError(f"environment variable {name} is not set (referenced as ${{{name}}})")
-            _remember_secret(name, resolved)
-            return resolved
+                _remember_secret(name, os.environ[name])
+                return os.environ[name]
+            if default is not None:
+                return default
+            raise ConfigError(f"environment variable {name} is not set (referenced as ${{{name}}})")
 
         return _ENV_RE.sub(sub, value)
     if isinstance(value, dict):
