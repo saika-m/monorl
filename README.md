@@ -375,7 +375,7 @@ stated. `make test` and `make lint` pass there; CI runs the suite on Linux witho
 | Failures and context | A run whose agent crashes on some episodes finishes with those episodes left out or retried; a context budget ends episodes instead of truncating them in training |
 | Sandbox | Harness episodes in real Docker containers (agent and verifier inside, reward from the verifier, containers removed); `grpo_harness_tasks_docker_cpu.yaml` on its Harbor-format example tasks |
 | Async rollouts | `rollout.async_steps_ahead: 2` with decoupled PPO, importance weights and a ratio mask, and with score centering |
-| MTP | A tiny random Mellum with one MTP layer (`grpo_mtp_tiny_cpu.yaml`): rollouts drafted by the layer, the layer trained and pushed back every step (`mtp/accept_rate` from 0 to 0.17 on sampled rollouts and 0.41 in greedy evaluation, over 16 steps), and the export loads with it in transformers |
+| MTP | A tiny random Mellum with one MTP layer (`grpo_mtp_tiny_cpu.yaml`): rollouts drafted by the layer, the layer trained and pushed back every step (`mtp/accept_rate` from 0 to 0.35 on sampled rollouts and 0.75 in greedy evaluation, over 16 steps), and the export loads with it in transformers |
 | Web UI | Launches a pipeline on the real server and streams its stage table, charts, log and trajectories; the transcript viewer and the wizard's fields for everything above |
 | Containers | `docker/Dockerfile.{cpu,envs}` build, `docker compose up` comes up healthy, and the five example environments pass `monorl env check` from the container |
 
