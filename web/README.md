@@ -42,7 +42,8 @@ under `dist/` returns the file, any other path outside `/api` returns `index.htm
 | `src/defaults.ts` | `defaultRunConfig()`: the pydantic defaults, restated; merge helpers. |
 | `src/pipeline.ts` | Stage defaults and structural checks mirroring `config/pipeline.py`. |
 | `src/schema.ts`, `src/api.ts` | Schema lookup by dotted config path; typed fetch and SSE client. |
-| `mock/server.ts` | Bun mock of the server API: seeded runs, a fake job, its own schema literal. |
+| `mock/server.ts` | Bun mock of the server API: seeded runs, a fake job, a pipeline schema literal. |
+| `mock/config_schema.json` | The config schema the mock serves, generated from `RunConfig`. |
 
 ## Adding a config field
 
@@ -53,8 +54,16 @@ hand, so a field added to `src/monorl/config/schema.py` also needs:
 
 its type in `src/types.ts`; its default in `src/defaults.ts` (`defaultRunConfig()`), or
 `src/pipeline.ts` for a stage; an input in the wizard step that owns the section
-(`src/wizard/*Step.tsx`), with `path` set so the description comes from the schema; and an entry in
-the schema literal in `mock/server.ts`, so `pnpm dev:mock` shows the description.
+(`src/wizard/*Step.tsx`), with `path` set so the description comes from the schema; and a
+regenerated `mock/config_schema.json`, so `pnpm dev:mock` shows the description (a stage field: an
+entry in the `PIPELINE_SCHEMA` literal in `mock/server.ts` instead). From the repository root:
+
+```bash
+.venv/bin/python -m monorl.config.schema_json --write web/mock/config_schema.json
+```
+
+The mock imports that file and needs no Python to run; `tests/config/test_schema_json.py` fails when
+a field or a description of the schema is not in it.
 
 Then run `pnpm build` and `pnpm lint`. `tsconfig.*.tsbuildinfo` are tracked; a build with no
 source changes left them byte-identical here.

@@ -1,6 +1,11 @@
-# Upstream framework pins. Every adapter under src/monorl/adapters/<name> is written and
-# version-gated against exactly these releases; `scripts/vendor.py --fetch <name>` clones the
-# pinned commit into third_party/<name> (gitignored) for reading/debugging upstream code.
+# Upstream framework pins. Every adapter under src/monorl/adapters/<name> is written against
+# exactly these releases; `scripts/vendor.py --fetch <name>` clones the pinned commit into
+# third_party/<name> (gitignored) for reading/debugging upstream code.
+#
+# Version gates: the adapters that patch upstream (vllm, sglang, verl, trl, nemo_rl, unsloth) gate
+# each patch on a version range that contains the pin; openenv and hermes-agent check nothing
+# about the installed version. tests/adapters/test_pins.py holds the pins, those ranges, the
+# adapters' pinned constants and the extras of pyproject.toml to each other.
 #
 # Fields: pypi (distribution name), version (PyPI release), git, tag, commit (resolved from the
 # tag at pin time), adapter (monorl module), notes.

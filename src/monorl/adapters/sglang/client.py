@@ -5,10 +5,11 @@ importing sglang. Endpoints (SGLang v0.5.23, ``python/sglang/srt/entrypoints/htt
 
 * ``POST /generate`` — body is ``GenerateReqInput`` (``srt/managers/io_struct.py`` /
   ``sglang/api/v1/api_types.py``): ``input_ids`` (list of token-id lists), ``sampling_params``
-  (one dict per request), ``return_logprob``, ``logprob_start_len``, ``top_logprobs_num`` (when
-  ``SamplingParams.top_logprobs`` is set), ``image_data`` (one entry per
-  request: a list of ``data:image/png;base64`` URLs, or ``None`` for text-only); returns the same
-  flat list of ``{"text", "output_ids", "meta_info"}`` dicts as ``Engine.generate``.
+  (one dict per request, each with the ``max_new_tokens`` of its prompt: a ``generate`` call with
+  a generation cap per prompt is still one request), ``return_logprob``, ``logprob_start_len``,
+  ``top_logprobs_num`` (when ``SamplingParams.top_logprobs`` is set), ``image_data`` (one entry
+  per request: a list of ``data:image/png;base64`` URLs, or ``None`` for text-only); returns the
+  same flat list of ``{"text", "output_ids", "meta_info"}`` dicts as ``Engine.generate``.
 * ``POST /update_weights_from_tensor`` — ``UpdateWeightsFromTensorReqInput``:
   ``serialized_named_tensors`` (one base64 ``MultiprocessingSerializer`` payload per TP rank),
   ``load_format``, ``flush_cache``; ``{"success", "message"}`` with 400 on failure. Tensors are
@@ -72,7 +73,7 @@ from monorl.adapters.sglang.common import (
 )
 from monorl.config.schema import RunConfig
 from monorl.core.errors import GenerationCancelled, WeightSyncError
-from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats
+from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats, prompt_caps
 from monorl.rollout.hf_engine import load_tokenizer
 
 log = logging.getLogger(__name__)
@@ -142,7 +143,13 @@ class SGLangServerClient:
     def url(self) -> str:
         return self._url
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if not prompts:
             return []
         call = _GenerateCall()
@@ -152,7 +159,8 @@ class SGLangServerClient:
             processor = self._load_processor() if any(is_media_prompt(p) for p in prompts) else None
             encoded = [encode_prompt(self._tokenizer, processor, p) for p in prompts]
             prompt_ids = [ids for ids, _ in encoded]
-            input_ids, sampling = expand_requests(prompt_ids, params)
+            caps = prompt_caps(params, len(prompts), max_new_tokens)
+            input_ids, sampling = expand_requests(prompt_ids, params, caps)
             self._check_server_drafts()
             body: dict[str, Any] = {
                 "input_ids": input_ids,

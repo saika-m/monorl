@@ -22,8 +22,38 @@ def test_ppo_is_accepted_wherever_a_critic_exists() -> None:
 
 
 def test_group_algorithms_need_groups() -> None:
-    with pytest.raises(ConfigError, match="group_size"):
-        RunConfig.from_dict(_base(algorithm={"name": "grpo"}, rollout={"group_size": 1}))
+    for name in ("grpo", "dapo", "rloo"):
+        with pytest.raises(ConfigError, match=f"{name} needs rollout.group_size >= 2"):
+            RunConfig.from_dict(_base(algorithm={"name": name}, rollout={"group_size": 1}))
+
+
+@pytest.mark.parametrize("backend", ["reference", "verl"])
+def test_one_rollout_per_prompt_is_enough_where_no_group_statistic_is_used(backend: str) -> None:
+    """reinforce and ppo have no group baseline: advantage_norm (default 'group') is not theirs to read."""
+    ppo = RunConfig.from_dict(
+        _base(algorithm={"name": "ppo"}, rollout={"group_size": 1}, trainer={"backend": backend})
+    )
+    assert ppo.algorithm.advantage_norm == "group"
+    for norm in ("batch", "none"):
+        algorithm = {"name": "reinforce", "advantage_norm": norm}
+        RunConfig.from_dict(
+            _base(algorithm=algorithm, rollout={"group_size": 1}, trainer={"backend": backend})
+        )
+    for other in ("reference", "nemo_rl"):
+        RunConfig.from_dict(
+            _base(algorithm={"name": "reinforce"}, rollout={"group_size": 1}, trainer={"backend": other})
+        )
+
+
+def test_verl_reinforce_with_a_group_baseline_needs_a_group() -> None:
+    """verl compiles reinforce + advantage_norm 'group' to REINFORCE++ with the group mean as baseline:
+    with one rollout per prompt every advantage would be zero."""
+    algorithm = {"name": "reinforce"}
+    with pytest.raises(ConfigError, match="verl.*advantage_norm.*'batch' or 'none'"):
+        RunConfig.from_dict(
+            _base(algorithm=algorithm, rollout={"group_size": 1}, trainer={"backend": "verl"})
+        )
+    RunConfig.from_dict(_base(algorithm=algorithm, rollout={"group_size": 2}, trainer={"backend": "verl"}))
 
 
 def _off_policy(off_policy: dict, **rollout):

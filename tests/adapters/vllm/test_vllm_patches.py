@@ -89,7 +89,7 @@ def test_monorl_routes_wrapper_attaches_router() -> None:
     assert wrapped("args", app, ("generate",), None) == "orig"
     assert seen["call"] == ("args", ("generate",), None)
     paths = set(app.openapi()["paths"])
-    assert {"/update_named_param", "/load_weights_from_path", "/monorl/info"} <= paths
+    assert {"/monorl/update_weights", "/load_weights_from_path", "/monorl/info"} <= paths
 
 
 # -- apply through the patch engine against the fake module tree ---------------------------------
@@ -115,7 +115,7 @@ def test_apply_and_revert_against_fake_tree(fake_vllm) -> None:
     app = FastAPI()
     app_mod.register_api_routers("args", app, ("generate",))
     assert app.state.registered == ("args", ("generate",), None)
-    assert "/update_named_param" in app.openapi()["paths"]
+    assert "/monorl/update_weights" in app.openapi()["paths"]
 
     assert {s.id: s.applied for s in status("vllm")} == dict.fromkeys(PATCH_IDS, True)
     second = apply("vllm")  # idempotent

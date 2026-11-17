@@ -24,8 +24,10 @@ class DraftingEngine(fakes.FakeEngine):
         self._stats = SpeculationStats()
         self._reads = 0
 
-    def generate(self, prompts: Any, params: SamplingParams) -> list[list[Completion]]:
-        out = super().generate(prompts, params)
+    def generate(
+        self, prompts: Any, params: SamplingParams, *, max_new_tokens: Any = None
+    ) -> list[list[Completion]]:
+        out = super().generate(prompts, params, max_new_tokens=max_new_tokens)
         with self._lock:
             for completion in (c for group in out for c in group):
                 self._stats.add(_cost(len(completion.token_ids), drafts_accepted=self._reads > 0))

@@ -20,12 +20,21 @@ turn differently once more messages follow it — is followed instead: the conve
 in full, as with ``mode="template"``, and the result says so (``bridged=False``). The batch
 builder then trains such a turn as a sequence of its own.
 
+A continuation is proven with renders of the whole conversation, on every turn, so the work around
+them is kept small: the probes are rendered in the order that lets a failed check skip the others,
+the render with the real assistant turn doubles as the full render of a turn that cannot be
+continued, and the ids of a closing's end-of-turn marker are worked out once per tokenizer object.
+That last part takes a tokenizer's vocabulary and special tokens as fixed once it has continued a
+turn.
+
 Torch-free; shared by the episode runner and the capture gateway.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import threading
+import weakref
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +42,11 @@ from monorl.core.types import Completion, Message
 
 SENTINEL = "MONORLTURNSENTINEL"
 """Stand-in assistant content used to locate the end of a turn in rendered chat text."""
+
+_REMEMBERED_CLOSINGS = 8
+"""Closing texts per tokenizer whose end-of-turn marker is remembered; a chat template has one or two."""
+_REMEMBERED_CLOSING_CHARS = 256
+"""A longer closing is not template boilerplate and is encoded every time."""
 
 
 def render_chat(
@@ -49,7 +63,7 @@ def encode_text(tokenizer: Any, text: str) -> list[int]:
     """Token ids of already-templated text: no special tokens are added, the template owns them."""
     if not text:
         return []
-    return [int(t) for t in tokenizer(text, add_special_tokens=False)["input_ids"]]
+    return _ints(tokenizer(text, add_special_tokens=False)["input_ids"])
 
 
 def chat_prompt_ids(tokenizer: Any, messages: Sequence[Message], tools: Any = None) -> list[int]:
@@ -113,15 +127,31 @@ def continue_prompt_ids(
         if assistant_message is not None
         else {"role": "assistant", "content": completion.text}
     )
+    rendered: str | None = None
     if mode == "tokens":
-        pieces = _turn_pieces(tokenizer, previous_messages, assistant, new_messages, tools)
+        pieces, rendered = _turn_pieces(tokenizer, previous_messages, assistant, new_messages, tools)
         if pieces is not None:
             closing, tail = pieces
-            sampled = [int(t) for t in completion.token_ids]
-            rest = _after_emitted_end(tokenizer, closing, tail, sampled[-1] if sampled else None)
-            return Continuation(ids=[*(int(t) for t in previous_prompt_ids), *sampled, *rest], bridged=True)
-    full = [*previous_messages, assistant, *new_messages]
-    return Continuation(ids=chat_prompt_ids(tokenizer, full, tools), bridged=False)
+            sampled = _ints(completion.token_ids)
+            ids = _ints(previous_prompt_ids)
+            ids += sampled
+            ids += _after_emitted_end(tokenizer, closing, tail, sampled[-1] if sampled else None)
+            return Continuation(ids=ids, bridged=True)
+    if rendered is None:
+        rendered = render_chat(tokenizer, [*previous_messages, assistant, *new_messages], tools)
+    return Continuation(ids=encode_text(tokenizer, rendered), bridged=False)
+
+
+def _ints(ids: Iterable[Any]) -> list[int]:
+    """``ids`` as a new list of Python ints. A list that holds nothing else, which is what prompts
+    and completions arrive as, is copied without converting each of its thousands of elements."""
+    if type(ids) is list and set(map(type, ids)) <= {int}:
+        return ids.copy()
+    return [int(t) for t in ids]
+
+
+class _ProbeRejected(Exception):
+    """The chat template raised on a probe conversation."""
 
 
 def _turn_pieces(
@@ -130,64 +160,70 @@ def _turn_pieces(
     assistant: Message,
     new_messages: Sequence[Message],
     tools: Any,
-) -> tuple[str, str] | None:
+) -> tuple[tuple[str, str] | None, str | None]:
     """``(closing, tail)``: the text the template puts after an assistant turn's content, and its
     rendering of ``new_messages`` plus the generation prompt. ``None`` when the template cannot be
     taken apart like that, renders the earlier messages differently now that more follow, or
-    would not carry the assistant's content over as it is."""
+    would not carry the assistant's content over as it is.
+
+    The second value is the conversation rendered with the real turn and the generation prompt,
+    when a check needed it: the text a caller that cannot continue would render next."""
     content = assistant.get("content") or ""
     if not isinstance(content, str):
-        return None
+        return None, None
+
+    def probe(*turn_and_after: Message, add_generation_prompt: bool = True) -> str:
+        messages = [*previous_messages, *turn_and_after]
+        try:
+            return render_chat(tokenizer, messages, tools, add_generation_prompt=add_generation_prompt)
+        except Exception as e:  # noqa: BLE001 - a template may reject the probe; the full render reports real errors
+            raise _ProbeRejected from e
+
     plain: Message = {"role": "assistant", "content": SENTINEL}
     # keeps tool_calls: templates may need them to render the tool messages that follow
     marked: Message = {**assistant, "content": SENTINEL}
     try:
-        prompt = render_chat(tokenizer, previous_messages, tools)
-        closed_plain = render_chat(tokenizer, [*previous_messages, plain], tools, add_generation_prompt=False)
-        closed = (
-            closed_plain
-            if marked == plain
-            else render_chat(tokenizer, [*previous_messages, marked], tools, add_generation_prompt=False)
-        )
-        extended = render_chat(tokenizer, [*previous_messages, marked, *new_messages], tools)
-        actual = (
-            render_chat(tokenizer, [*previous_messages, assistant, *new_messages], tools)
-            if content.strip()
-            else None
-        )
-    except Exception:  # noqa: BLE001 - a template may reject the probe; the full render reports real errors
-        return None
-    plain_at = closed_plain.rfind(SENTINEL)
-    if plain_at < 0 or not extended.startswith(prompt):
-        return None
-    closing = closed_plain[plain_at + len(SENTINEL) :]
-    # The assistant turn must follow the previous prompt as the template renders it today ...
-    at = extended.find(SENTINEL, len(prompt))
-    if at < 0:
-        # A template that renders a turn from its tool_calls alone (Llama 3.1, Mistral) leaves the
-        # content out; that only holds the sampled turn when there was no other content.
-        if content.strip() or not assistant.get("tool_calls"):
-            return None
-        if not (closed.startswith(prompt) and closed.endswith(closing) and extended.startswith(closed)):
-            return None
-        return closing, extended[len(closed) :]
-    if extended[len(prompt) : at].strip():
-        return None
-    head, rest = extended[:at], extended[at + len(SENTINEL) :]
-    # ... end the way a finished turn ends (after the content: tool calls if any, then the closing) ...
-    closed_at = closed.rfind(SENTINEL)
-    if closed_at < 0:
-        return None
-    turn_end = closed[closed_at + len(SENTINEL) :]
-    if not rest.startswith(turn_end) or not turn_end.endswith(closing):
-        return None
-    # ... and hold the real content as it is.
+        # The assistant turn must follow the previous prompt as the template renders it today ...
+        prompt = probe()
+        extended = probe(marked, *new_messages)
+        if not extended.startswith(prompt):
+            return None, None
+        at = extended.find(SENTINEL, len(prompt))
+        if at < 0:
+            # A template that renders a turn from its tool_calls alone (Llama 3.1, Mistral) leaves the
+            # content out; that only holds the sampled turn when there was no other content.
+            if content.strip() or not assistant.get("tool_calls"):
+                return None, None
+        elif extended[len(prompt) : at].strip():
+            return None, None
+        closed_plain = probe(plain, add_generation_prompt=False)
+        plain_at = closed_plain.rfind(SENTINEL)
+        if plain_at < 0:
+            return None, None
+        closing = closed_plain[plain_at + len(SENTINEL) :]
+        closed = closed_plain if marked == plain else probe(marked, add_generation_prompt=False)
+        if at < 0:
+            if not (closed.startswith(prompt) and closed.endswith(closing) and extended.startswith(closed)):
+                return None, None
+            return (closing, extended[len(closed) :]), None
+        head, rest = extended[:at], extended[at + len(SENTINEL) :]
+        # ... end the way a finished turn ends (after the content: tool calls if any, then the closing) ...
+        closed_at = closed.rfind(SENTINEL)
+        if closed_at < 0:
+            return None, None
+        turn_end = closed[closed_at + len(SENTINEL) :]
+        if not rest.startswith(turn_end) or not turn_end.endswith(closing):
+            return None, None
+        # ... and hold the real content as it is.
+        actual = probe(assistant, *new_messages) if content.strip() else None
+    except _ProbeRejected:
+        return None, None
     if actual is not None:
         if len(actual) < len(head) + len(rest) or not (actual.startswith(head) and actual.endswith(rest)):
-            return None
+            return None, actual
         if actual[len(head) : len(actual) - len(rest)].strip() != content.strip():
-            return None
-    return closing, rest[len(turn_end) :]
+            return None, actual
+    return (closing, rest[len(turn_end) :]), actual
 
 
 def _after_emitted_end(tokenizer: Any, closing: str, tail: str, last_sampled: int | None) -> list[int]:
@@ -198,12 +234,41 @@ def _after_emitted_end(tokenizer: Any, closing: str, tail: str, last_sampled: in
     rest = encode_text(tokenizer, closing + tail)
     if last_sampled is None:
         return rest
-    specials = special_token_ids(tokenizer)
-    closing_ids = encode_text(tokenizer, closing)
-    end = next((i for i, token_id in enumerate(closing_ids) if token_id in specials), None)
-    if end is None or closing_ids[end] != last_sampled or rest[: end + 1] != closing_ids[: end + 1]:
+    marker = _end_of_turn(tokenizer, closing)
+    if marker is None or marker[-1] != last_sampled or tuple(rest[: len(marker)]) != marker:
         return rest
-    return rest[end + 1 :]
+    return rest[len(marker) :]
+
+
+_END_OF_TURN: weakref.WeakKeyDictionary[Any, dict[str, tuple[int, ...] | None]] = weakref.WeakKeyDictionary()
+"""Per tokenizer object, and dropped with it: closing text -> :func:`_end_of_turn`."""
+_END_OF_TURN_LOCK = threading.Lock()
+_UNKNOWN: Any = object()
+
+
+def _end_of_turn(tokenizer: Any, closing: str) -> tuple[int, ...] | None:
+    """Ids of ``closing`` up to and including its first special token, the end-of-turn marker a
+    completion may already end with; ``None`` when ``closing`` has no special token."""
+    known: dict[str, tuple[int, ...] | None] | None = None
+    marker = _UNKNOWN
+    if len(closing) <= _REMEMBERED_CLOSING_CHARS:
+        try:
+            with _END_OF_TURN_LOCK:
+                known = _END_OF_TURN.setdefault(tokenizer, {})
+                marker = known.get(closing, _UNKNOWN)
+        except TypeError:  # not hashable, or no weak references to it: worked out every time
+            pass
+    if marker is _UNKNOWN:
+        closing_ids = encode_text(tokenizer, closing)
+        specials = special_token_ids(tokenizer)
+        end = next((i for i, token_id in enumerate(closing_ids) if token_id in specials), None)
+        marker = None if end is None else tuple(closing_ids[: end + 1])
+        if known is not None:
+            with _END_OF_TURN_LOCK:
+                while len(known) >= _REMEMBERED_CLOSINGS and closing not in known:
+                    del known[next(iter(known))]
+                known[closing] = marker
+    return marker
 
 
 __all__ = [

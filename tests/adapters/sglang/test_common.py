@@ -78,16 +78,16 @@ def test_sampling_dict_seed_overrides():
 
 
 def test_expand_requests_without_seed_keeps_one_request_per_prompt():
-    ids, sps = expand_requests([[1, 2], [3]], SamplingParams(n=4))
+    ids, sps = expand_requests([[1, 2], [3]], SamplingParams(n=4), [7, 2])
     assert ids == [[1, 2], [3]]
-    assert [sp["n"] for sp in sps] == [4, 4]
+    assert [(sp["n"], sp["max_new_tokens"]) for sp in sps] == [(4, 7), (4, 2)]
     assert all("sampling_seed" not in sp for sp in sps)
 
 
 def test_expand_requests_with_seed_fans_out_distinct_seeds():
-    ids, sps = expand_requests([[1, 2], [3]], SamplingParams(n=3, seed=100))
+    ids, sps = expand_requests([[1, 2], [3]], SamplingParams(n=3, seed=100), [7, 2])
     assert ids == [[1, 2], [1, 2], [1, 2], [3], [3], [3]]
-    assert [sp["n"] for sp in sps] == [1] * 6
+    assert [sp["n"] for sp in sps] == [1] * 6 and [sp["max_new_tokens"] for sp in sps] == [7] * 3 + [2] * 3
     assert [sp["sampling_seed"] for sp in sps] == [100, 101, 102, 100, 101, 102]
 
 

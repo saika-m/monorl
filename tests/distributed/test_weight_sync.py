@@ -8,11 +8,15 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 from distributed_fakes import (
+    AdapterTrainer,
     CollectorEngine,
     FakeEngine,
     FakeTrainer,
+    RemoteBroadcastEngine,
+    broadcast_engine_process,
     broadcast_worker,
     ipc_consumer,
+    make_batch,
     make_broadcast_weights,
 )
 
@@ -56,23 +60,9 @@ def test_checkpoint_roundtrip(tmp_path: Path):
     assert (sync.weights_dir / "weights.pt").exists()
     assert not list(tmp_path.joinpath("sync").glob(".weights-*"))
 
-    trainer.train_step(_batch())
+    trainer.train_step(make_batch())
     sync.sync(trainer, engines)
     assert torch.equal(engines[0].weights["model.embed.weight"], trainer.weights["model.embed.weight"])
-
-
-def _batch():
-    from monorl.core.batch import TrainBatch
-
-    ids = torch.zeros(2, 3, dtype=torch.long)
-    return TrainBatch(
-        input_ids=ids,
-        attention_mask=torch.ones_like(ids),
-        response_mask=torch.ones_like(ids),
-        advantages=torch.ones(2, 3),
-        rewards=torch.ones(2),
-        group_ids=["g", "g"],
-    )
 
 
 # -- broadcast --------------------------------------------------------------------------------
@@ -111,6 +101,47 @@ def test_broadcast_between_two_spawned_cpu_processes(tmp_path: Path):
     )  # 256-byte buckets, mixed dtypes
     payload = sum(t.numel() * t.element_size() for t in expected.values())
     assert receiver["weight_sync/bytes"] == payload
+
+
+@pytest.mark.timeout(120)
+def test_broadcast_sync_sends_what_changed_and_everything_after_a_failure():
+    """Rank 0 is this process, the engine lives in another one. Its weights have to be the
+    trainer's after every sync that succeeded, whatever was left out of the stream."""
+    spec = BroadcastGroupSpec("127.0.0.1", _free_port(), world_size=2, backend="gloo", timeout_s=60)
+    ctx = mp.get_context("spawn")
+    here, there = ctx.Pipe()
+    proc = ctx.Process(target=broadcast_engine_process, args=(there,))
+    proc.start()
+    trainer, engine = AdapterTrainer(seed=5), RemoteBroadcastEngine(here)
+    sync = BroadcastWeightSync(spec, rank=0)
+    everything, trained = list(trainer.weights), list(trainer.trained)
+
+    def synced() -> dict[str, float]:
+        metrics = sync.sync(trainer, [engine])
+        for name, tensor in trainer.weights.items():
+            assert torch.equal(engine.weights[name], tensor), name
+        return metrics
+
+    try:
+        first = synced()
+        assert engine.received == everything
+        trainer.train_step(make_batch())
+        second = synced()
+        assert engine.received == trained
+        assert second["weight_sync/bytes"] < first["weight_sync/bytes"]
+
+        trainer.train_step(make_batch())
+        engine.failing = True
+        with pytest.raises(RuntimeError, match="broke down"):
+            sync.sync(trainer, [engine])
+        engine.failing = False
+        synced()
+        assert engine.received == everything
+    finally:
+        here.send(None)
+        proc.join(timeout=30)
+        sync.close()
+    assert proc.exitcode == 0
 
 
 def test_broadcast_validation():

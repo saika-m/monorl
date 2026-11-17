@@ -128,14 +128,78 @@ def test_stop_string_sets_finish_reason(engine: HFRolloutEngine) -> None:
     assert stopped.text.endswith(stop_text)  # the stop string stays in the text (RolloutEngine contract)
 
 
-def test_finish_recorder_eos_and_length() -> None:
-    rec = _FinishRecorder(3, eos_ids=[2], stop=None)
+def test_finish_recorder_counts_the_tokens_up_to_eos() -> None:
+    rec = _FinishRecorder([9] * 3, eos_ids=[2], stop=None)
     ids = torch.tensor([[5, 2], [5, 6], [2, 2]])
-    rec(ids[:, :1], None)
-    rec(ids, None)
-    rec.finalize(2)
-    assert rec.reason == ["stop", "length", "stop"]
-    assert rec.num_tokens == [2, 2, 1]
+    assert rec(ids[:, :1], None).tolist() == [False, False, True]
+    assert rec(ids, None).tolist() == [True, False, True]
+    # the padding generate writes after a row's EOS is not counted; the middle row never finished
+    assert rec.num_tokens == [2, None, 1]
+    assert not rec.cut
+
+
+def test_finish_recorder_ends_the_call_for_the_rows_that_go_on() -> None:
+    rec = _FinishRecorder([9] * 3, eos_ids=[2], stop=None, slack=0)
+    ids = torch.tensor([[5, 7, 2], [5, 2, 2], [6, 6, 2]])
+    assert rec(ids[:, :1], None).tolist() == [False, False, False]
+    assert rec(ids[:, :2], None).tolist() == [True, True, True]  # one row finished, two go on
+    assert rec.cut and rec.num_tokens == [None, 2, None]
+    # On MPS generate runs one more step before it stops, and takes it back: the padding it wrote
+    # for the two rows (EOS here) is not their end.
+    assert rec(ids, None).tolist() == [True, True, True]
+    assert rec.num_tokens == [None, 2, None]
+
+
+def test_finish_recorder_lets_finished_rows_cost_what_ending_the_call_costs() -> None:
+    """With a slack of 4 forward passes of a row, a call of 4 rows goes on for 4 steps after one row
+    has finished, or for 2 after two have, and is then ended for the others."""
+    for finished, steps_after in ((1, 4), (2, 2)):
+        rec = _FinishRecorder([9] * 4, eos_ids=[2], stop=None, slack=4)
+        ids = torch.tensor([[2]] * finished + [[5]] * (4 - finished))
+        verdicts = [rec(ids, None).tolist()]
+        while not rec.cut:
+            ids = torch.cat([ids, torch.full((4, 1), 5)], dim=1)
+            verdicts.append(rec(ids, None).tolist())
+        assert len(verdicts) - 1 == steps_after
+        assert verdicts[0] == [True] * finished + [False] * (4 - finished)
+        assert verdicts[-1] == [True] * 4
+        assert rec.num_tokens == [1] * finished + [None] * (4 - finished)
+
+
+def test_finish_recorder_without_slack_runs_to_the_last_row() -> None:
+    rec = _FinishRecorder([9] * 2, eos_ids=[2], stop=None)
+    ids = torch.tensor([[2, 2, 2], [5, 5, 2]])
+    assert [rec(ids[:, :k], None).tolist() for k in (1, 2, 3)] == [[True, False], [True, False], [True, True]]
+    assert not rec.cut and rec.num_tokens == [1, 3]
+
+
+def test_logprobs_stay_those_of_the_raw_distribution_under_every_sampling_knob(
+    engine: HFRolloutEngine,
+) -> None:
+    """Repetition penalty and the truncations change what is sampled from, not what is reported:
+    the trainer's log-softmax of the same logits has to give an importance ratio of 1."""
+    params = SamplingParams(
+        n=2,
+        max_new_tokens=6,
+        temperature=0.8,
+        top_p=0.9,
+        top_k=50,
+        min_p=0.05,
+        repetition_penalty=1.3,
+        seed=11,
+        top_logprobs=3,
+    )
+    for group in engine.generate(CHATS, params):
+        for c in group:
+            ids = torch.tensor([c.prompt_token_ids + c.token_ids])
+            with torch.no_grad():
+                logits = engine.model(input_ids=ids).logits[0].float()
+            start = len(c.prompt_token_ids)
+            reference = torch.log_softmax(logits[start - 1 : -1] / 0.8, dim=-1)
+            sampled = reference.gather(1, ids[0, start:, None]).squeeze(1)
+            torch.testing.assert_close(torch.tensor(c.logprobs), sampled, atol=1e-4, rtol=0.0)
+            top = torch.tensor(list(c.top_logprobs.logprobs)).reshape(len(c.token_ids), 3)
+            torch.testing.assert_close(top, reference.topk(3).values, atol=1e-4, rtol=0.0)
 
 
 def test_sampling_knobs_accepted(engine: HFRolloutEngine) -> None:
@@ -152,6 +216,31 @@ def test_sampling_knobs_accepted(engine: HFRolloutEngine) -> None:
     out = engine.generate(CHATS, params)
     assert all(len(g) == 2 for g in out)
     assert all(len(c.logprobs) == len(c.token_ids) for g in out for c in g)
+
+
+def test_logprobs_of_a_peft_wrapped_policy(tiny_config: RunConfig) -> None:
+    """The TRL adapter samples from the trainer's LoRA-wrapped model. ``generate`` of the wrapper
+    runs the transformers model inside it, never the wrapper's own forward pass."""
+    from peft import LoraConfig, get_peft_model
+
+    eng = HFRolloutEngine(tiny_config)
+    try:
+        # init_lora_weights=False: the adapter changes the logits, as it does after a training step
+        lora = LoraConfig(r=4, target_modules=["q_proj", "v_proj"], init_lora_weights=False)
+        eng.model = get_peft_model(eng.model, lora).eval()
+        params = SamplingParams(n=2, max_new_tokens=5, temperature=1.0, seed=3, top_logprobs=2)
+        for group in eng.generate(CHATS, params):
+            for c in group:
+                start = len(c.prompt_token_ids)
+                reference = torch.log_softmax(_logits(eng, c.prompt_token_ids + c.token_ids)[0], dim=-1)
+                sampled = reference[start - 1 : -1].gather(1, torch.tensor(c.token_ids)[:, None]).squeeze(1)
+                torch.testing.assert_close(torch.tensor(c.logprobs), sampled, rtol=1e-4, atol=1e-5)
+                top = torch.tensor(list(c.top_logprobs.logprobs)).reshape(len(c.token_ids), 2)
+                torch.testing.assert_close(
+                    top, reference[start - 1 : -1].topk(2).values, rtol=1e-4, atol=1e-5
+                )
+    finally:
+        eng.shutdown()
 
 
 def _logits(engine: HFRolloutEngine, ids: list[int]) -> torch.Tensor:
@@ -213,12 +302,14 @@ def test_top_k_minus_one_disables_truncation(engine: HFRolloutEngine) -> None:
     """transformers backfills ``top_k=None`` with 50; the engine must pass 0 so sampling is
     full-vocabulary and matches the full-softmax logprobs it returns."""
     gc = engine._generation_config(
-        SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=-1, min_p=0.0), 1
+        SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=-1, min_p=0.0), 1, output_logits=False
     )
     effective, _ = engine.model._prepare_generation_config(gc)
     assert effective.top_k == 0
     assert effective.min_p == 0.0
-    gc = engine._generation_config(SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=7), 1)
+    gc = engine._generation_config(
+        SamplingParams(n=1, max_new_tokens=1, temperature=1.0, top_k=7), 1, output_logits=False
+    )
     effective, _ = engine.model._prepare_generation_config(gc)
     assert effective.top_k == 7
 

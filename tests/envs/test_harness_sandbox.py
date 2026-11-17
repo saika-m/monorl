@@ -91,7 +91,7 @@ def _episodes(
         specs,
         env_factory=lambda: make_env(config),
         tokenizer=engine.tokenizer,
-        params=SamplingParams(n=1, max_new_tokens=32),
+        params=SamplingParams(n=1, max_new_tokens=256),
         max_parallel=4,
         abort=abort,
     )

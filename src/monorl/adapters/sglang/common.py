@@ -6,6 +6,11 @@ Everything here is verified against SGLang v0.5.23:
   ``stop``, ``temperature``, ``top_p``, ``top_k`` (``-1`` = whole vocabulary), ``min_p``,
   ``repetition_penalty``, ``n``, ``sampling_seed``, ``skip_special_tokens``. ``temperature < 1e-6``
   is turned into greedy (``top_k=1``) by ``__post_init__``.
+* ``python/sglang/srt/managers/io_struct.py`` ``GenerateReqInput.sampling_params`` is one dict
+  for every request or a list with one dict per request (``_normalize_sampling_params``;
+  ``GenerateReqInput.__getitem__`` hands request ``i`` the ``i``-th), which is how the prompts of a
+  call get generation caps of their own (``max_new_tokens``). ``n`` has to be the same in all of
+  them (``_handle_parallel_sampling``).
 * ``python/sglang/srt/managers/tokenizer_manager.py`` ``_handle_batch_request``: with ``n > 1``
   each prompt is expanded into ``n`` requests **sharing the same sampling params** (so a
   ``sampling_seed`` would make all ``n`` samples identical) and results come back flat,
@@ -209,14 +214,21 @@ def image_data_urls(image_data: list[list[Any] | None] | None) -> list[list[str]
 # -- sampling ----------------------------------------------------------------------------------
 
 
-def sampling_dict(params: SamplingParams, *, n: int | None = None, seed: int | None = None) -> dict[str, Any]:
-    """``SamplingParams`` → sglang ``sampling_params`` dict (``SamplingParams.__init__`` keys).
+def sampling_dict(
+    params: SamplingParams,
+    *,
+    n: int | None = None,
+    seed: int | None = None,
+    max_new_tokens: int | None = None,
+) -> dict[str, Any]:
+    """``SamplingParams`` → sglang ``sampling_params`` dict (``SamplingParams.__init__`` keys);
+    ``n`` and ``max_new_tokens`` are those of ``params`` unless given.
 
     ``no_stop_trim`` keeps a matched stop string in the text (sglang's detokenizer trims it by
     default), as the ``RolloutEngine`` contract requires."""
     out: dict[str, Any] = {
         "n": params.n if n is None else n,
-        "max_new_tokens": params.max_new_tokens,
+        "max_new_tokens": params.max_new_tokens if max_new_tokens is None else max_new_tokens,
         "temperature": params.temperature,
         "top_p": params.top_p,
         "top_k": params.top_k if params.top_k > 0 else -1,
@@ -233,9 +245,10 @@ def sampling_dict(params: SamplingParams, *, n: int | None = None, seed: int | N
 
 
 def expand_requests(
-    prompt_ids: Sequence[list[int]], params: SamplingParams
+    prompt_ids: Sequence[list[int]], params: SamplingParams, caps: Sequence[int]
 ) -> tuple[list[list[int]], list[dict[str, Any]]]:
-    """Per-request ``input_ids`` and ``sampling_params`` lists for one ``generate`` call.
+    """Per-request ``input_ids`` and ``sampling_params`` lists for one ``generate`` call; the
+    requests of prompt ``i`` generate at most ``caps[i]`` tokens.
 
     Without a seed each prompt is one request with ``n=params.n`` (sglang expands it and shares
     the prefill). With a seed sglang would reuse the same ``sampling_seed`` for all ``n`` samples
@@ -243,13 +256,13 @@ def expand_requests(
     ``seed, seed+1, ...`` — the duplicated prompts still share the radix prefix.
     """
     if params.seed is None:
-        return [list(p) for p in prompt_ids], [sampling_dict(params) for _ in prompt_ids]
+        return [list(p) for p in prompt_ids], [sampling_dict(params, max_new_tokens=cap) for cap in caps]
     ids: list[list[int]] = []
     sps: list[dict[str, Any]] = []
-    for p in prompt_ids:
+    for p, cap in zip(prompt_ids, caps, strict=True):
         for k in range(params.n):
             ids.append(list(p))
-            sps.append(sampling_dict(params, n=1, seed=params.seed + k))
+            sps.append(sampling_dict(params, n=1, seed=params.seed + k, max_new_tokens=cap))
     return ids, sps
 
 

@@ -45,9 +45,11 @@ class ParamsEngine(fakes.FakeEngine):
         super().__init__(config)
         self.seen: list[SamplingParams] = []
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
         self.seen.append(params)
-        return super().generate(prompts, params)
+        return super().generate(prompts, params, max_new_tokens=max_new_tokens)
 
 
 class GatedEngine(fakes.FakeEngine):
@@ -57,13 +59,17 @@ class GatedEngine(fakes.FakeEngine):
         super().__init__(config)
         self.release = threading.Event()
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
         assert self.release.wait(60)
-        return super().generate(prompts, params)
+        return super().generate(prompts, params, max_new_tokens=max_new_tokens)
 
 
 class FailingEngine(fakes.FakeEngine):
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
         raise RuntimeError("boom")
 
 
@@ -240,7 +246,7 @@ def test_responses_stream_is_the_plain_response_as_events(
 ) -> None:
     session = open_session(_scripted_engine(make_config, [f"On it. {CALL_TEXT}"]))
     client = openai_client(gateway.base_url(session))
-    asked = {"model": "any", "input": "2+2?", "tools": [RESPONSES_TOOL], "max_output_tokens": 20}
+    asked = {"model": "any", "input": "2+2?", "tools": [RESPONSES_TOOL], "max_output_tokens": 256}
 
     plain = client.responses.create(**asked)
     events = list(client.responses.create(stream=True, **asked))
@@ -304,7 +310,7 @@ def test_messages_tool_round_trip_continues_the_call(
     engine = _scripted_engine(make_config, script)
     session = open_session(engine, model="policy-in-training")
     client = anthropic_client(gateway.anthropic_base_url(session))
-    asked = {"model": "any", "max_tokens": 64, "system": SYSTEM["content"], "tools": [MESSAGES_TOOL]}
+    asked = {"model": "any", "max_tokens": 256, "system": SYSTEM["content"], "tools": [MESSAGES_TOOL]}
 
     sampling = {"temperature": 0.0, "top_k": 1}  # not in the SDK's typed parameters; ignored anyway
     message = client.messages.create(messages=[QUESTION], extra_body=sampling, **asked)
@@ -398,7 +404,7 @@ def test_messages_stream_is_the_plain_message_as_events(
     client = anthropic_client(f"{gateway.url}", session.id)  # the session as API key
     asked = {
         "model": "any",
-        "max_tokens": 64,
+        "max_tokens": 256,
         "messages": [{"role": "user", "content": "2+2?"}],
         "tools": [MESSAGES_TOOL],
     }

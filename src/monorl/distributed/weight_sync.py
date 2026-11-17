@@ -1,7 +1,8 @@
 """Weight-sync strategies beyond the in-process hand-off (:class:`~monorl.distributed.runtime.InProcessWeightSync`).
 
 * :class:`CheckpointWeightSync` — ``trainer.save_pretrained(dir)`` then
-  ``engine.load_weights_from_path(dir)``; works everywhere a shared filesystem exists.
+  ``engine.load_weights_from_path(dir)``; works everywhere a shared filesystem exists. Always the
+  whole model: engines reload the directory.
 * :class:`BroadcastWeightSync` — a dedicated ``torch.distributed`` process group (gloo on CPU, NCCL
   on CUDA) with the trainer at rank 0 and one rank per engine (``1 + replica * tp``). Weights are
   streamed as buckets: a pickled header (names/shapes/dtypes) precedes every flat bucket, and an
@@ -14,6 +15,11 @@
   engine has consumed them. Engines in other processes implement ``update_weights_from_ipc(handles)``
   (see :class:`IpcCapableEngine`); an engine living in the exporting process gets the tensors
   directly, because CUDA refuses to open an IPC handle in the process that created it.
+
+The strategies that hand tensors over leave out the ones an engine already holds
+(:class:`SentWeights`): with LoRA that is everything the adapter does not touch. An engine has to
+say that it can take such a push (:func:`accepts_partial_weights`); any other engine, the first push
+to an engine, and the push after one that failed carry every tensor.
 """
 
 from __future__ import annotations
@@ -22,22 +28,150 @@ import logging
 import pickle
 import shutil
 import time
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 
 from monorl.core.errors import WeightSyncError
 from monorl.core.interfaces import RolloutEngine, Trainer
+from monorl.mtp import is_wire_name
 
 log = logging.getLogger(__name__)
 
 
 def _tensor_bytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
+
+
+# -- what an engine already holds -------------------------------------------------------------
+
+
+def accepts_partial_weights(engine: RolloutEngine) -> bool:
+    """Whether ``engine`` declares, with ``accepts_partial_weights = True``, that a push may leave
+    out the tensors it was sent before. That takes two things: ``update_weights`` patches the
+    tensors it is given and leaves the others alone, and the engine still has its weights at the
+    next push (one that drops them while it sleeps counts on getting all of them back). An engine
+    that does not declare it is sent everything."""
+    return bool(getattr(engine, "accepts_partial_weights", False))
+
+
+class _Held(NamedTuple):
+    """An exported tensor as it was when it was sent."""
+
+    storage: weakref.ReferenceType[torch.UntypedStorage]
+    layout: tuple[int, torch.Size, tuple[int, ...], torch.dtype]
+    version: int
+
+
+class SentWeights:
+    """What one receiver of a trainer's export holds, so that a push carries only what changed
+    since the last push that succeeded. The receiver is an engine, or the engines that read one
+    export together.
+
+    A tensor is left out when the trainer yields it as it was sent: on the same storage, which has
+    been alive since, with the same offset, shape, strides and dtype, and with the same version
+    counter, which torch advances on every in-place write. Nothing is read or hashed. Never left
+    out are
+
+    * a tensor on the memory of one of ``trainer.trainable_params``: an optimizer may write without
+      advancing the counter (torch's fused implementations do), so what is trained goes every time.
+      A trainer without that attribute names nothing, and all of its export goes every time;
+    * a tensor that was made for the export (merged LoRA weights): its storage is new;
+    * a tensor created in inference mode: it has no counter.
+
+    MTP weights (:data:`monorl.mtp.WIRE_PREFIX`) go all together or not at all, after the policy's:
+    an engine replaces its drafter's weights from a complete set only.
+
+    What this cannot see is a write that neither advances the counter nor belongs to the optimizer
+    of ``trainable_params``: through ``tensor.data``, a numpy view or another process.
+    """
+
+    def __init__(self) -> None:
+        self._held: dict[str, _Held | None] = {}
+
+    def forget(self) -> None:
+        """The receiver may hold anything (it was rebuilt, it lost its weights): the next push
+        carries every tensor."""
+        self._held.clear()
+
+    @contextmanager
+    def push(self, trainer: Trainer) -> Iterator[Iterator[tuple[str, torch.Tensor]]]:
+        """``with sent.push(trainer) as stream:`` deliver ``stream``, the part of
+        ``trainer.export_weights()`` the receiver does not hold. Leaving the block normally says
+        that what was taken from the stream has arrived; leaving it with an exception says that
+        the receiver's state is unknown (:meth:`forget`)."""
+        staged: dict[str, _Held | None] = {}
+        try:
+            yield self._changed(trainer, staged)
+        except BaseException:
+            self.forget()
+            raise
+        self._held.update(staged)
+
+    def _changed(
+        self, trainer: Trainer, staged: dict[str, _Held | None]
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        trained = getattr(trainer, "trainable_params", None)
+        if trained is None:
+            self.forget()  # what was noted of another trainer's export says nothing after this one
+            yield from trainer.export_weights()
+            return
+        written = {p.untyped_storage().data_ptr() for p in trained}
+        mtp: list[tuple[str, torch.Tensor]] = []
+        mtp_staged: dict[str, _Held | None] = {}
+        for name, tensor in trainer.export_weights():
+            storage = tensor.untyped_storage()
+            now = None
+            if not tensor.is_inference() and storage.data_ptr() not in written:
+                layout = (tensor.storage_offset(), tensor.shape, tensor.stride(), tensor.dtype)
+                now = _Held(weakref.ref(storage), layout, tensor._version)
+            before = self._held.get(name)
+            held = (
+                now is not None
+                and before is not None
+                and before.storage() is storage
+                and before.layout == now.layout
+                and before.version == now.version
+            )
+            if is_wire_name(name):
+                mtp.append((name, tensor))
+                if not held:
+                    mtp_staged[name] = now
+            elif not held:
+                staged[name] = now
+                yield name, tensor
+        if mtp_staged:
+            staged.update(mtp_staged)
+            yield from mtp
+
+
+class _SharedSentWeights:
+    """:class:`SentWeights` of a strategy whose engines all read one export: a tensor is left out
+    only when every engine holds it, so the engines have to be the ones of the last push and
+    every one has to take partial pushes (:func:`accepts_partial_weights`)."""
+
+    def __init__(self) -> None:
+        self._sent = SentWeights()
+        self._engines: tuple[RolloutEngine, ...] = ()
+
+    @contextmanager
+    def push(
+        self, trainer: Trainer, engines: Sequence[RolloutEngine]
+    ) -> Iterator[Iterator[tuple[str, torch.Tensor]]]:
+        same = len(engines) == len(self._engines) and all(
+            a is b for a, b in zip(engines, self._engines, strict=True)
+        )
+        self._engines = tuple(engines)
+        if not same or not all(accepts_partial_weights(engine) for engine in engines):
+            self._sent.forget()
+        with self._sent.push(trainer) as stream:
+            yield stream
 
 
 # -- checkpoint -------------------------------------------------------------------------------
@@ -139,6 +273,7 @@ class BroadcastWeightSync:
         self.device = torch.device(device)
         self._store: Any = None
         self._group: Any = None
+        self._sent = _SharedSentWeights()
 
     # -- group lifecycle ----------------------------------------------------------------
     def _ensure_group(self) -> Any:
@@ -240,7 +375,8 @@ class BroadcastWeightSync:
         }
 
     def sync(self, trainer: Trainer, engines: Sequence[RolloutEngine]) -> dict[str, float]:
-        """Rank-0 entry point: start every engine's receiver, stream the trainer weights, join."""
+        """Rank-0 entry point: start every engine's receiver, stream the trainer's weights (the
+        ones the engines do not hold, see :class:`SentWeights`), join."""
         if self.rank != 0:
             raise WeightSyncError("BroadcastWeightSync.sync must run on rank 0 (the trainer side)")
         if not engines:
@@ -258,9 +394,10 @@ class BroadcastWeightSync:
                     "process and implement begin_receive_broadcast(spec, rank)"
                 )
             handles.append(engine.begin_receive_broadcast(self.spec, 1 + i * ranks_per_engine))
-        metrics = self.send(trainer.export_weights())
-        for h in handles:
-            h.result()
+        with self._sent.push(trainer, engines) as stream:
+            metrics = self.send(stream)
+            for h in handles:
+                h.result()
         return metrics
 
     # -- receiver ---------------------------------------------------------------------------
@@ -282,7 +419,7 @@ class BroadcastWeightSync:
                 offset += n
 
     def receive(self, engine: RolloutEngine) -> dict[str, float]:
-        """Rank ``>= 1`` entry point: consume one full weight stream into ``engine.update_weights``."""
+        """Rank ``>= 1`` entry point: consume one weight stream into ``engine.update_weights``."""
         if self.rank == 0:
             raise WeightSyncError("rank 0 sends; call send()/sync()")
         t0 = time.perf_counter()
@@ -338,6 +475,7 @@ class CudaIpcWeightSync:
         )
         if self.device.type != "cuda":
             raise WeightSyncError(f"cuda_ipc device must be a CUDA device, got {self.device}")
+        self._sent = _SharedSentWeights()
 
     def export_handles(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -362,17 +500,18 @@ class CudaIpcWeightSync:
 
     def sync(self, trainer: Trainer, engines: Sequence[RolloutEngine]) -> dict[str, float]:
         t0 = time.perf_counter()
-        handles, keepalive = self.export_handles(trainer.export_weights())
-        total = sum(_tensor_bytes(t) for t in keepalive)
-        try:
-            for engine in engines:
-                if isinstance(engine, IpcCapableEngine):
-                    engine.update_weights_from_ipc(handles)
-                else:
-                    engine.update_weights((h.name, t) for h, t in zip(handles, keepalive, strict=True))
-            torch.cuda.synchronize(self.device)
-        finally:
-            del keepalive
+        with self._sent.push(trainer, engines) as stream:
+            handles, keepalive = self.export_handles(stream)
+            total = sum(_tensor_bytes(t) for t in keepalive)
+            try:
+                for engine in engines:
+                    if isinstance(engine, IpcCapableEngine):
+                        engine.update_weights_from_ipc(handles)
+                    else:
+                        engine.update_weights((h.name, t) for h, t in zip(handles, keepalive, strict=True))
+                torch.cuda.synchronize(self.device)
+            finally:
+                del keepalive
         return {
             "weight_sync/bytes": float(total),
             "weight_sync/seconds": time.perf_counter() - t0,

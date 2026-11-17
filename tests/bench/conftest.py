@@ -13,7 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from monorl.core.registry import registry
-from monorl.core.types import Completion, PromptInput, SamplingParams
+from monorl.core.types import Completion, PromptInput, SamplingParams, prompt_caps
 
 MEP_SERVER = Path(__file__).parent / "mep_bench_server.py"
 FAKE_ENGINE_NAME = "bench-fake"
@@ -31,8 +31,9 @@ class FakeTokenizer:
 
 
 class FakeEngine:
-    """Returns ``tokens_per_completion`` tokens per completion and sleeps ``seconds_per_call``
-    (plus ``seconds_per_prompt`` per prompt) so throughput numbers are predictable."""
+    """Returns ``tokens_per_completion`` tokens per completion (fewer, finishing with ``length``,
+    under a smaller generation cap) and sleeps ``seconds_per_call`` (plus ``seconds_per_prompt``
+    per prompt) so throughput numbers are predictable."""
 
     def __init__(
         self,
@@ -48,21 +49,28 @@ class FakeEngine:
         self.shutdowns = 0
         self._tok = FakeTokenizer()
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         self.calls.append(len(prompts))
         delay = self.seconds_per_call + self.seconds_per_prompt * len(prompts)
         if delay:
             time.sleep(delay)
         out: list[list[Completion]] = []
-        for p in prompts:
+        for p, cap in zip(prompts, prompt_caps(params, len(prompts), max_new_tokens), strict=True):
             prompt_ids = list(p) if p and isinstance(p[0], int) else [7] * (len(p) + 3)
+            tokens = min(self.tokens_per_completion, cap)
             out.append(
                 [
                     Completion(
-                        text="x " * self.tokens_per_completion,
-                        token_ids=list(range(self.tokens_per_completion)),
-                        logprobs=[-0.1] * self.tokens_per_completion,
-                        finish_reason="stop",
+                        text="x " * tokens,
+                        token_ids=list(range(tokens)),
+                        logprobs=[-0.1] * tokens,
+                        finish_reason="stop" if tokens == self.tokens_per_completion else "length",
                         prompt_token_ids=prompt_ids,
                     )
                     for _ in range(params.n)

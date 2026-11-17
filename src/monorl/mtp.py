@@ -2,9 +2,9 @@
 
 Models such as DeepSeek-V3, GLM, Step, Kimi and Mellum ship extra decoder layers that predict the
 tokens *after* the next one. MTP layer ``k`` (0-based) reads, at position ``t``, the hidden state
-the previous depth produced there (depth ``-1`` is the policy's last layer) and the embedding of
-token ``t+k+1``, and predicts token ``t+k+2``. They draft tokens for speculative decoding and are
-trained with an auxiliary loss.
+the previous depth produced there (depth ``-1`` is the policy, with its last hidden states) and
+the embedding of token ``t+k+1``, and predicts token ``t+k+2``. They draft tokens for speculative
+decoding and are trained with an auxiliary loss.
 
 transformers keeps these layers outside the model (``transformers.modeling_layers.MtpModel``,
 which shares embedding, head and rotary embedding with it), reloads them from disk for every
@@ -20,7 +20,14 @@ one ``MtpModel`` for the lifetime of an engine or trainer and adds what RL needs
   they are written next to an exported model (:func:`write_checkpoint_weights`): transformers,
   vLLM and SGLang all read MTP layers from the checkpoint's keys.
 
-Written against transformers 5.22 (``MtpModel``, ``MTPCandidateGenerator``,
+How the policy is asked for its last hidden states differs between transformers releases (5.22: a
+list with the last decoder layer's index; 5.23: ``-1``, an index into all hidden states, where the
+same list selects another layer and leaves the last entry ``None``). :class:`MtpLayers` therefore
+takes the request from transformers' own drafter (:attr:`MtpLayers.last_hidden_request`) and reads
+the answer where the drafter reads it (:meth:`MtpLayers.last_hidden_states`); trainers, engines
+and the held drafter use these two and nothing of their own.
+
+Written against transformers 5.22 and 5.23 (``MtpModel``, ``MTPCandidateGenerator``,
 ``core_model_loading``).
 """
 
@@ -80,6 +87,23 @@ def _mtp_model_class() -> Any:
             f"{transformers.__version__} is installed"
         ) from e
     return MtpModel
+
+
+MIN_TRANSFORMERS = "5.22"
+"""Oldest transformers release :class:`MtpLayers` works with. ``MtpModel`` is older, but the loader
+functions used here are complete from 5.21 on only, and nothing older than 5.22 was ever run."""
+
+
+def _require_transformers() -> None:
+    """A :class:`ConfigError` on a transformers release older than :data:`MIN_TRANSFORMERS`,
+    instead of an import or attribute error from the middle of loading."""
+    import transformers
+    from packaging.version import Version
+
+    if Version(transformers.__version__) < Version(MIN_TRANSFORMERS):
+        raise ConfigError(
+            f"model.mtp needs transformers {MIN_TRANSFORMERS} or later; {transformers.__version__} is installed"
+        )
 
 
 def num_mtp_layers(model_config: Any) -> int:
@@ -168,7 +192,10 @@ class MtpLayers:
     the policy and are shared, never copied."""
 
     def __init__(self, main_model: nn.Module, source: str | os.PathLike[str]) -> None:
-        MtpModel = _mtp_model_class()  # noqa: N806 - a class
+        _require_transformers()
+        from transformers import GenerationConfig
+        from transformers.generation.candidate_generator import MTPCandidateGenerator
+
         if num_mtp_layers(main_model.config) == 0:
             raise ConfigError(
                 f"model.mtp is enabled but {type(main_model).__name__} declares no MTP layers "
@@ -183,7 +210,6 @@ class MtpLayers:
         self.pattern: re.Pattern[str] | None = pattern
         self.source: Path | None = Path(source)
         table = self._checkpoint_table()
-        device = next(main_model.get_decoder().layers[-1].parameters()).device
         # A checkpoint may keep a copy of the embedding with its MTP weights. Where the loader does
         # not ignore it (a copy directly under the MTP prefix), it is written into the embedding the
         # layers share with the policy. That embedding is the policy's: its values are put back.
@@ -193,11 +219,12 @@ class MtpLayers:
             if any(key.endswith(TIED_EMBEDDING) for key in table)
             else {}
         )
-        # MtpModel.from_pretrained reads the directory the policy's config names; point it at `source`.
+        # transformers' own drafter loads the layers, and says how it asks the policy for the hidden
+        # states they read. It reads the directory the policy's config names; point it at `source`.
         name = main_model.config.name_or_path
         main_model.config.name_or_path = os.fspath(self.source)
         try:
-            model = MtpModel.from_pretrained(main_model, device_map={"": device})
+            drafter = MTPCandidateGenerator(main_model, GenerationConfig(), {}, None)
         except (ValueError, RuntimeError, OSError) as e:
             raise ConfigError(f"cannot load the MTP layers of {self.source}: {e}") from e
         finally:
@@ -206,22 +233,34 @@ class MtpLayers:
                 for parameter_name, parameter in embedding.named_parameters():
                     if parameter_name in policy_embedding:
                         parameter.copy_(policy_embedding[parameter_name])
-        self._attach(main_model, model)
+        self._attach(main_model, drafter.mtp_model, drafter.model_kwargs_overrides)
         self._record_layout(table)
 
     @classmethod
     def of(cls, main_model: nn.Module, mtp_model: nn.Module) -> MtpLayers:
         """Layers around an ``MtpModel`` that exists already. They draft and train; without a
-        checkpoint they have no checkpoint layout to be exported in."""
+        checkpoint they have no checkpoint layout to be exported in, and transformers built no
+        drafter that says how it asks the policy for them. The policy is then asked the way the
+        drafter's class asks unless told otherwise: for every layer's hidden states (they stay in
+        memory during the pass), of which the last are read."""
+        _require_transformers()
+        from transformers.generation.candidate_generator import MTPCandidateGenerator
+
         layers = cls.__new__(cls)
         layers.pattern = None
         layers.source = None
-        layers._attach(main_model, mtp_model)
+        layers._attach(main_model, mtp_model, MTPCandidateGenerator.model_kwargs_overrides)
         return layers
 
-    def _attach(self, main_model: nn.Module, model: nn.Module) -> None:
+    def _attach(
+        self, main_model: nn.Module, model: nn.Module, last_hidden_request: Mapping[str, Any]
+    ) -> None:
         self.main_model = main_model
         self.model = model
+        self.last_hidden_request: dict[str, Any] = dict(last_hidden_request)
+        """Keyword arguments for the policy's forward pass that make it return the hidden states
+        the layers read (:meth:`last_hidden_states` takes them from its output): what transformers'
+        drafter of the installed release passes during ``generate(use_mtp=True)``."""
         self.device = next(main_model.get_decoder().layers[-1].parameters()).device
         self.num_layers = len(model.layers)
         self._projection = _Projection(model)
@@ -422,6 +461,27 @@ class MtpLayers:
             )
 
     # -- training -------------------------------------------------------------------------
+    def last_hidden_states(self, outputs: Any) -> torch.Tensor:
+        """The hidden states ``[B, T, H]`` the layers read, from the ``outputs`` of a policy forward
+        pass that was given :attr:`last_hidden_request`: the last entry of ``hidden_states``, where
+        transformers' drafter reads them (the policy's final hidden states, the input of its head).
+
+        Raises when they are not there (the request was not passed, or a transformers release
+        answers it elsewhere), so that no loss is computed from ``None``. The held drafter needs
+        no such check: the request and the reading are both transformers' own there."""
+        states = getattr(outputs, "hidden_states", None)
+        last = states[-1] if states else None
+        if last is None:
+            import transformers
+
+            raise RuntimeError(
+                f"the policy's forward pass returned no last hidden states for the MTP layers (transformers "
+                f"{transformers.__version__}, asked with {self.last_hidden_request}): it has to be called with "
+                "MtpLayers.last_hidden_request, and monorl's MTP support reads hidden_states[-1] as transformers "
+                "5.22 and 5.23 do"
+            )
+        return last
+
     def target_counts(self, target_mask: torch.Tensor) -> list[int]:
         """Targets of every depth in ``target_mask`` ``[B, T]``: depth ``k`` is trained on the
         target tokens from position ``k+2`` on."""
@@ -439,11 +499,11 @@ class MtpLayers:
         """Teacher-forced MTP loss of a right-padded batch: the mean over the depths of the
         token-mean cross entropy.
 
-        ``hidden`` ``[B, T, H]`` are the policy's last-layer hidden states for ``input_ids``
-        ``[B, T]`` (``output_hidden_states=[num_hidden_layers - 1]``: what generation hands to the
-        MTP layers). ``target_mask`` ``[B, T]`` marks the tokens that are training targets
-        (response tokens). Depth ``k`` at position ``t`` is trained to predict token ``t+k+2``
-        when that token is a target.
+        ``hidden`` ``[B, T, H]`` are the policy's last hidden states for ``input_ids`` ``[B, T]``
+        (:meth:`last_hidden_states` of a forward pass with :attr:`last_hidden_request`: what
+        generation hands to the MTP layers). ``target_mask`` ``[B, T]`` marks the tokens that are
+        training targets (response tokens). Depth ``k`` at position ``t`` is trained to predict
+        token ``t+k+2`` when that token is a target.
 
         ``detach_trunk``: the loss reaches the MTP layers only: hidden states, embeddings and the
         shared output head enter as constants.
@@ -544,12 +604,10 @@ def _held_candidate_generator(layers: MtpLayers, generation_config: Any, logits_
 
     class HeldCandidateGenerator(MTPCandidateGenerator):
         def __init__(self) -> None:
-            # MTPCandidateGenerator.__init__ minus MtpModel.from_pretrained (transformers 5.22).
+            # MTPCandidateGenerator.__init__ minus MtpModel.from_pretrained (transformers 5.22 and 5.23).
             main = layers.main_model
             self.num_mtp_layers = layers.num_layers
-            self.model_kwargs_overrides = {
-                "output_hidden_states": [main.config.get_text_config().num_hidden_layers - 1]
-            }
+            self.model_kwargs_overrides = layers.last_hidden_request
             self.device = layers.device
             self.mtp_model = layers.model
             self.mtp_cache = MtpCache(config=main.config.get_mtp_config())

@@ -7,7 +7,7 @@ contracts between components are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
 ## Setup
 
 ```bash
-make install                # .venv (uv, Python 3.12) with the extras CI installs
+make install                # .venv (uv, Python 3.12) with the packages of requirements.lock
 scripts/dev/bootstrap.sh    # the same, plus the example environments and the web build
 ```
 
@@ -18,12 +18,35 @@ Development happens on macOS (arm64, no CUDA) and CI runs on Linux x86, CPU only
 verl, NeMo-RL and Unsloth are not installed in either place, which shapes the testing rules
 below.
 
+## Dependencies
+
+`requirements.lock` pins every package of that environment: monorl's dependencies with the extras
+`dev`, `trl`, `distributed`, `multimodal`, `rewards`, `openenv` and `hermes`, and what builds
+monorl, each at one version with the hashes of its files. It is one file for macOS on Apple
+silicon, Linux and Windows and for Python 3.11 and 3.12, with PyTorch's CPU builds.
+`make install`, CI and the CPU image install from it, from wheels only, and resolve nothing
+themselves, so a release published upstream changes nothing here until a commit changes the lock.
+
+| When | Command |
+|---|---|
+| A dependency or an extra changed in `pyproject.toml`, or a pin in `third_party/pins.toml` | `make lock`, then `make sync` |
+| Take the newest allowed release of everything | `make lock-upgrade`, then `make sync` and the tests |
+| Take the newest allowed release of one package | `.venv/bin/python scripts/lock.py -P transformers` |
+| A pull changed the lock | `make sync` |
+
+`make lock` keeps every version that still fits, so its diff shows what the edit needed.
+`scripts/lock.py` describes what goes into the file. `tests/test_requirements_lock.py` fails when
+`pyproject.toml` or a pin asks for something the lock does not hold, and `make sync` ends with
+`uv pip check`. The GPU frameworks are not in the lock: each needs an environment of its own (its
+extra, `make install-unsloth`, the images under `docker/`), and a CUDA build of PyTorch comes with
+them.
+
 ## Checks
 
 | What | Command |
 |---|---|
 | Python lint | `make lint` (ruff check and format check over `src tests scripts examples`, 110 columns) |
-| Python tests | `make test-fast`; one area: `.venv/bin/python -m pytest tests/rewards -q` |
+| Python tests | `make test-fast`; one area: `.venv/bin/python -m pytest tests/rewards -q`; on four workers, as CI runs them: `.venv/bin/python -m pytest tests -q -n 4 -m 'not slow and not network and not gpu'` |
 | Everything, including slow tests | `make test` (downloads a 135M model, trains a few steps on CPU) |
 | Go SDK | `cd envs/sdk/go && go vet ./... && go test ./...` |
 | Example environments | `make envs` (Go and C++, into `envs/bin`) |
@@ -31,8 +54,9 @@ below.
 | Web UI | `cd web && pnpm install --frozen-lockfile && pnpm build && pnpm lint` |
 | Config reference is current | `.venv/bin/python -m monorl.config.reference --check docs/CONFIG.md` |
 
-CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: Python lint and
-`pytest tests -m 'not slow and not network and not gpu'`, the Go and C++ SDK builds and tests,
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on pull requests: `make install`,
+Python lint and `pytest tests -n 4 -m 'not slow and not network and not gpu'`, the Go and C++ SDK
+builds and tests,
 the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, and builds of the
 `envs` and `cpu` images. A newer push cancels the run of an older one.
 
@@ -57,8 +81,17 @@ the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, an
 - **Floats.** Compare float32 results that were computed over different batch shapes with a
   relative tolerance. The Linux runner and a Mac differ in the last digits (about 1e-6
   relative), and an absolute bound that holds on one fails on the other.
-- **Scratch state.** Under pytest `MONORL_HOME` defaults to `/tmp/monorl-tests`; tests write
-  everything else below `tmp_path`.
+- **Parallel runs.** CI runs the suite on four pytest-xdist workers, each a process of its own
+  that gets the tests in no particular order. A test must pass alone and next to any other: it
+  takes its ports from the system (the server binds port 0 and is asked which one it got), and
+  it removes what it registers. Tests that share one resource outside their process carry
+  `pytest.mark.xdist_group("<name>")` and stay together on one worker (`--dist loadgroup` in
+  `pyproject.toml`): the local Ray of `tests/distributed/test_ray_runtime.py`, the Docker daemon
+  of `tests/envs/test_sandbox_docker.py`. CI gives every worker one torch thread
+  (`OMP_NUM_THREADS=1`): four workers with a thread per vCPU each are slower than four with one.
+- **Scratch state.** Under pytest `MONORL_HOME` defaults to `/tmp/monorl-tests`, and each xdist
+  worker uses a directory of its own below it (`gw0`, `gw1`, ...); tests write everything else
+  below `tmp_path`.
 
 ## Conventions
 

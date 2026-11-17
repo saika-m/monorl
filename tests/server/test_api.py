@@ -14,7 +14,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from monorl.server.app import ServerSettings, create_app
-from monorl.server.routes_system import recipe_description
 
 
 def test_server_import_is_torch_free() -> None:
@@ -96,14 +95,6 @@ def test_malformed_body_is_422(client: TestClient) -> None:
 # -- recipes -----------------------------------------------------------------------------------
 
 
-def test_recipe_description() -> None:
-    text = (
-        "#!/usr/bin/env monorl\n# GRPO on GSM8K\n#   with a tiny model\n\nrun_name: x\n# trailing comment\n"
-    )
-    assert recipe_description(text) == "GRPO on GSM8K with a tiny model"
-    assert recipe_description("run_name: x\n") == ""
-
-
 def test_recipes(client: TestClient, recipes_dir: Path, config_dict: dict[str, Any]) -> None:
     import yaml
 
@@ -121,6 +112,33 @@ def test_recipes(client: TestClient, recipes_dir: Path, config_dict: dict[str, A
     assert recipes[0]["config"]["model"]["name_or_path"] == "org/tiny-model"
     assert recipes[0]["valid"] is True
     assert recipes[2]["valid"] is False and recipes[2]["errors"]
+
+
+def test_recipes_lists_yml_files(client: TestClient, recipes_dir: Path, config_dict: dict[str, Any]) -> None:
+    import yaml
+
+    (recipes_dir / "b.yaml").write_text("# Long extension.\n" + yaml.safe_dump(config_dict))
+    (recipes_dir / "a.yml").write_text("# Short extension.\n" + yaml.safe_dump(config_dict))
+    (recipes_dir / "c.yml").write_text("# Also short.\n" + yaml.safe_dump(config_dict))
+    recipes = client.get("/api/recipes").json()
+    assert [(x["name"], Path(x["path"]).name) for x in recipes] == [
+        ("a", "a.yml"),
+        ("b", "b.yaml"),
+        ("c", "c.yml"),
+    ]
+    assert recipes[0]["description"] == "Short extension." and recipes[0]["valid"] is True
+
+
+def test_recipes_with_both_extensions_is_an_error(
+    client: TestClient, recipes_dir: Path, config_dict: dict[str, Any]
+) -> None:
+    import yaml
+
+    (recipes_dir / "twin.yaml").write_text(yaml.safe_dump(config_dict))
+    (recipes_dir / "twin.yml").write_text(yaml.safe_dump(config_dict))
+    r = client.get("/api/recipes")
+    assert r.status_code == 422
+    assert "twin.yaml and twin.yml" in r.text
 
 
 def test_recipes_missing_dir(client: TestClient, recipes_dir: Path) -> None:

@@ -47,7 +47,12 @@ engine. The orchestrator runs this loop itself, or hands the same config to a pi
 - **Pluggable at the seams.** Rollout engines (`hf`, `vllm`, `sglang`), trainers (`reference`,
   `unsloth`), pipeline backends (`trl`, `verl`, `nemo_rl`), rewards, data sources and
   environments talk through `monorl.core.interfaces`; the orchestrator never imports a framework.
-  Your own rewards and environments plug in from a module named in the config's `providers`.
+  Your own rewards, environments and data sources plug in from a module named in the config's
+  `providers`.
+- **Repeatable.** On the `hf` engine a run repeats for a fixed seed, multi-turn environments
+  included: the turns of concurrent episodes reach the engine in batches that do not depend on
+  timing, and a resumed run continues the run it resumes
+  ([docs](docs/RUNS.md#what-a-run-does)).
 - **Patches, not forks.** Each upstream modification is a `Patch` with a target, a version gate
   and a verification hook; pins live in [`third_party/pins.toml`](third_party/pins.toml)
   ([docs](docs/PATCHING.md)).
@@ -116,7 +121,7 @@ Needs Python 3.12 and [uv](https://docs.astral.sh/uv/). Optional: Node 24 and pn
 UI, Go and clang++ for the example environments, Docker for sandboxed episodes.
 
 ```bash
-make install                # .venv + monorl[dev,trl,distributed,rewards,openenv,hermes]
+make install                # .venv with the packages of requirements.lock, and monorl
 source .venv/bin/activate
 monorl doctor               # what is installed, which patches apply, what is registered
 
@@ -136,8 +141,14 @@ A run writes `~/.monorl/runs/<run_name>/`: `config.yaml`, `status.json`, `metric
 `trajectories.jsonl`, `run.log`, `checkpoints/` and the exported model in `final/`. `--resume`
 continues from the latest checkpoint.
 
-GPU engines and backends are extras (`.[vllm]`, `.[sglang]`, `.[verl]`; `.[multimodal]` for
-images). Unsloth gets its own venv (`make install-unsloth`) and NeMo-RL is a git checkout
+`make install` installs the versions pinned in [`requirements.lock`](requirements.lock), the ones
+CI runs the tests on: monorl's dependencies with the extras `dev`, `trl`, `distributed`,
+`rewards`, `openenv`, `hermes` and `multimodal` (image prompts), and PyTorch's CPU build (on
+macOS the regular build, MPS included). `make sync` brings an existing `.venv` back to the lock
+after a pull.
+
+GPU engines and backends are extras (`.[vllm]`, `.[sglang]`, `.[verl]`) and are not part of the
+lock. Unsloth gets its own venv (`make install-unsloth`) and NeMo-RL is a git checkout
 (`NEMO_RL_HOME`); see [`docs/BACKENDS.md`](docs/BACKENDS.md).
 
 ## Recipes
@@ -296,7 +307,7 @@ The native loop: rollout engines and trainers behind monorl's orchestrator.
 | | hf + reference | vLLM | SGLang | Unsloth |
 |---|---|---|---|---|
 | Role | engine + trainer | engine | engine | trainer |
-| Pin | transformers 5.22 | 0.33.0 | 0.5.23 | 2026.10.11 |
+| Pin | transformers 5.22, 5.23 | 0.33.0 | 0.5.23 | 2026.10.11 |
 | Tested here | real, CPU | fakes | fakes | fakes |
 | RL algorithms | GRPO, DAPO, RLOO, REINFORCE, PPO (value head) | any (engine) | any (engine) | GRPO, DAPO, RLOO, REINFORCE, PPO (value head) |
 | Per-turn credit (`credit_assignment: turn`) | yes | any (engine) | any (engine) | yes |
@@ -359,6 +370,7 @@ stated. `make test` and `make lint` pass there; CI runs the suite on Linux witho
 | Pipelines | The six-stage `r1_sft_grpo_loop_cpu.yaml` from the CLI, through a SIGTERM and `--resume`; the pipeline that samples episodes, runs SFT on every turn of them and evaluates, end to end |
 | Environments | The Go wordle environment through `grpo_remote_env_go_wordle.yaml`, over stdio and over http against the four replicas of the compose stack; `tool_calling` episodes with real tool calls, each trained as one token-contiguous sequence |
 | External agents | A tool-using agent through the capture gateway on the native loop and on the TRL backend, also with a side conversation (two threads, two training sequences per episode); agents written with the OpenAI SDK (Responses API, `previous_response_id`) and the Anthropic SDK (tool use, streamed final turn), with token-contiguous episodes; an image-sending agent training a tiny random Qwen2-VL |
+| Repeatability | Two runs with the same seed, on a busy machine: identical episodes and metrics for `grpo_gsm8k_smollm_cpu.yaml` (2 steps) and for the 6-turn `grpo_remote_env_go_wordle.yaml` (2 steps, 16 of 16 episodes); a run of 4 steps against the same run stopped after step 2 and resumed: identical episodes and metrics in steps 3 and 4, also with a reward that gives a gradient |
 | Failures and context | A run whose agent crashes on some episodes finishes with those episodes left out or retried; a context budget ends episodes instead of truncating them in training |
 | Sandbox | Harness episodes in real Docker containers (agent and verifier inside, reward from the verifier, containers removed); `grpo_harness_tasks_docker_cpu.yaml` on its Harbor-format example tasks |
 | Async rollouts | `rollout.async_steps_ahead: 2` with decoupled PPO, importance weights and a ratio mask, and with score centering |
@@ -408,6 +420,7 @@ configs/recipes/             example run and pipeline configs
 examples/sandbox/            example task directories and a shell agent
 docker/ scripts/ tests/
 third_party/pins.toml        upstream pins; scripts/vendor.py clones the sources here
+requirements.lock            every package of `make install` and CI, pinned with hashes
 ```
 
 ## Development
@@ -419,6 +432,8 @@ conventions; [`src/monorl/README.md`](src/monorl/README.md) maps the code.
 make test-fast     # pytest -m 'not slow and not network'
 make test          # everything (downloads tiny models, trains for a few steps on CPU)
 make lint          # ruff check + format check
+make lock          # rewrite requirements.lock after a change of pyproject.toml or a pin
+make sync          # make .venv match requirements.lock again
 make envs          # Go and C++ example environments into envs/bin
 scripts/vendor.py --list           # the pins and what is cloned
 scripts/vendor.py --fetch vllm     # clone a pinned upstream source (or `all`)

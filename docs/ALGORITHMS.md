@@ -109,16 +109,19 @@ algorithm:
 
 `A_i = R_i`: `compute_advantages` returns the raw rewards, with no baseline, and does not read
 `advantage_norm` or `advantage_std_norm`. The loss is still the clipped surrogate. The name does
-not need a group, but config validation rejects `rollout.group_size: 1` while `advantage_norm` is
-`group` (its default), so one rollout per prompt needs `advantage_norm: none` or `batch`:
+not need a group, so one rollout per prompt is valid:
 
 ```yaml
 algorithm:
   name: reinforce
-  advantage_norm: none
 rollout:
   group_size: 1
 ```
+
+`trainer.backend: verl` is the one place that reads `advantage_norm` under `reinforce`: `group`
+(the default) selects REINFORCE++ with the prompt group's mean reward as baseline, which needs
+`rollout.group_size >= 2` and is rejected at validation otherwise; `batch` and `none` select
+REINFORCE++ without that baseline.
 
 ### `ppo`
 
@@ -162,7 +165,7 @@ centering to the policy term and chooses the anchor of `logp_old`: [OFF_POLICY.m
 
 | Field | Default | Effect |
 |---|---|---|
-| `advantage_norm` | `group` | Read by `grpo`/`dapo`. `group`: mean and std over the prompt group. `batch`: mean and unbiased std over all episodes of the step. `none`: `A = R`. Under every RL name `group` needs `rollout.group_size >= 2`. |
+| `advantage_norm` | `group` | Read by `grpo`/`dapo`. `group`: mean and std over the prompt group. `batch`: mean and unbiased std over all episodes of the step. `none`: `A = R`. Not read by `rloo`, `ppo` or `reinforce`, except by verl under [`reinforce`](#reinforce). |
 | `advantage_std_norm` | `true` | `grpo`/`dapo` with `group` or `batch`. `false`: `A = R - mean`, no division. |
 | `loss_agg` | `token` | Mean used for the policy, KL and entropy terms (`masked_aggregate`). |
 | `kl_coef` | `0.0` | Weight of the KL penalty to the reference policy. `0` skips the reference pass. |
@@ -195,9 +198,13 @@ k1 = d            k2 = 0.5 * d^2            k3 = exp(-d) + d - 1
 **`dynamic_sampling`.** After scoring (overlong penalty included), `_drop_uniform_groups` removes
 every group with more than one member whose rewards are all equal. While fewer than
 `prompts_per_step` groups remain, the loop draws `prompts_per_step` random prompts (seeded by
-seed, step and round), rolls them out, filters them the same way and keeps as many groups as are
-missing, for at most `rollout.extra.dynamic_sampling_max_rounds` rounds (default 3). A batch can
-therefore hold fewer groups; with none left the step makes no update (`rollout/skipped: 1`).
+seed, step and round) and rolls out a prefix of that draw: first as many prompts as groups are
+missing, then, while groups are still missing, a slice twice as long as the last one. Each slice
+is filtered the same way and gives as many groups as are missing, for at most
+`rollout.extra.dynamic_sampling_max_rounds` draws (default 3). A step that lost one group
+therefore usually costs one more prompt, not a whole step. A batch can
+hold fewer groups; with none left the step makes no update (`rollout/skipped: 1`).
+`rollout/groups_dropped` counts the groups that were rolled out and dropped.
 
 ## SFT
 
@@ -213,8 +220,8 @@ loss_t = (1 - eps) * nll_t + eps * (-mean over the vocabulary v of logp_theta(v)
 loss   = agg(loss_t over the trained tokens)
 ```
 
-`sft_loss`, with `eps = sft_label_smoothing`. `logp_theta` is the same temperature-scaled
-log-softmax as in the RL loss, so `rollout.temperature` (default 1.0) applies. Apart from
+`sft_loss`, with `eps = sft_label_smoothing`. `logp_theta` is the plain `log_softmax(logits)`:
+SFT samples nothing, so `rollout.temperature` is not applied. Apart from
 `loss_agg`, `num_epochs` and the three fields below, no `algorithm.*` field is read.
 `loss_agg: rollout` reduces like `sequence` here, because the SFT batch has no loss weights.
 

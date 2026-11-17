@@ -5,10 +5,13 @@ PNPM ?= pnpm
 # Unsloth caps trl/transformers below monorl's versions, so it gets its own venv (third_party/pins.toml).
 UNSLOTH_PIN := $(shell sed -n '/^\[unsloth\]/,/^\[/s/^version = "\(.*\)"/\1/p' third_party/pins.toml)
 
-.PHONY: help install install-unsloth test test-fast web serve envs lint vendor-list
+.PHONY: help install sync install-unsloth lock lock-upgrade test test-fast web serve envs lint vendor-list
 
 help:
-	@echo "install    create .venv and install monorl with dev/trl/distributed/rewards/openenv/hermes extras"
+	@echo "install    create .venv with exactly the packages of requirements.lock, and monorl itself (editable)"
+	@echo "sync       make an existing .venv match requirements.lock again (after a pull that changed it)"
+	@echo "lock       rewrite requirements.lock after a change of pyproject.toml or third_party/pins.toml"
+	@echo "lock-upgrade  rewrite requirements.lock with the newest versions that are allowed"
 	@echo "install-unsloth  create .venv-unsloth (CUDA box) with monorl + unsloth==$(UNSLOTH_PIN) for trainer.backend=unsloth"
 	@echo "test       run the full test suite"
 	@echo "test-fast  run tests except 'slow' and 'network'"
@@ -19,7 +22,22 @@ help:
 
 install:
 	$(UV) venv .venv --python 3.12
-	$(UV) pip install --python $(PY) -e ".[dev,trl,distributed,rewards,openenv,hermes]"
+	$(MAKE) sync
+
+# The environment CI tests: every package at the version and with the hashes of requirements.lock,
+# from wheels only, torch from PyTorch's CPU builds (what the lock holds; scripts/lock.py). monorl
+# itself is built with the locked build backend, and `pip check` fails when pyproject.toml asks for
+# something the lock does not have.
+sync:
+	$(UV) pip sync --python $(PY) --torch-backend cpu --require-hashes --no-build requirements.lock
+	$(UV) pip install --python $(PY) --no-deps --build-constraint requirements.lock -e .
+	$(UV) pip check --python $(PY)
+
+lock:
+	$(PY) scripts/lock.py
+
+lock-upgrade:
+	$(PY) scripts/lock.py --upgrade
 
 install-unsloth:
 	$(UV) venv .venv-unsloth --python 3.12

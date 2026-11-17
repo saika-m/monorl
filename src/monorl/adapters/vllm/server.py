@@ -12,9 +12,11 @@ What it adds on top of vLLM v0.33.0's launcher (``vllm/entrypoints/launchers/api
 * ``--worker-extension-cls monorl.adapters.vllm.worker.MonorlWorkerExtension`` by default.
 * The ``vllm.server.monorl_routes`` patch, which mounts :func:`router` on the app:
 
-  - ``POST /update_named_param?name=&dtype=&shape=`` with the raw tensor bytes as body
-    (:func:`monorl.adapters.vllm.common.tensor_to_bytes`) → ``collective_rpc("monorl_update_weights")``;
-    ``&mtp=true`` marks a checkpoint key of an MTP layer, which goes to the drafter only
+  - ``POST /monorl/update_weights`` with several tensors as body
+    (:func:`monorl.adapters.vllm.common.encode_weights`, a versioned format) → one
+    ``collective_rpc("monorl_update_weights")``; an entry marked ``mtp`` is a checkpoint key of an
+    MTP layer, which goes to the drafter only. The tensors handed on are views of the received
+    body, which is read straight into one buffer: the server holds each request once
   - ``POST /monorl/finish_weight_update`` after the last parameter of an update, when the server
     drafts → ``collective_rpc("monorl_refresh_drafter")``
   - ``POST /load_weights_from_path`` ``{"path": ...}`` → ``collective_rpc("monorl_load_weights_from_path")``
@@ -37,10 +39,10 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from monorl.adapters.vllm.common import WORKER_EXTENSION_CLS, tensor_from_bytes
+from monorl.adapters.vllm.common import WORKER_EXTENSION_CLS, decode_weights
 
 router = APIRouter(tags=["monorl"])
 
@@ -52,31 +54,44 @@ def _engine_client(request: Request) -> Any:
     return client
 
 
-def _parse_shape(shape: str) -> list[int]:
-    if shape.strip() == "":
-        return []
+async def _read_body(request: Request) -> bytearray:
+    """The request body in a buffer of its own. With a ``Content-Length`` the buffer has its
+    final size from the start, so the body is never held twice (``Request.body()`` keeps the
+    chunks and their concatenation, and a growing buffer is copied when it moves)."""
+    declared = request.headers.get("content-length")
+    if declared is None:
+        body = bytearray()
+        async for chunk in request.stream():
+            body += chunk
+        return body
     try:
-        return [int(s) for s in shape.split(",")]
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"bad shape {shape!r}: {e}") from e
+        body = bytearray(int(declared))
+    except (ValueError, MemoryError) as e:
+        raise HTTPException(status_code=400, detail=f"bad Content-Length {declared!r}: {e}") from e
+    filled = 0
+    async for chunk in request.stream():
+        end = filled + len(chunk)
+        if end > len(body):
+            raise HTTPException(status_code=400, detail=f"body is longer than its Content-Length {declared}")
+        body[filled:end] = chunk
+        filled = end
+    if filled != len(body):
+        raise HTTPException(
+            status_code=400, detail=f"body has {filled} bytes, its Content-Length says {declared}"
+        )
+    return body
 
 
-@router.post("/update_named_param")
-async def update_named_param(
-    request: Request,
-    name: str = Query(..., description="HF parameter name"),
-    dtype: str = Query(..., description="torch dtype name, e.g. bfloat16"),
-    shape: str = Query("", description="comma-separated dims; empty for a scalar"),
-    mtp: bool = Query(False, description="the name is a checkpoint key of an MTP layer"),
-) -> JSONResponse:
-    body = await request.body()
+@router.post("/monorl/update_weights")
+async def update_weights(request: Request) -> JSONResponse:
+    body = await _read_body(request)
     try:
-        tensor = tensor_from_bytes(body, dtype, _parse_shape(shape))
+        weights, mtp_weights = decode_weights(body)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    args = ([], [(name, tensor)]) if mtp else ([(name, tensor)],)
+    args = (weights, mtp_weights) if mtp_weights else (weights,)
     results = await _engine_client(request).collective_rpc("monorl_update_weights", args=args)
-    return JSONResponse({"name": name, "loaded": [int(r) for r in results]})
+    return JSONResponse({"tensors": len(weights) + len(mtp_weights), "loaded": [int(r) for r in results]})
 
 
 @router.post("/monorl/finish_weight_update")

@@ -8,17 +8,15 @@ dispatch between pipeline backends (trl/verl/nemo_rl own their loop, SFT include
 from __future__ import annotations
 
 import re
-import signal
 import threading
 import time
 import traceback
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 from monorl.config.schema import RunConfig
 from monorl.core.registry import ensure_providers, registry
 from monorl.core.reporting import CONFIG_FILE, RunReporter, list_checkpoints
+from monorl.core.signals import signal_guard
 from monorl.core.types import RunResult
 from monorl.orchestrator.loop import ComponentLoop
 from monorl.orchestrator.sft import SFTLoop
@@ -46,7 +44,7 @@ def run(config: RunConfig, run_dir: Path | None = None, *, resume: bool = False)
     cancel = threading.Event()
     backend = config.trainer.backend
     kind = "pipeline" if config.is_pipeline_backend else "sft" if config.is_sft else "component"
-    with _signal_guard(cancel, reporter):
+    with signal_guard(cancel, reporter, "finishing the current step, then stopping"):
         reporter.set_status("running", f"starting {kind} backend {backend!r} (resume={resume})", step=0)
         try:
             ensure_providers(config)
@@ -91,29 +89,3 @@ def _run_pipeline(config: RunConfig, reporter: RunReporter) -> RunResult:
     if not result.checkpoints:
         result.checkpoints = list_checkpoints(reporter.run_dir)
     return result
-
-
-@contextmanager
-def _signal_guard(cancel: threading.Event, reporter: RunReporter) -> Iterator[None]:
-    """SIGINT/SIGTERM set ``cancel`` (finish the step, checkpoint, status cancelled); a second
-    signal raises ``KeyboardInterrupt`` for an immediate stop. Only the main thread may install
-    handlers; elsewhere the run simply cannot be cancelled by signal."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-
-    def handler(signum: int, _frame: object) -> None:
-        name = signal.Signals(signum).name
-        if cancel.is_set():
-            raise KeyboardInterrupt(name)
-        cancel.set()
-        reporter.log(f"received {name}: finishing the current step, then stopping")
-
-    previous = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        previous[sig] = signal.signal(sig, handler)
-    try:
-        yield
-    finally:
-        for sig, prev in previous.items():
-            signal.signal(sig, prev)

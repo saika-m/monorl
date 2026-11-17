@@ -1,6 +1,9 @@
 """``monorl env check``: drive any MEP/1 server through spec → reset → step×N → close using the
 raw protocol helpers in :mod:`monorl.envs.protocol`. Independent of the in-process env client so
 it exercises exactly what a Go/C++ author shipped. Torch-free.
+
+The episode is reset with :data:`CANNED_SAMPLE` and stepped with :data:`CANNED_ACTION` unless the
+caller gives its own (:func:`check_sample` builds one from ``--sample`` / ``--reference``).
 """
 
 from __future__ import annotations
@@ -12,18 +15,23 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from monorl.config.loader import apply_overrides
 from monorl.core.types import Completion, Sample
 from monorl.envs.protocol import (
     EnvSpec,
     ProtocolError,
     close_request,
+    decode_sample,
+    encode_sample,
     health_request,
     parse_response,
     reset_request,
     spec_request,
     step_request,
+    validate_messages,
     validate_reset_response,
     validate_step_response,
 )
@@ -35,6 +43,46 @@ CANNED_SAMPLE = Sample(
     metadata={"source": "monorl env check"},
 )
 CANNED_ACTION = Completion(text="hello", token_ids=[], finish_reason="stop")
+CANNED_SAMPLE_HINT = (
+    f"reset was sent the built-in sample (reference {CANNED_SAMPLE.reference!r}); if the environment "
+    "needs a sample of its own, pass --sample FILE.json or --reference VALUE"
+)
+
+
+def check_sample(path: Path | None = None, reference: str | None = None) -> Sample:
+    """The sample ``env check`` resets with.
+
+    ``path`` is a JSON file holding a sample as MEP/1 sends it (an object with any of ``id``,
+    ``messages``, ``reference``, ``metadata``); keys it leaves out keep the value of
+    :data:`CANNED_SAMPLE`. ``reference`` then replaces the reference and is read like the value of
+    a ``--set`` override (``7`` is an integer, ``'"7"'`` a string, ``{a: 1}`` a mapping). With
+    neither this is :data:`CANNED_SAMPLE` itself. Raises ``ValueError`` saying what to change.
+    """
+    if path is None and reference is None:
+        return CANNED_SAMPLE
+    wire = encode_sample(CANNED_SAMPLE)
+    if path is not None:
+        try:
+            given = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            raise ValueError(f"cannot read sample file {path}: {e.strerror or e}") from e
+        except ValueError as e:
+            raise ValueError(f"sample file {path} is not JSON: {e}") from e
+        if not isinstance(given, dict):
+            raise ValueError(f"sample file {path} must hold a JSON object, got {type(given).__name__}")
+        unknown = sorted(set(given) - set(wire))
+        if unknown:
+            raise ValueError(f"sample file {path} has unknown keys {unknown}; a sample has {sorted(wire)}")
+        wire.update(given)
+        try:
+            validate_messages(wire["messages"])
+        except ProtocolError as e:
+            raise ValueError(f"sample file {path}: {e.message}") from e
+        if not isinstance(wire["metadata"], dict):
+            raise ValueError(f"sample file {path}: metadata must be an object")
+    if reference is not None:
+        wire = apply_overrides(wire, [f"reference={reference}"])
+    return decode_sample(wire)
 
 
 @dataclass(slots=True)
@@ -207,6 +255,7 @@ def run_check(
         transport = HttpTransport(url, timeout=timeout)
 
     episode_id = f"check-{uuid.uuid4().hex[:8]}"
+    resetting_canned = False
     try:
         spec_payload = transport.request(spec_request())
         if not spec_payload.get("name"):
@@ -223,11 +272,13 @@ def run_check(
             raise ProtocolError("protocol", f"health must return {{ok: true}}, got {health!r}")
         report.health = health
 
+        resetting_canned = sample is CANNED_SAMPLE
         reset_payload = transport.request(reset_request(episode_id, sample, seed=0))
         msgs, info = validate_reset_response(reset_payload)
         if not msgs:
             raise ProtocolError("protocol", "reset returned no messages")
         report.reset_messages, report.reset_info = list(msgs), info
+        resetting_canned = False
 
         for turn in range(1, max(turns, 1) + 1):
             step_payload = transport.request(step_request(episode_id, action))
@@ -241,7 +292,7 @@ def run_check(
         transport.request(close_request(episode_id))
         report.closed = True
     except ProtocolError as e:
-        report.error = str(e)
+        report.error = f"{e}\n{CANNED_SAMPLE_HINT}" if resetting_canned else str(e)
     finally:
         transport.close()
     return report
@@ -254,5 +305,6 @@ __all__ = [
     "HttpTransport",
     "StdioTransport",
     "StepRecord",
+    "check_sample",
     "run_check",
 ]

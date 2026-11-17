@@ -104,10 +104,12 @@ With `train`, every batch adds
 - **Targets** are the response tokens of the batch (`TrainBatch.response_mask`): depth `k` is
   trained at every position whose token `k+2` places ahead is a response token. Prompts are
   context only. In SFT the response tokens are the assistant turns that carry the SFT loss.
-- **Teacher forcing.** The layers read the batch's own tokens, and the policy's last-layer hidden
-  states from the same forward pass the policy loss uses. The logits a depth is trained on are
-  the logits drafting computes for the same tokens (tested against transformers' drafting loop
-  for two depths).
+- **Teacher forcing.** The layers read the batch's own tokens, and the policy's last hidden
+  states (its final ones, the input of the output head) from the same forward pass the policy
+  loss uses. They are asked for and read as transformers' drafter does it, which differs between
+  releases (`MtpLayers.last_hidden_request`, `MtpLayers.last_hidden_states`). The logits a depth
+  is trained on are the logits drafting computes for the same tokens (tested against
+  transformers' drafting loop for two depths).
 - **`detach_trunk: true`** (default): hidden states, embeddings and the shared output head enter
   as constants, so the policy's update is exactly what it is without MTP training. `loss_coef`
   then scales a gradient that only the MTP layers receive, which an Adam-type optimizer
@@ -194,8 +196,12 @@ untouched layer: over 8 steps `mtp/accept_rate` stayed 0 in every step and in th
 
 - Models: what `transformers.modeling_layers.MtpModel.from_pretrained` loads for the model's
   class. A model whose class registers no MTP key patterns, or a checkpoint without MTP weights,
-  is a `ConfigError`. The native path needs transformers 5.22 or later (tested with 5.22.1 and
-  5.22.2); it reaches into loader internals that a later release may move.
+  is a `ConfigError`. The native path needs transformers 5.22 or later; an older release, which
+  `pyproject.toml` does not rule out, is a `ConfigError` when the layers are loaded. It is tested
+  with 5.22.1, 5.22.2 and 5.23.0, and reaches into loader internals that a
+  later release may move. 5.23 changed how `output_hidden_states` selects layers; monorl takes
+  the request for the layers' input from the release's own `MTPCandidateGenerator` and fails
+  with an error that says so when a forward pass returns none.
 - `hf` engine: one sequence at a time, text prompts only, one drafted token per MTP layer.
 - vLLM and SGLang decide themselves which architectures they can draft for; an unsupported one
   fails when the engine starts.
@@ -210,8 +216,9 @@ untouched layer: over 8 steps `mtp/accept_rate` stayed 0 in every step and in th
 
 - MTP layers and drafting: `transformers/modeling_layers.py` (`MtpModel`, `MtpLayer`),
   `transformers/generation/candidate_generator.py` (`MTPCandidateGenerator`),
-  `transformers/generation/utils.py` (`_assisted_decoding`, `_speculative_sampling`) at 5.22.1
-  and 5.22.2.
+  `transformers/generation/utils.py` (`_assisted_decoding`, `_speculative_sampling`) at 5.22.1,
+  5.22.2 and 5.23.0; `transformers/utils/output_capturing.py` (`capture_outputs`) for what
+  `output_hidden_states` selects.
 - Speculative sampling: Leviathan, Kalman, Matias, "Fast Inference from Transformers via
   Speculative Decoding", <https://arxiv.org/abs/2211.17192>, as implemented by transformers.
 - vLLM: `third_party/vllm/docs/features/speculative_decoding/mtp.md`,

@@ -9,10 +9,10 @@ Label smoothing follows the HF ``LabelSmoother`` definition::
 
     loss_t = (1 - eps) * (-log p_t[y_t]) + eps * (-(1/V) * sum_v log p_t[v])
 
-The smoothing term only needs the vocabulary-mean logprob per position, a ``[B, T]`` tensor
-(:func:`mean_logprob_all_tokens`), which the trainer derives from the logits it already holds
-instead of keeping the full ``[B, T, V]`` log-softmax alive for the loss; passing ``logits``
-directly is supported for callers that have them.
+The smoothing term only needs the vocabulary-mean logprob per position, a ``[B, T]`` tensor.
+The reference trainer hands it in, computed at the trained positions together with the token
+logprobs; :func:`mean_logprob_all_tokens` computes it from ``[B, T, V]`` logits for callers that
+hold those, and passing ``logits`` directly is supported too.
 """
 
 from __future__ import annotations

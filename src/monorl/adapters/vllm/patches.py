@@ -118,7 +118,7 @@ PATCHES = PatchSet(
             mode="wrap",
             build=build_monorl_routes,
             verify=lambda orig: _has_params(orig, "args", "app", "supported_tasks"),
-            description="Mount monorl's /update_named_param and /load_weights_from_path on vLLM's API server.",
+            description="Mount monorl's /monorl/update_weights and /load_weights_from_path on vLLM's API server.",
         ),
     ],
 )

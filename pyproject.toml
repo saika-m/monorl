@@ -7,7 +7,7 @@ requires-python = ">=3.11,<3.13"
 license = { text = "Apache-2.0" }
 dependencies = [
     "torch>=2.4",
-    "transformers>=4.46,<5.23",
+    "transformers>=4.56",
     "datasets>=3.0",
     "huggingface_hub>=0.26",
     "peft>=0.13",
@@ -29,12 +29,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-trl = ["trl>=0.20"]
+trl = ["trl>=1.17,<2"]
 distributed = ["ray[default]>=2.40"]
-vllm = ["vllm>=0.33"]
-sglang = ["sglang>=0.5.23"]
-verl = ["verl>=0.9.1"]
-unsloth = ["unsloth>=2026.10"]
+vllm = ["vllm>=0.33,<0.34"]
+sglang = ["sglang>=0.5.23,<0.6"]
+verl = ["verl>=0.9.1,<0.10"]
+unsloth = ["unsloth>=2026.10,<2027"]
 openenv = ["openenv-core>=0.3.0"]
 hermes = ["hermes-agent>=0.19"]
 rewards = ["math-verify>=0.7"]
@@ -70,6 +70,10 @@ conflicts = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Read by pytest-xdist when a run asks for workers (`-n 4`), ignored otherwise: tests that carry
+# `xdist_group("<name>")` share one resource (a local Ray, the Docker daemon) and stay together on
+# one worker, every other test goes to whichever worker is free.
+addopts = "--dist loadgroup"
 timeout = 600
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]

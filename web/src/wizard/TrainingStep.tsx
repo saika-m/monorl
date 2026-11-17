@@ -158,6 +158,9 @@ export default function TrainingStep({ config, set, patch, system }: StepProps) 
                 <Field path="rollout.turn_rendering" label="Turn rendering">
                   <Select value={r.turn_rendering} onChange={(v) => set("rollout.turn_rendering", v)} options={["tokens", "template"].map((v) => ({ value: v as typeof r.turn_rendering }))} />
                 </Field>
+                <Field path="rollout.turn_batching" label="Turn batching">
+                  <Select value={r.turn_batching} onChange={(v) => set("rollout.turn_batching", v)} options={["lockstep", "arrival"].map((v) => ({ value: v as typeof r.turn_batching }))} />
+                </Field>
               </div>
               <div className="mt-3 space-y-2">
                 <Toggle path="algorithm.advantage_std_norm" checked={a.advantage_std_norm} onChange={(v) => set("algorithm.advantage_std_norm", v)} label="Std-normalise advantages" />

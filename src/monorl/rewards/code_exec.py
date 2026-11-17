@@ -48,6 +48,11 @@ from monorl.rewards.base import (
 
 # Runs inside the child: apply the rlimit when the platform allows it, then execute the file as
 # ``__main__``. Kept as a -c string so the sandbox never needs monorl importable.
+TREE_WALK_INTERVAL_S = 0.25
+"""How often the memory watchdog adds up the program's descendants. Finding them reads the
+machine's whole process table (milliseconds, under the GIL), so doing it at every 20 ms check of
+the program itself would cost more than the checks of all workers together have time for."""
+
 _RUNNER = """
 import resource, runpy, sys
 mb = int(sys.argv[1])
@@ -184,18 +189,24 @@ class Sandbox:
                 ps = psutil.Process(proc.pid)
             except psutil.Error:
                 ps = None
+        descendants_rss = 0
+        next_tree_walk = time.monotonic() + TREE_WALK_INTERVAL_S
         while True:
             try:
                 proc.wait(timeout=0.02)
                 return "ok"
             except subprocess.TimeoutExpired:
                 pass
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 self._kill(proc)
                 return "timeout"
             if ps is not None:
                 try:
-                    rss = ps.memory_info().rss + sum(c.memory_info().rss for c in ps.children(recursive=True))
+                    if now >= next_tree_walk:
+                        descendants_rss = sum(c.memory_info().rss for c in ps.children(recursive=True))
+                        next_tree_walk = time.monotonic() + TREE_WALK_INTERVAL_S
+                    rss = ps.memory_info().rss + descendants_rss
                 except psutil.Error:
                     rss = 0
                 if rss > self.memory_bytes:

@@ -346,7 +346,7 @@ def test_recipes_carry_kind(
 
 
 def test_bundled_pipeline_recipes_validate() -> None:
-    from monorl.cli.recipes import recipes_dir
+    from monorl.config.recipes import recipes_dir
 
     recipes = {r["name"]: r for r in load_recipes(recipes_dir())}
     for name in ("r1_sft_grpo_loop_cpu", "r1_sft_grpo_loop_8gpu_vllm"):

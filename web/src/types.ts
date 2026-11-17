@@ -157,6 +157,7 @@ export interface RolloutConfig {
   enable_sleep_mode: boolean;
   async_steps_ahead: number;
   turn_rendering: "tokens" | "template";
+  turn_batching: "lockstep" | "arrival";
   device: string | null;
   extra: JsonDict;
 }

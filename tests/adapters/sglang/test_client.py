@@ -62,10 +62,11 @@ class FakeServer:
             outs = []
             for i, (ids, sp) in enumerate(zip(body["input_ids"], body["sampling_params"], strict=True)):
                 for k in range(sp.get("n", 1)):
-                    toks = [500 + i * 10 + k, 501]
+                    # two tokens per completion, or as many as the request's max_new_tokens allows
+                    toks = [500 + i * 10 + k, 501][: sp.get("max_new_tokens", 2)]
                     meta: dict[str, Any] = {
                         "id": f"r{i}{k}",
-                        "finish_reason": self.finish,
+                        "finish_reason": self.finish if len(toks) == 2 else {"type": "length", "length": 1},
                         "prompt_tokens": len(ids),
                         "completion_tokens": len(toks),
                         **spec_meta(
@@ -76,7 +77,9 @@ class FakeServer:
                         ),
                     }
                     if body.get("return_logprob"):
-                        meta["output_token_logprobs"] = [[-0.1, toks[0], None], [-0.2, toks[1], None]]
+                        meta["output_token_logprobs"] = [
+                            [-0.1 * (t + 1), tok, None] for t, tok in enumerate(toks)
+                        ]
                     outs.append({"text": f"t{i}{k}", "output_ids": toks, "meta_info": meta})
             return httpx.Response(200, json=outs)
         if path == "/begin_weight_update":
@@ -189,6 +192,25 @@ def test_generate_request_body_chat_and_tokens(client, server):
     assert groups[0][0].prompt_token_ids == chat_ids and groups[1][1].prompt_token_ids == [1, 2, 3]
     assert groups[1][1].text == "t11" and groups[1][1].token_ids == [511, 501]
     assert groups[0][0].logprobs == [-0.1, -0.2] and groups[0][0].finish_reason == "stop"
+
+
+def test_prompts_with_caps_of_their_own_are_one_request_with_sampling_params_per_prompt(client, server):
+    """``POST /generate`` takes one ``sampling_params`` dict per request (``GenerateReqInput``),
+    so a call with a generation cap per prompt stays one HTTP request."""
+    params = SamplingParams(n=2, max_new_tokens=5, temperature=0.5)
+    groups = client.generate([[1, 2, 3], [4], [5, 6]], params, max_new_tokens=[1, 5, 1])
+    generate = [body for _, path, body in server.requests if path == "/generate"]
+    assert len(generate) == 1 and generate[0]["input_ids"] == [[1, 2, 3], [4], [5, 6]]
+    sent = generate[0]["sampling_params"]
+    assert [sp["max_new_tokens"] for sp in sent] == [1, 5, 1]
+    assert {(sp["n"], sp["temperature"]) for sp in sent} == {(2, 0.5)}
+    assert [[c.token_ids for c in g] for g in groups] == [
+        [[500], [501]],
+        [[510, 501], [511, 501]],
+        [[520], [521]],
+    ]
+    assert [[c.finish_reason for c in g] for g in groups] == [["length"] * 2, ["stop"] * 2, ["length"] * 2]
+    assert groups[0][1].logprobs == pytest.approx([-0.1]) and groups[2][0].prompt_token_ids == [5, 6]
 
 
 def test_generate_seed_fanout_and_no_logprobs(client, server):

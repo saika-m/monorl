@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
     from monorl.config.schema import RunConfig
     from monorl.core.interfaces import RolloutEngine, Trainer, WeightSync
+    from monorl.distributed.weight_sync import SentWeights
 
 
 @dataclass
@@ -47,21 +48,39 @@ class Runtime:
 
 
 class InProcessWeightSync:
-    """Direct tensor hand-off: ``trainer.export_weights()`` -> ``engine.update_weights``."""
+    """Direct tensor hand-off: ``trainer.export_weights()`` -> ``engine.update_weights``. An engine
+    that takes partial pushes gets the tensors that changed since its last one
+    (:class:`~monorl.distributed.weight_sync.SentWeights`)."""
 
     name = "inprocess"
 
+    def __init__(self) -> None:
+        self._sent: list[tuple[RolloutEngine, SentWeights]] = []
+        """The engines of the last sync that take partial pushes, and what each of them holds."""
+
     def sync(self, trainer: Trainer, engines: Sequence[RolloutEngine]) -> dict[str, float]:
+        from monorl.distributed.weight_sync import SentWeights, accepts_partial_weights
+
         t0 = time.perf_counter()
         counted = [0]
 
-        def stream() -> Iterable[tuple[str, torch.Tensor]]:
-            for name, tensor in trainer.export_weights():
+        def count(weights: Iterable[tuple[str, torch.Tensor]]) -> Iterable[tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
                 counted[0] += tensor.numel() * tensor.element_size()
                 yield name, tensor
 
+        known = {id(engine): sent for engine, sent in self._sent}
+        self._sent = []
         for engine in engines:
-            engine.update_weights(stream())
+            if not accepts_partial_weights(engine):
+                engine.update_weights(count(trainer.export_weights()))
+                continue
+            sent = known.get(id(engine))
+            if sent is None:
+                sent = SentWeights()
+            with sent.push(trainer) as stream:
+                engine.update_weights(count(stream))
+            self._sent.append((engine, sent))
         return {"weight_sync/bytes": float(counted[0]), "weight_sync/seconds": time.perf_counter() - t0}
 
 

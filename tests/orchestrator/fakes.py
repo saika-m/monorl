@@ -28,6 +28,7 @@ from monorl.core.types import (
     SamplingParams,
     StepResult,
     Trajectory,
+    prompt_caps,
 )
 
 ENGINES: list[FakeEngine] = []
@@ -109,6 +110,9 @@ class FakeEngine:
     * ``fake_mismatch``: prepend a token that the text does not re-tokenise to (prefix mismatch).
     * ``fake_finish``: finish_reason for every completion.  ``fake_no_logprobs``: logprobs=None.
     * ``fake_latency``: seconds slept per ``generate`` call.
+
+    An answer longer than the cap of its prompt (``params.max_new_tokens``, or the prompt's entry
+    of ``max_new_tokens``) is cut there and finishes with ``length``.
     """
 
     def __init__(self, config: RunConfig, replica: int = 0, **_: Any) -> None:
@@ -144,13 +148,15 @@ class FakeEngine:
             return last_user_text(prompt_text).upper()
         return last_user_text(prompt_text).upper() if i % 2 == 0 else "wrong"
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
         if self.latency:
             time.sleep(self.latency)
         with self._lock:
             self.calls.append({"num_prompts": len(prompts), "n": params.n, "temperature": params.temperature})
         out: list[list[Completion]] = []
-        for prompt in prompts:
+        for prompt, cap in zip(prompts, prompt_caps(params, len(prompts), max_new_tokens), strict=True):
             if prompt and isinstance(prompt[0], dict):
                 prompt_ids = self._tokenizer.apply_chat_template(
                     prompt, add_generation_prompt=True, tokenize=True
@@ -162,6 +168,10 @@ class FakeEngine:
             for _ in range(params.n):
                 text = self._respond(prompt_text)
                 ids = self._tokenizer.encode(text) + [self._tokenizer.eos_token_id]
+                finish = self.finish
+                if len(ids) > cap:
+                    ids, finish = ids[:cap], "length"
+                    text = self._tokenizer.decode(ids, skip_special_tokens=True)
                 if self.mismatch:
                     ids = [9999] + ids
                 comps.append(
@@ -169,7 +179,7 @@ class FakeEngine:
                         text=text,
                         token_ids=ids,
                         logprobs=None if self.no_logprobs else [-(0.1 + 0.01 * j) for j in range(len(ids))],
-                        finish_reason=self.finish,
+                        finish_reason=finish,
                         prompt_token_ids=list(prompt_ids),
                     )
                 )
@@ -209,13 +219,15 @@ class SlowCancellableEngine(FakeEngine):
         self._cancel_epoch = 0
         super().__init__(config, replica, **kwargs)
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
         with self._cancel_cv:
             epoch = self._cancel_epoch
             self.generating.set()
             if self._cancel_cv.wait_for(lambda: self._cancel_epoch != epoch, timeout=self.generate_seconds):
                 raise GenerationCancelled("fake generation cancelled")
-        return super().generate(prompts, params)
+        return super().generate(prompts, params, max_new_tokens=max_new_tokens)
 
     def cancel(self) -> None:
         with self._cancel_cv:
@@ -452,10 +464,12 @@ class FakeBatchingEngine:
         self._lock = threading.Lock()
         BATCHING_ENGINES.append(self)
 
-    def generate(self, prompts: Sequence[Any], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self, prompts: Sequence[Any], params: SamplingParams, *, max_new_tokens: Sequence[int] | None = None
+    ) -> list[list[Completion]]:
         with self._lock:
             self.generate_calls += 1
-        return self.engine.generate(prompts, params)
+        return self.engine.generate(prompts, params, max_new_tokens=max_new_tokens)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.engine, name)

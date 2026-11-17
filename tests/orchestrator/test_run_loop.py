@@ -308,7 +308,7 @@ def test_eval_every_logs_greedy_eval_metrics(make_config: Any, tmp_path: Path) -
     assert [r["step"] for r in eval_rows] == [2]
     assert eval_rows[0]["eval/reward_mean"] == 1.0 and eval_rows[0]["eval/num_samples"] == 2
     greedy_calls = [c for c in fakes.ENGINES[-1].calls if c["temperature"] == 0.0]
-    assert len(greedy_calls) == 2
+    assert sum(c["num_prompts"] for c in greedy_calls) == 2  # both eval prompts, decoded greedily
 
 
 def test_failure_is_recorded_in_status_and_log(make_config: Any) -> None:

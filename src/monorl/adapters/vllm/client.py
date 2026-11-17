@@ -12,18 +12,23 @@ Endpoints used (vLLM v0.33.0 unless noted):
   ``SamplingParams.top_logprobs = k``: ``logprobs=k`` and ``return_tokens_as_token_ids=true`` →
   ``choices[i].logprobs.top_logprobs`` (``{"token_id:<id>": logprob}`` per position). The server
   must allow that many: ``--max-logprobs`` ≥ ``k`` (``k + 1`` for the chat endpoint; default 20)
-  and ``--logprobs-mode processed_logprobs``.
+  and ``--logprobs-mode processed_logprobs``. A request has one ``max_tokens`` for all its
+  prompts (``CompletionRequest.max_tokens``), so the text prompts of a ``generate`` call go out
+  as one request per distinct cap, in flight together.
 * ``POST /v1/chat/completions`` (``vllm/entrypoints/openai/chat_completion/protocol.py``) for
   prompts with image parts: ``messages`` with ``image_url`` data URLs, ``logprobs=true,
   top_logprobs=0`` and ``return_token_ids=true``. The chat endpoint's logprob entries only carry
   token *strings*, so token ids come from ``choices[i].token_ids`` and the prompt ids the server
   conditioned on (chat template + image placeholders rendered server-side) from the
-  response-level ``prompt_token_ids``. One request per prompt (a chat request is one conversation).
+  response-level ``prompt_token_ids``. One request per prompt (a chat request is one
+  conversation); the requests of a ``generate`` call are in flight together.
 * ``POST /sleep?level=N``, ``POST /wake_up``, ``GET /is_sleeping``
   (``vllm/entrypoints/serve/dev/sleep/api_router.py``, enabled by ``VLLM_SERVER_DEV_MODE=1``).
 * ``POST /reset_prefix_cache`` (``vllm/entrypoints/serve/dev/cache/api_router.py``).
-* ``POST /update_named_param``, ``POST /load_weights_from_path``,
-  ``POST /monorl/finish_weight_update``, ``GET /monorl/info`` — monorl additions.
+* ``POST /monorl/update_weights``, ``POST /load_weights_from_path``,
+  ``POST /monorl/finish_weight_update``, ``GET /monorl/info`` — monorl additions. A weight update
+  goes out as requests of at most ``rollout.extra.weight_request_bytes`` of tensor data each (a
+  larger tensor has a request to itself), streamed from the tensors' own memory.
 * ``GET /metrics`` (``vllm/entrypoints/serve/instrumentator/metrics.py``): Prometheus text with
   the speculative-decoding counters (``vllm/v1/spec_decode/metrics.py``), absent when the server
   runs with ``--disable-log-stats`` or does not draft.
@@ -44,19 +49,23 @@ import concurrent.futures
 import logging
 import os
 import threading
-from collections.abc import Iterable, Sequence
-from typing import Any
+from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator, Sequence
+from typing import Any, TypeVar
 
 import httpx
 import torch
 
 from monorl.adapters.vllm.common import (
+    DEFAULT_IMAGE_CACHE_BYTES,
+    WEIGHTS_MEDIA_TYPE,
+    ImageUrlCache,
     SpeculationCounters,
     chat_completion_kwargs,
     chat_completion_messages,
+    chunk_weights,
     completions_from_chat_response,
     completions_from_choices,
-    dtype_name,
+    encode_weights,
     is_media_prompt,
     prometheus_samples,
     prompt_token_ids,
@@ -64,15 +73,30 @@ from monorl.adapters.vllm.common import (
     spec_decode_totals,
     speculative_config,
     speculative_serve_flag,
-    tensor_to_bytes,
 )
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError, GenerationCancelled
-from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats
+from monorl.core.types import Completion, PromptInput, SamplingParams, SpeculationStats, prompt_caps
 from monorl.mtp import checkpoint_key, is_wire_name
 
 log = logging.getLogger(__name__)
+_T = TypeVar("_T")
 _ALL_TAGS: tuple[str, ...] = ("weights", "kv_cache")
+_UPDATE_WEIGHTS_PATH = "/monorl/update_weights"
+DEFAULT_WEIGHT_REQUEST_BYTES = 64 * 1024 * 1024
+
+
+class _StatusError(RuntimeError):
+    """The server answered a request with an error status."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+async def _stream(pieces: Iterator[bytes | memoryview]) -> AsyncIterator[bytes | memoryview]:
+    for piece in pieces:
+        yield piece
 
 
 def server_url(config: RunConfig, replica: int) -> str:
@@ -99,15 +123,23 @@ class _GenerateCall:
 
     def __init__(self) -> None:
         self.cancelled = False
-        self.request: concurrent.futures.Future[httpx.Response] | None = None
-        """The HTTP request the call is blocked on, if any."""
+        self.request: concurrent.futures.Future[Any] | None = None
+        """The HTTP request, or the group of concurrent ones, the call is blocked on, if any."""
 
 
 class VllmServerClient:
     """``rollout_engine: vllm`` with ``rollout.extra.mode='server'``.
 
     ``rollout.extra`` keys: ``url``/``urls``, ``model_name`` (served model name, defaults to
-    ``model.name_or_path``), ``timeout`` seconds per request (default: none), ``sleep_level``.
+    ``model.name_or_path``), ``timeout`` seconds per request (default: none), ``sleep_level``,
+    ``weight_request_bytes`` (tensor bytes per weight-update request, default 64 MiB: what the
+    server holds of an update at a time, unless a single tensor is larger) and
+    ``image_cache_bytes`` (bound on the image data URLs kept for re-sending, default 256 MiB).
+
+    Text prompts are one completion request per distinct generation cap (one request, unless
+    the call carries caps per prompt) and prompts with images one chat request each. The requests
+    of a kind are sent together: a server-side error of any of them fails the call with that
+    request's error and drops the others.
 
     ``cancel()`` disconnects the completion requests in flight, which makes the server abort
     their generation, and fails the ``generate`` calls waiting for the lock; all of them raise
@@ -142,10 +174,14 @@ class VllmServerClient:
 
             tokenizer = load_tokenizer(config)
         self._tokenizer = tokenizer
+        self._weight_request_bytes = int(extra.get("weight_request_bytes", DEFAULT_WEIGHT_REQUEST_BYTES))
+        self._images = ImageUrlCache(int(extra.get("image_cache_bytes", DEFAULT_IMAGE_CACHE_BYTES)))
         timeout = extra.get("timeout")
         self._client = httpx.AsyncClient(
             base_url=self._url,
-            timeout=httpx.Timeout(None if timeout is None else float(timeout)),
+            # The timeout bounds the server's answer, not the wait for a free connection: the
+            # chat requests of one generate call can outnumber the pool.
+            timeout=httpx.Timeout(None if timeout is None else float(timeout), pool=None),
             transport=transport,
         )
         self._loop = asyncio.new_event_loop()
@@ -175,10 +211,20 @@ class VllmServerClient:
     def url(self) -> str:
         return self._url
 
-    def generate(self, prompts: Sequence[PromptInput], params: SamplingParams) -> list[list[Completion]]:
+    def generate(
+        self,
+        prompts: Sequence[PromptInput],
+        params: SamplingParams,
+        *,
+        max_new_tokens: Sequence[int] | None = None,
+    ) -> list[list[Completion]]:
         if not prompts:
             return []
-        text_idx = [i for i, p in enumerate(prompts) if not is_media_prompt(p)]
+        caps = prompt_caps(params, len(prompts), max_new_tokens)
+        text_idx: dict[int, list[int]] = {}  # generation cap -> its text prompts
+        for i, p in enumerate(prompts):
+            if not is_media_prompt(p):
+                text_idx.setdefault(caps[i], []).append(i)
         media_idx = [i for i, p in enumerate(prompts) if is_media_prompt(p)]
         result: list[list[Completion] | None] = [None] * len(prompts)
         call = _GenerateCall()
@@ -188,35 +234,49 @@ class VllmServerClient:
             with self._lock:
                 self._wake(_ALL_TAGS)
                 if text_idx:
-                    ids = [prompt_token_ids(self._tokenizer, prompts[i]) for i in text_idx]
-                    body: dict[str, Any] = {
-                        "model": self._model_name,
-                        "prompt": ids,
-                        "return_token_ids": True,
-                        **sampling_kwargs(params),
+                    ids = {
+                        cap: [prompt_token_ids(self._tokenizer, prompts[i]) for i in indices]
+                        for cap, indices in text_idx.items()
                     }
-                    if params.top_logprobs > 0:
-                        body["return_tokens_as_token_ids"] = True
-                    resp = self._post("/v1/completions", call=call, json=body)
-                    grouped = completions_from_choices(
-                        resp.json()["choices"],
-                        ids,
-                        params.n,
-                        want_logprobs=params.logprobs,
-                        top_logprobs=params.top_logprobs,
-                    )
-                    for i, comps in zip(text_idx, grouped, strict=True):
-                        result[i] = comps
-                for i in media_idx:
-                    body = {
-                        "model": self._model_name,
-                        "messages": chat_completion_messages(prompts[i]),  # type: ignore[arg-type]
-                        **chat_completion_kwargs(params),
-                    }
-                    resp = self._post("/v1/chat/completions", call=call, json=body)
-                    result[i] = completions_from_chat_response(
-                        resp.json(), params.n, want_logprobs=params.logprobs, top_logprobs=params.top_logprobs
-                    )
+                    bodies: list[dict[str, Any]] = []
+                    for cap, cap_ids in ids.items():
+                        body: dict[str, Any] = {
+                            "model": self._model_name,
+                            "prompt": cap_ids,
+                            "return_token_ids": True,
+                            **sampling_kwargs(params, cap),
+                        }
+                        if params.top_logprobs > 0:
+                            body["return_tokens_as_token_ids"] = True
+                        bodies.append(body)
+                    responses = self._run(self._post_each("/v1/completions", bodies), call)
+                    for (cap, indices), resp in zip(text_idx.items(), responses, strict=True):
+                        grouped = completions_from_choices(
+                            resp.json()["choices"],
+                            ids[cap],
+                            params.n,
+                            want_logprobs=params.logprobs,
+                            top_logprobs=params.top_logprobs,
+                        )
+                        for i, comps in zip(indices, grouped, strict=True):
+                            result[i] = comps
+                if media_idx:
+                    bodies = [
+                        {
+                            "model": self._model_name,
+                            "messages": chat_completion_messages(prompts[i], self._images),  # type: ignore[arg-type]
+                            **chat_completion_kwargs(params, caps[i]),
+                        }
+                        for i in media_idx
+                    ]
+                    responses = self._run(self._post_each("/v1/chat/completions", bodies), call)
+                    for i, resp in zip(media_idx, responses, strict=True):
+                        result[i] = completions_from_chat_response(
+                            resp.json(),
+                            params.n,
+                            want_logprobs=params.logprobs,
+                            top_logprobs=params.top_logprobs,
+                        )
         finally:
             with self._calls_lock:
                 self._calls.discard(call)
@@ -232,26 +292,33 @@ class VllmServerClient:
                     call.request.cancel()
 
     def update_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        if not self._drafting:
+            # The server does not draft: the MTP layers the trainer holds are not its business.
+            weights = ((name, tensor) for name, tensor in weights if not is_wire_name(name))
         with self._lock:
             self._wake(("weights",))
-            for name, tensor in weights:
-                t = tensor.detach()
-                params = {
-                    "name": name,
-                    "dtype": dtype_name(t.dtype),
-                    "shape": ",".join(str(s) for s in t.shape),
-                }
-                if is_wire_name(name):  # an MTP weight: to the drafter, under its checkpoint key
-                    if not self._drafting:
-                        continue  # the server does not draft: MTP layers are not its business
-                    params["name"] = checkpoint_key(name)
-                    params["mtp"] = "true"
-                self._post(
-                    "/update_named_param",
-                    params=params,
-                    content=tensor_to_bytes(t),
-                    headers={"content-type": "application/octet-stream"},
+            for chunk in chunk_weights(weights, max_bytes=self._weight_request_bytes):
+                # Tagged names are MTP weights: to the drafter, under their checkpoint keys.
+                length, pieces = encode_weights(
+                    [
+                        (checkpoint_key(name), tensor, True) if is_wire_name(name) else (name, tensor, False)
+                        for name, tensor in chunk
+                    ]
                 )
+                try:
+                    self._post(
+                        _UPDATE_WEIGHTS_PATH,
+                        content=_stream(pieces),
+                        headers={"content-type": WEIGHTS_MEDIA_TYPE, "content-length": str(length)},
+                    )
+                except _StatusError as e:
+                    if e.status != 404:
+                        raise
+                    raise RuntimeError(
+                        f"the vLLM server {self._url} has no {_UPDATE_WEIGHTS_PATH}: it is not a monorl "
+                        "server, or one of a monorl version with another weight transfer; run the same "
+                        "monorl version on the trainer and on the vLLM server"
+                    ) from None
             if self._drafting:
                 self._post("/monorl/finish_weight_update")
             self._post("/reset_prefix_cache")
@@ -341,29 +408,52 @@ class VllmServerClient:
         self._post("/wake_up", params=[("tags", t) for t in pending])
         self._sleeping_tags.difference_update(pending)
 
-    def _post(self, path: str, *, call: _GenerateCall | None = None, **kwargs: Any) -> httpx.Response:
-        return self._request("POST", path, call=call, **kwargs)
+    def _post(self, path: str, **kwargs: Any) -> httpx.Response:
+        return self._request("POST", path, **kwargs)
 
-    def _request(
-        self, method: str, path: str, *, call: _GenerateCall | None = None, **kwargs: Any
-    ) -> httpx.Response:
-        """Send a request on the client's event loop and wait for the response. With ``call`` the
-        request belongs to that ``generate`` call and :meth:`cancel` can abandon it."""
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Send a request on the client's event loop and wait for the response."""
+        return self._run(self._send(method, path, **kwargs), None)
+
+    def _run(self, sending: Coroutine[Any, Any, _T], call: _GenerateCall | None) -> _T:
+        """Run ``sending`` on the client's event loop and wait for its result. With ``call`` it
+        belongs to that ``generate`` call and :meth:`cancel` can abandon it."""
         with self._calls_lock:
             if call is not None and call.cancelled:
+                sending.close()
                 raise GenerationCancelled("generation cancelled")
-            request = asyncio.run_coroutine_threadsafe(
-                self._client.request(method, path, **kwargs), self._loop
-            )
+            request = asyncio.run_coroutine_threadsafe(sending, self._loop)
             if call is not None:
                 call.request = request
         try:
-            resp = request.result()
+            return request.result()
         except concurrent.futures.CancelledError:  # only cancel() cancels a request
             raise GenerationCancelled("generation cancelled") from None
         except BaseException:
             request.cancel()  # interrupted while waiting (KeyboardInterrupt): drop the request too
             raise
+
+    async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        resp = await self._client.request(method, path, **kwargs)
         if resp.status_code >= 400:
-            raise RuntimeError(f"vLLM server {self._url}{path} -> {resp.status_code}: {resp.text[:500]}")
+            raise _StatusError(
+                f"vLLM server {self._url}{path} -> {resp.status_code}: {resp.text[:500]}", resp.status_code
+            )
         return resp
+
+    async def _post_each(self, path: str, bodies: Sequence[dict[str, Any]]) -> list[httpx.Response]:
+        """POST every body to ``path`` at once; the responses in the order of ``bodies``. The
+        first request to fail fails the group with its error (the earliest in ``bodies`` when
+        several have failed by then), and the requests still in flight are dropped, as they are
+        when the group is cancelled."""
+        tasks = [asyncio.ensure_future(self._send("POST", path, json=body)) for body in bodies]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for task in tasks:
+                if task.done() and task.exception() is not None:
+                    raise task.exception()  # type: ignore[misc]
+            return [task.result() for task in tasks]
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

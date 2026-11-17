@@ -153,12 +153,11 @@ def fit_to_greedy(
         pad_token_id=model.config.pad_token_id,
         eos_token_id=model.config.eos_token_id,
     )
-    last_layer = [model.config.get_text_config().num_hidden_layers - 1]
     examples = []
     with torch.no_grad():
         for prompt in prompts:
             ids = model.generate(input_ids=torch.tensor([prompt]), generation_config=config)
-            hidden = model(input_ids=ids, output_hidden_states=last_layer).hidden_states[-1]
+            hidden = layers.last_hidden_states(model(input_ids=ids, **layers.last_hidden_request))
             mask = torch.zeros_like(ids)
             mask[:, len(prompt) :] = 1
             examples.append((hidden, ids, mask))
