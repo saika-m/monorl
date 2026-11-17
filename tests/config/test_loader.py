@@ -6,8 +6,12 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
+from monorl.config import loader
 from monorl.config.loader import apply_overrides, load_yaml
+from monorl.config.pipeline import PipelineConfig
+from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError
 
 
@@ -75,3 +79,89 @@ def test_an_override_into_a_list_says_to_replace_the_list() -> None:
     replaced = apply_overrides(data, ["rewards=[{type: length, weight: 2}]", "model.lora.r=8"])
     assert replaced["rewards"] == [{"type": "length", "weight": 2}]
     assert replaced["model"] == {"lora": {"r": 8}}
+
+
+# -- secrets read from the environment ------------------------------------------------------------
+
+API_KEY = "sk-test-0123456789abcdef"
+
+
+@pytest.fixture
+def forget_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The loader remembers secrets for the life of the process: each test starts with none."""
+    monkeypatch.setattr(loader, "_secrets", {})
+
+
+def _config_file(tmp_path: Path, params: str) -> Path:
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        "model: {name_or_path: org/model}\n"
+        "data: {uri: d.jsonl}\n"
+        "rewards:\n"
+        "  - type: exact_match\n"
+        f"    params: {params}\n"
+    )
+    return path
+
+
+def test_a_written_config_names_the_variable_of_a_secret_and_loads_back_to_its_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forget_secrets: None
+) -> None:
+    monkeypatch.setenv("JUDGE_API_KEY", API_KEY)
+    params = '{api_key: "${JUDGE_API_KEY}", url: "https://judge.example/v1?key=${JUDGE_API_KEY}&n=1"}'
+    cfg = RunConfig.from_yaml(_config_file(tmp_path, params))
+    assert cfg.rewards[0].params == {
+        "api_key": API_KEY,
+        "url": f"https://judge.example/v1?key={API_KEY}&n=1",
+    }
+
+    written = tmp_path / "written.yaml"
+    text = cfg.to_yaml(written)
+    assert API_KEY not in text and API_KEY not in written.read_text()
+    assert yaml.safe_load(text)["rewards"][0]["params"] == {
+        "api_key": "${JUDGE_API_KEY}",
+        "url": "https://judge.example/v1?key=${JUDGE_API_KEY}&n=1",
+    }
+    assert RunConfig.from_yaml(written) == cfg
+
+    monkeypatch.delenv("JUDGE_API_KEY")
+    with pytest.raises(ConfigError, match=r"environment variable JUDGE_API_KEY is not set"):
+        RunConfig.from_yaml(written)
+
+
+def test_a_secret_that_came_from_the_default_is_not_written_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forget_secrets: None
+) -> None:
+    monkeypatch.delenv("JUDGE_TOKEN", raising=False)
+    cfg = RunConfig.from_yaml(_config_file(tmp_path, '{token: "${JUDGE_TOKEN:-fallback-token-0123}"}'))
+    assert cfg.rewards[0].params == {"token": "fallback-token-0123"}
+    text = cfg.to_yaml()
+    assert "fallback-token-0123" not in text
+    assert yaml.safe_load(text)["rewards"][0]["params"] == {"token": "${JUDGE_TOKEN}"}
+
+
+def test_a_pipeline_config_is_written_without_the_secret_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forget_secrets: None
+) -> None:
+    monkeypatch.setenv("JUDGE_API_KEY", API_KEY)
+    base = load_yaml(_config_file(tmp_path, '{api_key: "${JUDGE_API_KEY}"}'))
+    stage = {"type": "train", "name": "rl", "overrides": {"env": {"params": {"password": API_KEY}}}}
+    cfg = PipelineConfig.from_dict({"base": base, "stages": [stage]})
+    written = tmp_path / "pipeline.yaml"
+    assert API_KEY not in cfg.to_yaml(written)
+    assert PipelineConfig.from_yaml(written) == cfg
+
+
+def test_a_variable_that_is_not_named_like_a_secret_and_a_short_value_are_written_as_they_are(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forget_secrets: None
+) -> None:
+    monkeypatch.setenv("JUDGE_ENDPOINT", "https://judge.example/v1")
+    monkeypatch.setenv("JUDGE_API_KEY", "short")
+    params = '{url: "${JUDGE_ENDPOINT}", api_key: "${JUDGE_API_KEY}", mode: "${JUDGE_KEY_MODE:-strict}"}'
+    cfg = RunConfig.from_yaml(_config_file(tmp_path, params))
+    written = yaml.safe_load(cfg.to_yaml())
+    assert written["rewards"][0]["params"] == {
+        "url": "https://judge.example/v1",
+        "api_key": "short",
+        "mode": "strict",
+    }

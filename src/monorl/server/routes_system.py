@@ -10,7 +10,7 @@ from typing import Any
 import yaml
 from fastapi import APIRouter, Request
 
-from monorl.config.loader import load_yaml
+from monorl.config.loader import load_yaml, mask_secrets
 from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
 from monorl.config.recipes import read_description, recipe_files
 from monorl.config.schema import RunConfig
@@ -65,8 +65,9 @@ def config_validate(body: dict[str, Any]) -> dict[str, Any]:
         }
     try:
         if key == "pipeline":
-            return {"ok": True, "errors": [], "pipeline": PipelineConfig.from_dict(payload).to_dict()}
-        return {"ok": True, "errors": [], "config": RunConfig.from_dict(payload).to_dict()}
+            config = PipelineConfig.from_dict(payload).to_dict()
+            return {"ok": True, "errors": [], "pipeline": mask_secrets(config)}
+        return {"ok": True, "errors": [], "config": mask_secrets(RunConfig.from_dict(payload).to_dict())}
     except ConfigError as e:
         return {"ok": False, "errors": validation_errors(e)}
 
@@ -98,7 +99,7 @@ def load_recipes(recipes_dir: Path) -> list[dict[str, Any]]:
                 "name": path.stem,
                 "kind": kind,
                 "description": read_description(path),
-                "config": config,
+                "config": mask_secrets(config),
                 "path": str(path),
                 "valid": valid,
                 "errors": errors,

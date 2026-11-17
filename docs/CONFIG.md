@@ -11,6 +11,13 @@ each section.
 Unknown keys are rejected. A key marked "required" has no default. Bounds on numbers are listed
 with the type.
 
+A string of a config file may read the environment: `${NAME}` is replaced with the value of the
+variable `NAME` when the file is loaded, `${NAME:-default}` with `default` when the variable is not
+set, and `${NAME}` of a variable that is not set is an error. Values given with `--set` or sent to
+the API are taken as written. Name a variable that holds a secret with `KEY`, `TOKEN`, `SECRET`,
+`PASSWORD`, `PASSWD` or `CREDENTIAL` in its name: the run then writes `${NAME}` instead of the value
+to its directory and to W&B (see [`config.yaml` in RUNS.md](RUNS.md#configyaml)).
+
 ## Top-level fields
 
 See: [RUNS.md](RUNS.md)

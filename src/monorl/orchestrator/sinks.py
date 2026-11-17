@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from monorl.config.loader import mask_secrets
+
 if TYPE_CHECKING:
     from monorl.config.schema import RunConfig
     from monorl.core.reporting import RunReporter
@@ -33,7 +35,7 @@ class MetricSinks:
                     project=logging.wandb_project,
                     name=config.run_name,
                     dir=str(run_dir),
-                    config=config.to_dict(),
+                    config=mask_secrets(config.to_dict()),
                     resume="allow",
                 )
                 reporter.log(

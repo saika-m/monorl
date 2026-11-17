@@ -15,6 +15,7 @@ import fakes
 import pytest
 import yaml
 
+from monorl.config.pipeline import PipelineConfig
 from monorl.core.registry import registry
 from monorl.core.reporting import iter_metrics, iter_trajectories, read_status
 from monorl.pipeline import PipelineResult, read_manifest, run_pipeline
@@ -477,3 +478,28 @@ def test_sigterm_aborts_sampling_stage_generation_in_flight(
     assert engine.shutdown_count >= 1
     leftovers = ("monorl-episode", "monorl-batching")
     assert not [t.name for t in threading.enumerate() if t.name.startswith(leftovers)]
+
+
+def test_no_file_of_the_pipeline_directory_holds_a_secret_of_the_config(
+    make_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``api_key: ${JUDGE_API_KEY}`` in the base config: ``pipeline.yaml``, the manifest and the
+    ``config.yaml`` of every stage name the variable, and the pipeline file loads back."""
+    from monorl.config import loader
+
+    api_key = "sk-pipeline-0123456789abcdef"
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("JUDGE_API_KEY", api_key)
+    rewards = [{"type": "test_exact", "params": {"api_key": "${JUDGE_API_KEY}"}}]
+    source = tmp_path / "user-pipeline.yaml"
+    source.write_text(yaml.safe_dump(make_pipeline(rewards=rewards).to_dict()))
+    cfg = PipelineConfig.from_yaml(source)
+    assert cfg.base.rewards[0].params == {"api_key": api_key}
+
+    result = run_pipeline(cfg)
+    assert result.state == "succeeded"
+    run_dir = Path(result.run_dir)
+    files = [p for p in run_dir.rglob("*") if p.is_file()]
+    assert len([p for p in files if p.name == "config.yaml"]) == len(cfg.stages)
+    assert [str(p.relative_to(run_dir)) for p in files if api_key.encode() in p.read_bytes()] == []
+    assert PipelineConfig.from_yaml(run_dir / "pipeline.yaml") == cfg

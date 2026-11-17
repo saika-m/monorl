@@ -26,6 +26,8 @@ from sink_support import (
     tensorboard_points,
 )
 
+from monorl.config import loader
+from monorl.config.schema import RunConfig
 from monorl.core.reporting import RunReporter
 from monorl.orchestrator import run
 from monorl.orchestrator.sinks import MetricSinks
@@ -100,6 +102,39 @@ def test_every_number_of_a_metrics_row_reaches_both_sinks_under_its_name(
     log = (reporter.run_dir / "run.log").read_text()
     assert f"wandb: new run {wandb_run.id} in project monorl-test" in log
     assert f"tensorboard: events in {reporter.run_dir / 'tensorboard'}" in log
+
+
+def test_wandb_gets_the_config_with_the_variable_of_a_secret_not_its_value(
+    tmp_path: Path, fake_components: Any, packages: FakeSinkPackages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``api_key: ${JUDGE_API_KEY}`` in a config file: the W&B server stores the config of a run,
+    so it is given the reference the file has. TensorBoard is given no config."""
+    monkeypatch.setattr(loader, "_secrets", {})
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-sink-0123456789abcdef")
+    monkeypatch.setenv("JUDGE_ENDPOINT", "https://judge.example/v1")
+    params = {"api_key": "${JUDGE_API_KEY}", "url": "${JUDGE_ENDPOINT}", "auth": "Bearer ${JUDGE_API_KEY}"}
+    data = fakes.fake_config_dict(tmp_path, rewards=[{"type": "test_exact", "params": params}], logging=BOTH)
+    path = tmp_path / "user-config.yaml"
+    path.write_text(yaml.safe_dump(data))
+    cfg = RunConfig.from_yaml(path)
+    assert cfg.rewards[0].params["auth"] == "Bearer sk-sink-0123456789abcdef"
+
+    reporter = RunReporter(tmp_path / "r", echo=False)
+    sinks = MetricSinks(cfg, reporter.run_dir, reporter)
+    sinks.log(1, {"reward/mean": 0.5})
+    sinks.close()
+
+    (wandb_run,) = packages.runs
+    assert "sk-sink-0123456789abcdef" not in repr(wandb_run.init)
+    assert wandb_run.init["config"]["rewards"][0]["params"] == {
+        "api_key": "${JUDGE_API_KEY}",
+        "url": "https://judge.example/v1",
+        "auth": "Bearer ${JUDGE_API_KEY}",
+    }
+    without_rewards = {k: v for k, v in wandb_run.init["config"].items() if k != "rewards"}
+    assert without_rewards == {k: v for k, v in cfg.to_dict().items() if k != "rewards"}
+    (writer,) = packages.writers
+    assert vars(writer) == {"log_dir": str(reporter.run_dir / "tensorboard"), "closed": True}
 
 
 def test_missing_optional_packages_are_logged_and_skipped(

@@ -30,6 +30,7 @@ from typing import Any
 
 import psutil
 
+from monorl.config.loader import mask_secrets
 from monorl.config.pipeline import PipelineConfig, is_pipeline_payload
 from monorl.config.schema import RunConfig
 from monorl.core.errors import MonorlError
@@ -213,7 +214,7 @@ class JobManager:
             "kind": kind,
             "name": name,
             "run_dir": str(run_dir),
-            "config": config,
+            "config": mask_secrets(config),
             "state": "pending",
             "pid": None,
             "created_at": now,

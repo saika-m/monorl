@@ -16,6 +16,7 @@ from typing import Any, Literal, get_args, get_origin
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from monorl.config.loader import mask_secrets
 from monorl.core.errors import ConfigError
 
 #: A dotted module path, as an import statement takes it.
@@ -731,7 +732,7 @@ class RunConfig(_Model):
         return self.model_dump(mode="json")
 
     def to_yaml(self, path: str | Path | None = None) -> str:
-        text = yaml.safe_dump(self.to_dict(), sort_keys=False)
+        text = yaml.safe_dump(mask_secrets(self.to_dict()), sort_keys=False)
         if path is not None:
             Path(path).write_text(text)
         return text
