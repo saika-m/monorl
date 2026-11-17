@@ -815,3 +815,9 @@ def test_env_serve_param_without_a_value_is_named_as_written(runner: CliRunner) 
     assert result.exit_code == 2, result.output
     assert "--param must look like key=value, got 'max_turns'" in result.output
     assert "params." not in result.output
+
+
+def test_version_is_the_installed_distributions(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.output == f"monorl {importlib.metadata.version('monorl')}\n"

@@ -56,6 +56,27 @@ def _fail(message: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
+def _print_version(wanted: bool) -> None:
+    if wanted:
+        from importlib.metadata import version
+
+        typer.echo(f"monorl {version('monorl')}")
+        raise typer.Exit()
+
+
+@app.callback()
+def root(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_print_version,
+        is_eager=True,
+        help="Print the version of the installed monorl and exit.",
+    ),
+) -> None:
+    pass
+
+
 def _recipe_hint(config: Path) -> str:
     """For a ``--config`` that is no file but names a bundled recipe: where that recipe is."""
     from monorl.config.recipes import get_recipe
