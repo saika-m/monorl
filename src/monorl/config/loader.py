@@ -34,12 +34,41 @@ def interpolate_env(value: Any) -> Any:
     return value
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` that refuses a mapping with the same key twice. PyYAML keeps the last
+    one, so a second ``trainer:`` block further down would drop every setting of the first."""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        first_line: dict[Any, int] = {}
+        for key_node, _ in node.value:
+            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = self.construct_object(key_node)
+            line = key_node.start_mark.line + 1
+            if key in first_line:
+                raise yaml.constructor.ConstructorError(
+                    None,
+                    None,
+                    f"the key {key!r} is set twice, on lines {first_line[key]} and {line}; "
+                    "merge the two into one",
+                    key_node.start_mark,
+                )
+            first_line[key] = line
+        return super().construct_mapping(node, deep=deep)
+
+
 def load_yaml(path: str | Path) -> dict[str, Any]:
     p = Path(path).expanduser()
     if not p.exists():
         raise ConfigError(f"config file not found: {p}")
     try:
-        data = yaml.safe_load(p.read_text()) or {}
+        text = p.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ConfigError(f"cannot read config file {p}: {e.strerror or e}") from e
+    except UnicodeDecodeError as e:
+        raise ConfigError(f"config file {p} is not UTF-8 text: {e}") from e
+    try:
+        data = yaml.load(text, Loader=_UniqueKeyLoader) or {}
     except yaml.YAMLError as e:
         raise ConfigError(f"invalid YAML in {p}: {e}") from e
     if not isinstance(data, dict):
