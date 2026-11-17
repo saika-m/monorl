@@ -169,6 +169,22 @@ def test_the_layers_learn_to_draft_the_policys_continuations(
     assert [group["lr"] for group in trainer.optimizer.param_groups] == pytest.approx([3e-3, 3e-3])
 
 
+def test_the_layers_train_on_sequences_without_advantage(mtp_dir: Path, batch: TrainBatch) -> None:
+    """The episodes of a group with equal rewards have no advantage and add nothing to the policy
+    loss; the MTP loss reads their response tokens all the same."""
+    silent = batch.slice(0, len(batch))
+    silent.advantages = torch.zeros_like(batch.advantages)
+    trained = []
+    for item in (batch, silent):
+        trainer = _trainer(mtp_dir, mtp={"train": True}, **EXACT)
+        initial = _layer_params(trainer)
+        metrics = trainer.train_step(item)
+        assert metrics["loss/mtp"] > 0 and metrics["tokens/sequences_skipped"] == 0
+        assert _differ(_layer_params(trainer), initial) > 1e-3
+        trained.append(_layer_params(trainer))
+    _assert_same(*trained, rtol=0, atol=0)  # the trunk is detached: the policy loss does not reach them
+
+
 @LORA
 def test_with_a_detached_trunk_the_policy_takes_the_step_it_takes_without_mtp_training(
     mtp_dir: Path, batch: TrainBatch, lora: bool

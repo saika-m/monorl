@@ -45,6 +45,31 @@ own: with ``detach_trunk`` the policy's update is exactly what it is without MTP
 counts are global across ranks), so the accumulated gradient is the full-batch gradient. Without
 ``train`` the layers are frozen and no forward pass runs through them.
 
+Zero-advantage sequences
+------------------------
+A sequence whose advantage is exactly 0 at every response token adds exactly 0 to the policy loss
+and to its gradient: every episode of a prompt group whose rewards are all equal. ``train_step``
+runs no forward or backward pass for such sequences when the update is the same without them:
+
+* the loss is ``policy_loss`` and nothing else: no injected loss and no ``sft``, ``entropy_coef``
+  0, no ``ref_logprobs`` in the batch (``kl_coef`` 0), no value head (``ppo``) and no MTP training.
+  The off-policy corrections multiply the advantage and stay 0 with it;
+* a forward pass in training mode draws no random numbers (measured at construction; LoRA dropout
+  above 0 does), so leaving one out moves no dropout mask;
+* there is no ``GradScaler`` (``precision: fp16`` on CUDA), which keeps books on every backward;
+* the batch is text alone (no ``extra`` model inputs), its advantages, log-probs and loss weights
+  are finite and its old log-probs above ``-MAX_LOG_RATIO``, so that 0 times the ratio is 0, and
+  its loss weights are zero outside the response mask and add up to something in every sequence.
+
+Otherwise every sequence is computed as before. The loss means keep their denominators over the
+whole batch (response tokens, sequences or weight mass, global across ranks), so the sequences
+that are computed weigh what they weighed, and the parameters such a sequence would have reached
+get a gradient of zeros where they have none: the optimizer then takes the step it takes on a zero
+gradient (momentum, weight decay), also when no sequence is left. ``tokens/sequences_skipped``
+counts them. The metrics in ``ZERO_AT_ZERO_ADVANTAGE`` are 0 for such a sequence and stay means
+over the whole batch; ``loss/entropy``, ``policy/approx_kl``, ``policy/ratio_mean`` and the
+score-centering metrics are over the sequences that were computed and absent when none was.
+
 Data parallelism
 ----------------
 With ``world_size > 1`` (``rank``/``world_size`` kwargs, else ``RANK``/``WORLD_SIZE`` env) every
@@ -136,6 +161,13 @@ CHECKPOINT_ADAPTER = "adapter"
 #: ``ppo`` gives its critic the same factor).
 VALUE_LR_SCALE = 10.0
 GRAD_BUCKET_BYTES = 64 << 20
+#: Metrics of ``policy_loss`` that are exactly 0 for a sequence whose advantages are 0 (and whose
+#: batch has no ``ref_logprobs``), whatever the model says about it.
+ZERO_AT_ZERO_ADVANTAGE = ("loss/policy", "loss/total", "loss/kl", "policy/clipfrac")
+#: ``exp`` of a log-ratio up to this is finite in float32 (and 0 times it is 0).
+MAX_LOG_RATIO = 80.0
+#: Ten times the floor ``masked_aggregate`` puts under the weight mass of a micro-batch.
+MIN_WEIGHT_MASS = 1e-7
 
 
 def _resolve_rank(rank: int | None, world_size: int | None) -> tuple[int, int]:
@@ -382,6 +414,7 @@ class ReferenceTrainer:
         self.scheduler = self._build_scheduler()
         self._reference_model: nn.Module | None = None
         self._narrow_head = self._head_narrows()
+        self._zero_grads = self._zero_advantage_grads()
 
     def shutdown(self) -> None:
         """Leaves the process group this trainer created (no-op for single-process runs)."""
@@ -430,25 +463,21 @@ class ReferenceTrainer:
             )
         return module
 
-    @torch.no_grad()
-    def _head_narrows(self) -> bool:
-        """Whether the model's logits at chosen positions are what it returns when its output
-        embedding sees the final hidden states of those positions only (:meth:`_head_input`).
-        Compared on two short token sequences against the full logits; a model that calls the
-        embedding more than once, on something that is not ``[B, T, H]``, or that reshapes, slices
-        or normalises the logits across positions afterwards fails or disagrees."""
+    def _probe_batch(self) -> TrainBatch | None:
+        """Two short sequences of plain tokens with three wanted positions, for the checks of the
+        model's own behaviour at construction; ``None`` for a model without the embeddings."""
         embedding = self.hf_model.get_input_embeddings()
         if self.hf_model.get_output_embeddings() is None or embedding is None:
-            return False
+            return None
         # Plain tokens: an id the config gives a role (image placeholder, padding) is no text.
         special = {v for k, v in self.hf_model.config.to_dict().items() if k.endswith("token_id")}
         ids = [i for i in range(min(embedding.weight.shape[0], 64)) if i not in special][:12]
         if len(ids) < 4:
-            return False
+            return None
         input_ids = torch.tensor([ids, ids[::-1]], dtype=torch.long)
         wanted = torch.zeros_like(input_ids)
         wanted[0, 1] = wanted[0, -1] = wanted[1, 2] = 1  # ragged: another count in every row
-        probe = TrainBatch(
+        return TrainBatch(
             input_ids=input_ids,
             attention_mask=torch.ones_like(input_ids),
             response_mask=wanted,
@@ -456,6 +485,17 @@ class ReferenceTrainer:
             rewards=torch.zeros(2),
             group_ids=["", ""],
         ).to(self.device)
+
+    @torch.no_grad()
+    def _head_narrows(self) -> bool:
+        """Whether the model's logits at chosen positions are what it returns when its output
+        embedding sees the final hidden states of those positions only (:meth:`_head_input`).
+        Compared on two short token sequences against the full logits; a model that calls the
+        embedding more than once, on something that is not ``[B, T, H]``, or that reshapes, slices
+        or normalises the logits across positions afterwards fails or disagrees."""
+        probe = self._probe_batch()
+        if probe is None:
+            return False
         rows = head_rows(probe.response_mask)
         was_training = self.model.training
         self.model.eval()  # no dropout: both passes compute the same function, and draw no random numbers
@@ -469,7 +509,7 @@ class ReferenceTrainer:
             return False
         finally:
             self.model.train(was_training)
-        if full.dim() != 3 or full.shape[:2] != input_ids.shape:
+        if full.dim() != 3 or full.shape[:2] != probe.input_ids.shape:
             return False
         expected = full[:, :-1][rows].float()
         if narrow.shape != expected.shape:
@@ -482,6 +522,109 @@ class ReferenceTrainer:
         if not same:
             log.info("output head is applied at every position: its logits depend on the other positions")
         return same
+
+    def _zero_advantage_grads(self) -> list[nn.Parameter] | None:
+        """The parameters to which a text sequence with zero advantages gives a gradient of zero
+        (not none: the optimizer steps those and skips the others), or ``None`` when ``train_step``
+        has to compute such sequences (module docstring): the loss is not ``policy_loss`` alone, a
+        ``GradScaler`` keeps books on every backward pass, or a pass in training mode draws random
+        numbers, so that leaving one out would shift the dropout masks of everything after it.
+        The last is measured: one pass over the probe batch must leave every generator where it
+        was (they are put back when it does not)."""
+        from monorl.algorithms import policy_loss
+
+        if (
+            self.loss_fn is not policy_loss
+            or self.value_head is not None
+            or self._mtp_params
+            or self.scaler is not None
+        ):
+            return None
+        probe = self._probe_batch()
+        if probe is None:
+            return None
+        before = self._rng_states()
+        reached: list[nn.Parameter] | None = None
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(self._autocast())
+                if self._narrow_head:
+                    stack.enter_context(self._head_input(self.model, head_rows(probe.response_mask)))
+                logits = self._forward(self.model, probe)
+            (logits.float().sum() * 0.0).backward()
+            reached = [p for p in self._policy_params if p.grad is not None]
+        except (RuntimeError, IndexError, ValueError, TypeError) as exc:
+            log.info("sequences with zero advantages are computed: %s", exc)
+        finally:
+            self.optimizer.zero_grad(set_to_none=True)
+        if self._rng_moved(before):
+            log.info("sequences with zero advantages are computed: a training pass draws random numbers")
+            return None
+        return reached
+
+    def _rng_states(self) -> dict[str, Any]:
+        """The generators a pass of the model can draw from: the ones a checkpoint stores and the
+        device's own."""
+        states = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+        if self.device.type == "cuda":
+            states["device"] = torch.cuda.get_rng_state(self.device)
+        elif self.device.type == "mps":
+            states["device"] = torch.mps.get_rng_state()
+        return states
+
+    def _rng_moved(self, before: dict[str, Any]) -> bool:
+        """Whether a generator has left the state ``before`` (:meth:`_rng_states`); it is back there
+        afterwards."""
+        now = self._rng_states()
+        moved = (
+            now["python"] != before["python"]
+            or not all(np.array_equal(a, b) for a, b in zip(now["numpy"], before["numpy"], strict=True))
+            or any(not torch.equal(now[k], before[k]) for k in now if k not in ("python", "numpy"))
+        )
+        if moved:
+            random.setstate(before["python"])
+            np.random.set_state(before["numpy"])
+            torch.set_rng_state(before["torch"])
+            if self.device.type == "cuda":
+                torch.cuda.set_rng_state(before["device"], self.device)
+            elif self.device.type == "mps":
+                torch.mps.set_rng_state(before["device"])
+        return moved
+
+    def _zero_advantage_rows(self, batch: TrainBatch) -> torch.Tensor | None:
+        """``[B]`` bool: the sequences of ``batch`` whose advantage is exactly 0 at every response
+        token (also those without one), when ``train_step`` may leave them out (module docstring);
+        ``None`` when it computes every sequence."""
+        if (
+            self._zero_grads is None
+            or self.config.algorithm.entropy_coef > 0.0
+            or batch.ref_logprobs is not None
+            or batch.extra
+            or batch.advantages.shape != batch.input_ids.shape
+        ):
+            return None
+        # 0 * x is 0 for a finite x only: a batch that holds anything else is computed as it is.
+        inputs = (batch.advantages, batch.old_logprobs, batch.behavior_logprobs, batch.loss_weights)
+        if not all(bool(torch.isfinite(t).all()) for t in inputs if t is not None):
+            return None
+        if batch.old_logprobs is not None and bool((batch.old_logprobs < -MAX_LOG_RATIO).any()):
+            return None
+        top = batch.behavior_top_logprobs  # -inf where the sampler returned fewer tokens
+        if top is not None and bool((top > MAX_LOG_RATIO).any()):
+            return None
+        mask = batch.response_mask.bool()
+        weights = batch.loss_weights
+        if weights is not None:
+            # A micro-batch is its share of the batch's weighted mean only while the weights lie on the
+            # response tokens and no floor is in the way, whichever sequences it holds.
+            mass = weights.sum(dim=1)[mask.any(dim=1)]
+            if (
+                bool((weights < 0).any())
+                or bool((weights[~mask] != 0).any())
+                or bool((mass < MIN_WEIGHT_MASS).any())
+            ):
+                return None
+        return ((batch.advantages == 0) | ~mask).all(dim=1)
 
     def _build_value_head(self) -> nn.Linear:
         """``hidden -> 1`` in float32, zero-initialised: the first advantages are plain returns and
@@ -560,6 +703,25 @@ class ReferenceTrainer:
         total_scored = max(total_scored, 1)
         mbs = self.config.trainer.micro_batch_size
         token_agg = self.config.algorithm.loss_agg == "token"
+
+        def share(response_mask: torch.Tensor, loss_weights: torch.Tensor | None) -> float:
+            """What the sequences with these masks weigh in the loss mean of the whole batch."""
+            if loss_weights is not None:
+                return float(loss_weights.sum().item()) / max(total_mass, 1e-8)
+            if token_agg:
+                return int(response_mask.sum().item()) / total_tokens
+            return int((response_mask.sum(dim=1) > 0).sum().item()) / total_scored
+
+        # Sequences that would give every parameter a gradient of exactly zero are not computed
+        # (module docstring). The totals above still count them, so the others weigh what they did.
+        skipped, skipped_share = 0, 0.0
+        zero = self._zero_advantage_rows(batch)
+        if zero is not None and bool(zero.any()):
+            skipped = int(zero.sum().item())
+            skipped_share = share(
+                batch.response_mask[zero], None if batch.loss_weights is None else batch.loss_weights[zero]
+            )
+            batch = batch.select((~zero).nonzero().squeeze(1))
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -573,15 +735,11 @@ class ReferenceTrainer:
         mtp_inputs: dict[str, Any] = {}
         if mtp is not None:
             mtp_inputs = mtp.last_hidden_request
-        for start in range(0, local_seqs, mbs):
+        for start in range(0, len(batch), mbs):
             micro = batch.slice(start, start + mbs).trimmed()
             micro_tokens = int(micro.response_mask.sum().item())
-            micro_scored = int((micro.response_mask.sum(dim=1) > 0).sum().item())
             micro_states = int(micro.value_mask.sum().item()) if critic else 0
-            if micro.loss_weights is not None:
-                weight = float(micro.loss_weights.sum().item()) / max(total_mass, 1e-8)
-            else:
-                weight = micro_tokens / total_tokens if token_agg else micro_scored / total_scored
+            weight = share(micro.response_mask, micro.loss_weights)
             if micro_tokens == 0 and micro_states == 0:
                 continue
             rows = head_rows(micro.response_mask) if self._narrow_head else None
@@ -673,13 +831,19 @@ class ReferenceTrainer:
                 sums[k] = sums.get(k, 0.0) + float(v) * weight
             weights_total += weight
 
+        if skipped and local_tokens:
+            # Computed, they would have left these parameters a gradient of zero, and an optimizer
+            # steps a parameter whose gradient is zero (momentum, weight decay), not one without.
+            for p in self._zero_grads:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
         if self._dist is not None:
             self._dist.all_reduce_grads(self.trainable_params)
-            gathered = self._dist.all_gather_object(
-                (sums, weights_total, value_sums, value_weights_total, mtp_sums, mtp_correct)
-            )
+            local = (sums, weights_total, value_sums, value_weights_total, mtp_sums, mtp_correct)
+            gathered = self._dist.all_gather_object((*local, skipped, skipped_share))
             sums, weights_total, value_sums, value_weights_total = {}, 0.0, {}, 0.0
             mtp_sums, mtp_correct = [0.0] * len(mtp_totals), 0
+            skipped, skipped_share = 0, 0.0
             for (
                 other_sums,
                 other_total,
@@ -687,7 +851,11 @@ class ReferenceTrainer:
                 other_value_total,
                 other_mtp,
                 other_correct,
+                other_skipped,
+                other_share,
             ) in gathered:
+                skipped += other_skipped
+                skipped_share += other_share
                 for k, v in other_sums.items():
                     sums[k] = sums.get(k, 0.0) + v
                 weights_total += other_total
@@ -711,7 +879,16 @@ class ReferenceTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         self._step += 1
 
-        result = {k: v / weights_total for k, v in sums.items()} if weights_total > 0 else {}
+        result: dict[str, float] = {}
+        if weights_total > 0:
+            # A sequence that was left out counts as the 0 it is in the means it would have been 0 in;
+            # the other means are over the sequences that were computed.
+            result = {
+                k: v / (weights_total + skipped_share * (k in ZERO_AT_ZERO_ADVANTAGE))
+                for k, v in sums.items()
+            }
+        elif skipped_share > 0:
+            result = dict.fromkeys(ZERO_AT_ZERO_ADVANTAGE, 0.0)
         if value_weights_total > 0:
             result.update({k: v / value_weights_total for k, v in value_sums.items()})
             result["loss/total"] = (
@@ -731,6 +908,8 @@ class ReferenceTrainer:
         result["grad_norm"] = float(grad_norm.item())
         result["lr"] = float(self.scheduler.get_last_lr()[0])
         result["tokens/response_mean"] = float(total_tokens / total_seqs)
+        if not self.config.is_sft:
+            result["tokens/sequences_skipped"] = float(skipped)
         return result
 
     @torch.no_grad()

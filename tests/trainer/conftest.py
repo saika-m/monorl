@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,70 @@ def reinforce_loss(
     mask = response_mask.float()
     loss = -(logprobs * advantages * mask).sum() / mask.sum().clamp(min=1)
     return SimpleLossOutput(loss=loss, metrics={"loss/policy": float(loss.detach().item())})
+
+
+def every_sequence_loss(*args: Any, **kwargs: Any) -> Any:
+    """``policy_loss`` as an injected loss. The trainer cannot know the terms of a loss it is handed,
+    so it computes every sequence of a batch, also those whose advantage is zero: the step that
+    tests of leaving those out compare with."""
+    from monorl.algorithms import policy_loss
+
+    return policy_loss(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def forward_passes(trainer: Any) -> Iterator[list[tuple[int, int]]]:
+    """The ``(sequences, width)`` of every forward pass of the trainer's policy inside the block."""
+    passes: list[tuple[int, int]] = []
+
+    def record(_module: Any, _args: Any, kwargs: dict[str, Any]) -> None:
+        passes.append(tuple(kwargs["input_ids"].shape))
+
+    handle = trainer.hf_model.register_forward_pre_hook(record, with_kwargs=True)
+    try:
+        yield passes
+    finally:
+        handle.remove()
+
+
+def step_with_gradient(trainer: Any, batch: TrainBatch) -> tuple[dict[str, float], torch.Tensor]:
+    """One ``train_step`` and the gradient its optimizer was handed (clipped), in one vector. A
+    parameter without a gradient, which the optimizer does not step, is ``nan`` in it."""
+    gradient: list[torch.Tensor] = []
+
+    def keep(*_: Any) -> None:
+        for p in trainer.trainable_params:
+            grad = torch.full_like(p, float("nan")) if p.grad is None else p.grad.detach()
+            gradient.append(grad.flatten().clone())
+
+    handle = trainer.optimizer.register_step_pre_hook(keep)
+    try:
+        return trainer.train_step(batch), torch.cat(gradient)
+    finally:
+        handle.remove()
+
+
+def relative_difference(a: torch.Tensor, b: torch.Tensor) -> float:
+    """``|a - b| / |b|`` over all entries, in float64; ``nan`` entries have to be the same ones."""
+    assert torch.equal(a.isnan(), b.isnan())
+    a, b = a.double().nan_to_num(), b.double().nan_to_num()
+    return float((a - b).norm() / b.norm())
+
+
+def trainer_state(trainer: Any) -> dict[str, torch.Tensor]:
+    """Every trainable tensor of ``trainer`` and what its optimizer keeps for it (moments, step)."""
+    state = {f"weight.{i}": p.detach().clone() for i, p in enumerate(trainer.trainable_params)}
+    for i, entry in enumerate(trainer.optimizer.state.values()):
+        for key, value in entry.items():
+            state[f"optimizer.{i}.{key}"] = torch.as_tensor(value).detach().clone()
+    return state
+
+
+def bitwise_equal(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> bool:
+    """The same tensors bit for bit: ``nan`` equals ``nan``, and 0.0 does not equal -0.0."""
+    return a.keys() == b.keys() and all(
+        a[k].dtype == b[k].dtype and a[k].numpy().tobytes() == b[k].numpy().tobytes() for k in a
+    )
 
 
 def make_config(tiny_model_dir: Path, *, lora: bool = False, **trainer: Any) -> RunConfig:

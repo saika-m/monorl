@@ -11,7 +11,14 @@ from monorl.core.types import SamplingParams, Trajectory, Turn
 from monorl.orchestrator.batching import build_train_batch
 from monorl.rollout.hf_engine import HFRolloutEngine
 from monorl.trainer.reference import ReferenceTrainer
-from tests.trainer.conftest import make_batch, make_config
+from tests.trainer.conftest import (
+    every_sequence_loss,
+    forward_passes,
+    make_batch,
+    make_config,
+    relative_difference,
+    step_with_gradient,
+)
 
 # The tiny random model is near-uniform over its 49k tokens at temperature 1; at 0.08 its 16 most
 # likely tokens carry about 70% of the mass, which gives score centering something to subtract.
@@ -133,3 +140,81 @@ def test_micro_batching_matches_single_pass_with_score_centering(tiny_model_dir:
     batch.behavior_top_ids = batch.behavior_top_logprobs = None
     plain, _ = _step(tiny_model_dir, batch, 6, temperature=PEAKED)
     assert abs(plain["grad_norm"] - m6["grad_norm"]) > 1e-3 * plain["grad_norm"]
+
+
+def _ours_and_every_sequence(tiny_model_dir: Path, batch: Any, **config: Any):
+    """A step on ``batch`` by the trainer and by one that computes every sequence (an injected loss):
+    ``(metrics, gradient, sequences per forward pass)`` of each."""
+    steps = []
+    for loss_fn in (None, every_sequence_loss):
+        trainer = ReferenceTrainer(_config(tiny_model_dir, **config), loss_fn=loss_fn)
+        with forward_passes(trainer) as passes:
+            metrics, gradient = step_with_gradient(trainer, batch)
+        steps.append((metrics, gradient, [rows for rows, _ in passes]))
+    return steps
+
+
+@pytest.mark.parametrize("loss_agg", ["token", "rollout"])
+def test_importance_corrections_leave_a_sequence_without_advantage_at_zero(
+    tiny_model_dir: Path, tokenizer, loss_agg: str
+) -> None:
+    """The weights and the ratio mask multiply the policy term, so a sequence whose advantages are 0
+    still adds nothing and is not computed."""
+    batch = _stale_batch(tiny_model_dir, tokenizer, loss_agg=loss_agg)
+    batch.advantages[[0, 3, 4]] = 0.0
+    off_policy = {
+        "anchor": "trainer",
+        "importance_weights": "sequence",
+        "importance_cap": 1.3,
+        "ratio_mask": "token",
+        "ratio_mask_low": 0.8,
+        "ratio_mask_high": 1.4,
+    }
+    (metrics, gradient, passes), (expected_metrics, expected, every_passes) = _ours_and_every_sequence(
+        tiny_model_dir, batch, loss_agg=loss_agg, off_policy=off_policy
+    )
+    assert passes == [2, 1] and every_passes == [2, 2, 2]
+    assert metrics["tokens/sequences_skipped"] == 3
+    assert relative_difference(gradient, expected) < 2e-5
+    assert metrics["loss/policy"] == pytest.approx(expected_metrics["loss/policy"], rel=1e-5)
+    # the corrections are live: the same batch without them takes a different step
+    plain, _, _ = _ours_and_every_sequence(tiny_model_dir, batch, loss_agg=loss_agg)[0]
+    assert abs(plain["grad_norm"] - metrics["grad_norm"]) > 1e-3 * plain["grad_norm"]
+
+
+def test_score_centering_leaves_a_sequence_without_advantage_at_zero(tiny_model_dir: Path, tokenizer) -> None:
+    """The centering term is the advantage times the expected score: 0 with the advantage. Its
+    diagnostics are over the sequences that were computed."""
+    batch = _centering_batch(tiny_model_dir, tokenizer, shift=1.0)
+    batch.advantages[[1, 2]] = 0.0
+    config = {"temperature": PEAKED, "off_policy": {"score_centering": True}}
+    (metrics, gradient, passes), (expected_metrics, expected, every_passes) = _ours_and_every_sequence(
+        tiny_model_dir, batch, **config
+    )
+    assert passes == [2, 2] and every_passes == [2, 2, 2]
+    assert metrics["tokens/sequences_skipped"] == 2
+    assert relative_difference(gradient, expected) < 2e-5
+    assert metrics["loss/policy"] == pytest.approx(expected_metrics["loss/policy"], rel=1e-5)
+    kept = batch.select(torch.tensor([0, 3, 4, 5]))
+    ran, _, _ = _ours_and_every_sequence(tiny_model_dir, kept, **config)[1]
+    for key in ("offpolicy/sc_coef_l1", "offpolicy/sc_tail_ratio"):
+        assert metrics[key] == pytest.approx(ran[key], rel=1e-5), key
+    assert metrics["offpolicy/sc_coef_l1"] > 0.05
+    batch.behavior_top_ids = batch.behavior_top_logprobs = None
+    plain, _, _ = _ours_and_every_sequence(tiny_model_dir, batch, temperature=PEAKED)[0]
+    assert abs(plain["grad_norm"] - metrics["grad_norm"]) > 1e-3 * plain["grad_norm"]
+
+
+def test_a_top_log_prob_no_distribution_has_is_computed_as_it_is(tiny_model_dir: Path, tokenizer) -> None:
+    """exp(100) is not a probability and overflows the centering coefficient: 0 times it is not 0,
+    so the sequence is computed although it has no advantage, and the step is what it was."""
+    batch = _centering_batch(tiny_model_dir, tokenizer, shift=1.0)
+    batch.advantages[[1, 2]] = 0.0
+    batch.behavior_top_logprobs[1, int(batch.response_mask[1].argmax()), 0] = 100.0
+    config = {"temperature": PEAKED, "off_policy": {"score_centering": True}}
+    (metrics, gradient, passes), (expected_metrics, expected, _) = _ours_and_every_sequence(
+        tiny_model_dir, batch, **config
+    )
+    assert passes == [2, 2, 2] and metrics["tokens/sequences_skipped"] == 0
+    assert expected.isnan().all() and gradient.isnan().all()
+    assert str(metrics) == str(expected_metrics)

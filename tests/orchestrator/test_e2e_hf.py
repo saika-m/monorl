@@ -13,16 +13,19 @@ from monorl.config.schema import RunConfig
 from monorl.core.reporting import iter_metrics, iter_trajectories, list_checkpoints, read_status
 from monorl.orchestrator import run
 
+# The random model answers no question, so the rewards of every group are equal, no sequence has an
+# advantage and the trainer runs no pass for the update. `loss/entropy` and `policy/approx_kl` need
+# a forward pass: such a row does not have them (tests/trainer/test_zero_advantage.py holds them to
+# the sequences that were computed where some were).
 CONTRACT_KEYS = {
     "reward/mean",
     "reward/std",
     "reward/exact_match",
     "loss/policy",
     "loss/kl",
-    "loss/entropy",
     "policy/clipfrac",
-    "policy/approx_kl",
     "tokens/response_mean",
+    "tokens/sequences_skipped",
     "tokens/prompt_mean",
     "time/rollout",
     "time/train",

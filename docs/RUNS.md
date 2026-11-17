@@ -518,6 +518,7 @@ Rollouts and batch:
 | `tokens/sequences`, `tokens/truncated` | rows of the batch; rows cut at `trainer.max_seq_len` |
 | `tokens/truncated_turns` | SFT: trained turns that lost tokens to the cut |
 | `tokens/old_logprobs_recomputed` | 1 when the trainer recomputed the old log-probs instead of using the engine's |
+| `tokens/sequences_skipped` | RL, reference trainer: rows of the batch the update ran no pass for, because their advantage is 0 at every response token and they change nothing about it; see [ALGORITHMS.md](ALGORITHMS.md#options) |
 | `advantage/mean`, `advantage/abs_mean` | mean and mean magnitude of the advantage over response tokens |
 | `advantage/turn_spread`, `advantage/turn_spread_max`, `advantage/first_turn_abs`, `advantage/last_turn_abs` | per-turn credit, see [CREDIT_ASSIGNMENT.md](CREDIT_ASSIGNMENT.md) |
 
@@ -527,10 +528,10 @@ Loss and optimisation (`src/monorl/algorithms/losses.py`, `src/monorl/trainer/re
 |---|---|
 | `loss/policy` | clipped policy-gradient surrogate |
 | `loss/kl` | KL penalty to the reference policy before `algorithm.kl_coef`; 0.0 when `kl_coef` is 0 |
-| `loss/entropy` | mean token entropy of the policy, before `algorithm.entropy_coef` |
+| `loss/entropy` | mean token entropy of the policy, before `algorithm.entropy_coef`; over the rows the update computed, absent when it computed none (`tokens/sequences_skipped`) |
 | `loss/total` | the optimised loss: policy + `kl_coef` * kl - `entropy_coef` * entropy, plus the value and MTP terms when present |
 | `policy/clipfrac` | share of response tokens where the clipped surrogate is the active one |
-| `policy/approx_kl`, `policy/ratio_mean` | mean of `(ratio - 1) - log ratio` (k3 estimate of KL(old, new)); mean ratio new/old |
+| `policy/approx_kl`, `policy/ratio_mean` | mean of `(ratio - 1) - log ratio` (k3 estimate of KL(old, new)); mean ratio new/old; both over the rows the update computed, absent when it computed none |
 | `grad_norm` | gradient norm of the policy (and value head) before clipping to `trainer.max_grad_norm` |
 | `lr` | learning rate after the scheduler step |
 | `loss/sft`, `sft/ppl` | SFT loss (label smoothing included); `exp` of the unsmoothed token-mean NLL |
