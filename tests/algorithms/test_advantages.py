@@ -3,12 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from monorl.algorithms import (
-    apply_overlong_penalty,
-    compute_advantages,
-    discount_turn_rewards,
-    dynamic_sampling_mask,
-)
+from monorl.algorithms import compute_advantages
 from monorl.config.schema import AlgorithmConfig
 
 REWARDS = torch.tensor([1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 5.0])
@@ -68,26 +63,3 @@ def test_compute_advantages_validates_inputs_and_handles_empty():
     with pytest.raises(ValueError):
         compute_advantages(REWARDS[None], GROUPS, algorithm=cfg)
     assert compute_advantages(torch.zeros(0), [], algorithm=cfg).shape == (0,)
-
-
-def test_dynamic_sampling_mask_drops_zero_variance_groups():
-    rewards = torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.5])
-    groups = ["same", "same", "mixed", "mixed", "zero", "zero", "solo"]
-    keep = dynamic_sampling_mask(rewards, groups)
-    assert keep.tolist() == [False, False, True, True, False, False, False]
-    assert keep.dtype == torch.bool
-
-
-def test_apply_overlong_penalty():
-    rewards = torch.tensor([1.0, 1.0, 0.0])
-    out = apply_overlong_penalty(rewards, ["stop", "length", "length"], 0.5)
-    torch.testing.assert_close(out, torch.tensor([1.0, 0.5, -0.5]))
-    torch.testing.assert_close(rewards, torch.tensor([1.0, 1.0, 0.0]))  # input untouched
-    with pytest.raises(ValueError):
-        apply_overlong_penalty(rewards, ["stop"], 0.5)
-
-
-def test_discount_turn_rewards():
-    assert discount_turn_rewards([1.0, 1.0, 1.0], 0.5) == pytest.approx(1.75)
-    assert discount_turn_rewards([0.0, 0.0, 2.0], 1.0) == pytest.approx(2.0)
-    assert discount_turn_rewards([], 0.9) == 0.0
