@@ -295,7 +295,7 @@ SDK is header-only (`envs/sdk/cpp/include/mep/mep.hpp`) and serves the same prot
 | `monorl patches` | `list`, `status [FRAMEWORK]`, `apply FRAMEWORK`: inspect and apply the patchsets |
 | `monorl data inspect URI` | Preview a dataset and the samples built from it (`--limit`, `--split`, `--config-name`, `--provider`, `--json`) |
 | `monorl env check` | Drive a MEP/1 server (`--command WORD`, repeated for every word of its command line, or `--url URL`) through spec, health, reset, step and close; `--sample`, `--reference` and `--action` choose the sample and the action |
-| `monorl env serve TYPE` | Expose a Python environment as a MEP/1 server (`--transport stdio\|http`, `--port`) |
+| `monorl env serve TYPE` | Expose a Python environment as a MEP/1 server (`--transport stdio\|http`, `--host`, `--port`, `--allowed-host` for the names an http server answers to) |
 | `monorl recipes` | `list`, `show NAME`: browse the bundled recipes |
 
 `python -m monorl.cli ...` is equivalent (the web server launches runs that way);
