@@ -420,6 +420,7 @@ configs/recipes/             example run and pipeline configs
 examples/sandbox/            example task directories and a shell agent
 docker/ scripts/ tests/
 third_party/pins.toml        upstream pins; scripts/vendor.py clones the sources here
+requirements.lock            every package of `make install` and CI, pinned with hashes
 ```
 
 ## Development
@@ -431,6 +432,8 @@ conventions; [`src/monorl/README.md`](src/monorl/README.md) maps the code.
 make test-fast     # pytest -m 'not slow and not network'
 make test          # everything (downloads tiny models, trains for a few steps on CPU)
 make lint          # ruff check + format check
+make lock          # rewrite requirements.lock after a change of pyproject.toml or a pin
+make sync          # make .venv match requirements.lock again
 make envs          # Go and C++ example environments into envs/bin
 scripts/vendor.py --list           # the pins and what is cloned
 scripts/vendor.py --fetch vllm     # clone a pinned upstream source (or `all`)
