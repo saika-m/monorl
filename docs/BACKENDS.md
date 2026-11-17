@@ -247,7 +247,10 @@ Hydra and NeMo-RL yaml, `GRPOConfig` kwargs for TRL).
   single-turn completions and never step it; `rollout.stop` has no verl equivalent and is
   ignored; `rollout.backend: hf` falls back to vLLM (verl only has `vllm`/`sglang`); the
   per-reward breakdown is only available in
-  verl's `reward_extra_info` (the scalar `score` is the reward). `trainer.extra` keys are
+  verl's `reward_extra_info` (the scalar `score` is the reward). A secret that the config read
+  from an environment variable is `${NAME}` in `monorl_reward.py` and `config.yaml`, and verl's
+  reward workers resolve it themselves: set the variable on every node of the Ray cluster
+  ([RUNS.md](RUNS.md#configyaml)). `trainer.extra` keys are
   deep-merged into the Hydra tree, except `verl_python`, which picks the interpreter that runs
   the entry (default: the current one).
   Multimodal: the parquet follows `examples/data_preprocess/geo3k.py` — message content keeps
