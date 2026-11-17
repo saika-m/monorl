@@ -56,7 +56,7 @@ This section is required.
 
 | Key | Type, default | Description |
 | --- | --- | --- |
-| `data.uri` | string; required | Dataset location: 'hf://org/name' (Hub), 's3://bucket/prefix-or-file' (credentials from AWS_* env vars), or a local file/directory (.jsonl/.json/.parquet/.csv/.arrow). |
+| `data.uri` | string; required | Dataset location: 'hf://org/name' (Hub), 's3://bucket/prefix-or-file' (credentials from AWS_* env vars), a local file/directory (.jsonl/.json/.parquet/.csv/.arrow), or the scheme of a data source that a module in `providers` registers. |
 | `data.split` | string; default `train` | Split name for Hub datasets (ignored for files). |
 | `data.hf_config_name` | string or null; default `null` | Hub dataset config/subset name. |
 | `data.format` | `auto`, `chat`, `prompt_answer`, `text`; default `auto` | 'chat': a messages column; 'prompt_answer': prompt + reference answer columns; 'text': a single prompt column; 'auto' sniffs columns. |

@@ -380,20 +380,27 @@ def patches_apply(
 
 @data_app.command("inspect")
 def data_inspect(
-    uri: str = typer.Argument(..., help="Local path, hf://org/name or s3://bucket/key."),
+    uri: str = typer.Argument(
+        ..., help="Local path, hf://org/name, s3://bucket/key, or the scheme of a --provider's data source."
+    ),
     limit: int = typer.Option(5, "--limit", "-n", min=1, help="Rows / samples to show."),
     split: str | None = typer.Option(None, "--split", help="Split for Hub datasets."),
     hf_config_name: str | None = typer.Option(None, "--config-name", help="Hub dataset config/subset."),
+    providers: list[str] = typer.Option(
+        [], "--provider", help="Module to import first, as in a config's `providers` (repeatable)."
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Preview a dataset: columns, inferred format, first rows and the Samples monorl would build."""
     from itertools import islice
 
     from monorl.config.schema import DataConfig
+    from monorl.core.registry import registry
     from monorl.data import open_source
     from monorl.data.browse import preview_uri
 
     try:
+        registry.load_providers(providers)
         preview = preview_uri(uri, split=split, hf_config_name=hf_config_name, limit=limit)
         data_config = DataConfig(uri=uri, hf_config_name=hf_config_name, shuffle=False, streaming=True)
         if split:
@@ -403,6 +410,11 @@ def data_inspect(
             {"id": s.id, "messages": s.messages, "reference": s.reference, "metadata": s.metadata}
             for s in islice(iter(source), limit)
         ]
+    except FileNotFoundError as e:
+        # A string without a scheme is a path, also one that reads like a Hub repository.
+        looks_like_repo = "://" not in uri and uri.count("/") == 1 and not Path(uri).suffix
+        _fail(f"{e}" + (f" (a Hub dataset is written hf://{uri})" if looks_like_repo else ""))
+        return
     except MonorlError as e:
         _fail(str(e))
         return

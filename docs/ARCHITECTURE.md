@@ -74,11 +74,12 @@ Read the file. Key points:
 
 ### Registry — `src/monorl/core/registry.py`
 `registry.register(namespace, name, factory)`; factories are `factory(config: RunConfig, **kw)`
-except rewards: `factory(params: dict, **kw)` and data sources: `factory(data_config: DataConfig, **kw)`.
-Providers expose `register(registry)`. Built-in providers are imported lazily on lookup miss;
-adapters via `monorl.adapters.PROVIDERS`. A run config names further provider modules in
-`RunConfig.providers`; `ensure_providers(config)` loads them in every process that builds
-components from the config.
+except rewards: `factory(params: dict, **kw)` and data sources, which are row sources keyed by
+URI scheme: `factory(uri: ParsedURI, *, split, config_name, streaming, extra) -> RowSource`.
+Providers expose `register(registry)`. Built-in providers are imported lazily on lookup
+miss; adapters via `monorl.adapters.PROVIDERS`. A run config names further provider modules in
+`RunConfig.providers`; `ensure_providers(config)` loads them in every process that builds components
+from the config.
 
 Names: rollout_engine `hf|vllm|sglang`; trainer `reference|unsloth`; pipeline_backend
 `trl|verl|nemo_rl`; env `single_turn|tool_calling|remote|openenv|hermes|harness`; weight_sync

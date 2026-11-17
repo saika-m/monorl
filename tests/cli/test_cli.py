@@ -556,6 +556,43 @@ def test_data_inspect_local_jsonl(runner: CliRunner, tmp_path: Path) -> None:
     assert result.exit_code == 1
 
 
+def test_data_inspect_reports_a_missing_path_without_a_traceback(runner: CliRunner, tmp_path: Path) -> None:
+    result = runner.invoke(app, ["data", "inspect", "openai/gsm8k"])
+    assert result.exit_code == 1 and not isinstance(result.exception, FileNotFoundError)
+    flat = " ".join(result.output.split())
+    assert "dataset path not found: openai/gsm8k" in flat and "hf://openai/gsm8k" in flat
+    assert "Traceback" not in result.output
+
+
+def test_data_inspect_reads_the_data_source_of_a_provider(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = f"inspect_provider_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{name}.py").write_text(
+        "from monorl.data.rows import RowSource\n\n\n"
+        "class Squares(RowSource):\n"
+        "    def __init__(self, uri):\n"
+        "        self.uri = uri.raw\n"
+        "        self.rows = [(f'{uri.raw}#{i}', {'question': f'{i} squared?', 'answer': str(i * i)}) "
+        "for i in range(int(uri.path))]\n\n"
+        "    def columns(self):\n"
+        "        return {'question': 'string', 'answer': 'string'}\n\n"
+        "    def iter_rows(self, *, shuffle_seed=None):\n"
+        "        return iter(self.rows)\n\n\n"
+        "def register(registry):\n"
+        "    registry.register('data_source', 'squares', lambda uri, **_: Squares(uri), overwrite=True)\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["data", "inspect", "squares://4", "--provider", name, "--json"])
+    assert result.exit_code == 0, result.output
+    out = json.loads(result.output)
+    assert [s["reference"] for s in out["samples"]] == ["0", "1", "4", "9"]
+    without = runner.invoke(app, ["data", "inspect", "nosuchscheme://4"])
+    assert without.exit_code == 1 and "no data source for the scheme 'nosuchscheme'" in " ".join(
+        without.output.split()
+    )
+
+
 def test_data_inspect_renders_media_parts_as_markers(runner: CliRunner, tmp_path: Path) -> None:
     image_module = pytest.importorskip("PIL.Image")
     image_module.new("RGB", (4, 4), (255, 0, 0)).save(tmp_path / "red.png")

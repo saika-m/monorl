@@ -8,7 +8,10 @@ Supported shapes:
   driver is installed. S3 credentials come **only** from the environment
   (``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_SESSION_TOKEN``,
   ``AWS_DEFAULT_REGION``/``AWS_REGION``, ``AWS_ENDPOINT_URL``), never from config.
-* local path or ``file://`` — file, directory or glob.
+* local path or ``file://`` — file, directory or glob. A string without ``://`` is always a
+  path: a Hub dataset needs the ``hf://`` prefix.
+* ``<scheme>://anything`` for a scheme a provider module registered a ``data_source`` for
+  (:mod:`monorl.data.rows`). The scheme has to be an identifier (letters, digits, ``_``).
 """
 
 from __future__ import annotations
@@ -37,9 +40,11 @@ class ParsedURI:
     raw: str
     kind: Kind
     scheme: str
-    """``file``, ``hf`` or the fsspec protocol (``s3``, ``gs``...)."""
+    """``file``, ``hf``, or for ``remote`` what precedes ``://``: an fsspec protocol (``s3``,
+    ``gs``...) or the scheme of a provider's data source."""
     path: str
-    """Local: absolute path. Remote: ``bucket/key`` without the scheme. HF: ``org/name``."""
+    """Local: absolute path. Remote: what follows ``://`` without surrounding slashes
+    (``bucket/key``). HF: ``org/name``."""
     revision: str | None = None
     """HF only: ``@revision``."""
     subpath: str | None = None

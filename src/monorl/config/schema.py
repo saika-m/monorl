@@ -106,7 +106,8 @@ class DataConfig(_Model):
         ...,
         description=(
             "Dataset location: 'hf://org/name' (Hub), 's3://bucket/prefix-or-file' (credentials from "
-            "AWS_* env vars), or a local file/directory (.jsonl/.json/.parquet/.csv/.arrow)."
+            "AWS_* env vars), a local file/directory (.jsonl/.json/.parquet/.csv/.arrow), or the scheme of "
+            "a data source that a module in `providers` registers."
         ),
     )
     split: str = Field("train", description="Split name for Hub datasets (ignored for files).")

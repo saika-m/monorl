@@ -108,7 +108,7 @@ def test_s3_options_come_only_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_unknown_fsspec_driver_is_a_data_error() -> None:
     with pytest.raises(DataError, match="no fsspec driver"):
-        open_source(DataConfig(uri="nosuchscheme://bucket/x.jsonl"))
+        browse_uri("nosuchscheme://bucket/")
 
 
 # -- S3 end to end (moto) ------------------------------------------------------------------------
