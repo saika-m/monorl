@@ -586,6 +586,7 @@ class LoopbackServer:
 
     def __init__(self, handler: Callable[[httpx.Request], httpx.Response]) -> None:
         self.stall = False
+        self.stall_paths: set[str] = set()
         self.stalled: queue.Queue[str] = queue.Queue()
         self.disconnects: queue.Queue[str] = queue.Queue()
         owner = self
@@ -598,7 +599,7 @@ class LoopbackServer:
 
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers.get("content-length", 0)))
-                if owner.stall:
+                if owner.stall or self.path in owner.stall_paths:
                     owner.stalled.put(self.path)
                     self.close_connection = True
                     readable, _, _ = select.select([self.connection], [], [], 10)

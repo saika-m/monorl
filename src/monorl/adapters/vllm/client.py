@@ -14,14 +14,15 @@ Endpoints used (vLLM v0.33.0 unless noted):
   must allow that many: ``--max-logprobs`` ≥ ``k`` (``k + 1`` for the chat endpoint; default 20)
   and ``--logprobs-mode processed_logprobs``. A request has one ``max_tokens`` for all its
   prompts (``CompletionRequest.max_tokens``), so the text prompts of a ``generate`` call go out
-  as one request per distinct cap, in flight together.
+  as one request per distinct cap.
 * ``POST /v1/chat/completions`` (``vllm/entrypoints/openai/chat_completion/protocol.py``) for
   prompts with image parts: ``messages`` with ``image_url`` data URLs, ``logprobs=true,
   top_logprobs=0`` and ``return_token_ids=true``. The chat endpoint's logprob entries only carry
   token *strings*, so token ids come from ``choices[i].token_ids`` and the prompt ids the server
   conditioned on (chat template + image placeholders rendered server-side) from the
   response-level ``prompt_token_ids``. One request per prompt (a chat request is one
-  conversation); the requests of a ``generate`` call are in flight together.
+  conversation). The completion and chat requests of a ``generate`` call are all in flight
+  together; the responses are regrouped into the order of the prompts.
 * ``POST /sleep?level=N``, ``POST /wake_up``, ``GET /is_sleeping``
   (``vllm/entrypoints/serve/dev/sleep/api_router.py``, enabled by ``VLLM_SERVER_DEV_MODE=1``).
 * ``POST /reset_prefix_cache`` (``vllm/entrypoints/serve/dev/cache/api_router.py``).
@@ -137,9 +138,9 @@ class VllmServerClient:
     ``image_cache_bytes`` (bound on the image data URLs kept for re-sending, default 256 MiB).
 
     Text prompts are one completion request per distinct generation cap (one request, unless
-    the call carries caps per prompt) and prompts with images one chat request each. The requests
-    of a kind are sent together: a server-side error of any of them fails the call with that
-    request's error and drops the others.
+    the call carries caps per prompt) and prompts with images one chat request each. All the
+    requests of a call are sent together: a server-side error of any of them fails the call with
+    that request's error and drops the others.
 
     ``cancel()`` disconnects the completion requests in flight, which makes the server abort
     their generation, and fails the ``generate`` calls waiting for the lock; all of them raise
@@ -233,50 +234,47 @@ class VllmServerClient:
         try:
             with self._lock:
                 self._wake(_ALL_TAGS)
-                if text_idx:
-                    ids = {
-                        cap: [prompt_token_ids(self._tokenizer, prompts[i]) for i in indices]
-                        for cap, indices in text_idx.items()
+                ids = {
+                    cap: [prompt_token_ids(self._tokenizer, prompts[i]) for i in indices]
+                    for cap, indices in text_idx.items()
+                }
+                requests: list[tuple[str, dict[str, Any]]] = []
+                for cap, cap_ids in ids.items():
+                    body: dict[str, Any] = {
+                        "model": self._model_name,
+                        "prompt": cap_ids,
+                        "return_token_ids": True,
+                        **sampling_kwargs(params, cap),
                     }
-                    bodies: list[dict[str, Any]] = []
-                    for cap, cap_ids in ids.items():
-                        body: dict[str, Any] = {
-                            "model": self._model_name,
-                            "prompt": cap_ids,
-                            "return_token_ids": True,
-                            **sampling_kwargs(params, cap),
-                        }
-                        if params.top_logprobs > 0:
-                            body["return_tokens_as_token_ids"] = True
-                        bodies.append(body)
-                    responses = self._run(self._post_each("/v1/completions", bodies), call)
-                    for (cap, indices), resp in zip(text_idx.items(), responses, strict=True):
-                        grouped = completions_from_choices(
-                            resp.json()["choices"],
-                            ids[cap],
-                            params.n,
-                            want_logprobs=params.logprobs,
-                            top_logprobs=params.top_logprobs,
-                        )
-                        for i, comps in zip(indices, grouped, strict=True):
-                            result[i] = comps
-                if media_idx:
-                    bodies = [
-                        {
-                            "model": self._model_name,
-                            "messages": chat_completion_messages(prompts[i], self._images),  # type: ignore[arg-type]
-                            **chat_completion_kwargs(params, caps[i]),
-                        }
-                        for i in media_idx
-                    ]
-                    responses = self._run(self._post_each("/v1/chat/completions", bodies), call)
-                    for i, resp in zip(media_idx, responses, strict=True):
-                        result[i] = completions_from_chat_response(
-                            resp.json(),
-                            params.n,
-                            want_logprobs=params.logprobs,
-                            top_logprobs=params.top_logprobs,
-                        )
+                    if params.top_logprobs > 0:
+                        body["return_tokens_as_token_ids"] = True
+                    requests.append(("/v1/completions", body))
+                for i in media_idx:
+                    body = {
+                        "model": self._model_name,
+                        "messages": chat_completion_messages(prompts[i], self._images),  # type: ignore[arg-type]
+                        **chat_completion_kwargs(params, caps[i]),
+                    }
+                    requests.append(("/v1/chat/completions", body))
+                responses = self._run(self._post_each(requests), call)
+                text, chat = responses[: len(text_idx)], responses[len(text_idx) :]
+                for (cap, indices), resp in zip(text_idx.items(), text, strict=True):
+                    grouped = completions_from_choices(
+                        resp.json()["choices"],
+                        ids[cap],
+                        params.n,
+                        want_logprobs=params.logprobs,
+                        top_logprobs=params.top_logprobs,
+                    )
+                    for i, comps in zip(indices, grouped, strict=True):
+                        result[i] = comps
+                for i, resp in zip(media_idx, chat, strict=True):
+                    result[i] = completions_from_chat_response(
+                        resp.json(),
+                        params.n,
+                        want_logprobs=params.logprobs,
+                        top_logprobs=params.top_logprobs,
+                    )
         finally:
             with self._calls_lock:
                 self._calls.discard(call)
@@ -441,12 +439,12 @@ class VllmServerClient:
             )
         return resp
 
-    async def _post_each(self, path: str, bodies: Sequence[dict[str, Any]]) -> list[httpx.Response]:
-        """POST every body to ``path`` at once; the responses in the order of ``bodies``. The
-        first request to fail fails the group with its error (the earliest in ``bodies`` when
+    async def _post_each(self, requests: Sequence[tuple[str, dict[str, Any]]]) -> list[httpx.Response]:
+        """POST every ``(path, body)`` at once; the responses in the order of ``requests``. The
+        first request to fail fails the group with its error (the earliest in ``requests`` when
         several have failed by then), and the requests still in flight are dropped, as they are
         when the group is cancelled."""
-        tasks = [asyncio.ensure_future(self._send("POST", path, json=body)) for body in bodies]
+        tasks = [asyncio.ensure_future(self._send("POST", path, json=body)) for path, body in requests]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in tasks:

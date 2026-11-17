@@ -77,8 +77,9 @@ Pins: [`third_party/pins.toml`](../third_party/pins.toml). Patch mechanics:
   `VLLM_SERVER_DEV_MODE=1` (vLLM's own `/sleep`, `/wake_up`, `/is_sleeping`,
   `/reset_prefix_cache`) plus monorl's `/monorl/update_weights` (many tensors per request, raw
   bytes, at most `rollout.extra.weight_request_bytes` of them, default 64 MiB) and
-  `/load_weights_from_path`. Image prompts are one chat request each, in flight together; an
-  image is encoded to a data URL once per run (`rollout.extra.image_cache_bytes`).
+  `/load_weights_from_path`. Image prompts are one chat request each, in flight together with
+  the call's completion requests; an image is encoded to a data URL once per run
+  (`rollout.extra.image_cache_bytes`).
 * `sglang` — `sglang.srt.entrypoints.engine.Engine` (colocate, default) or an httpx client for
   `sglang.launch_server` (`rollout.extra.mode: server`, `url`/`urls`) using `/generate` and
   `/update_weights_from_tensor`; the tensor route only works when trainer and server share a host
@@ -138,6 +139,14 @@ Chat prompts with `{"type": "image", ...}` parts (`data.image_field`, see `docs/
 | `vllm` / server | `POST /v1/chat/completions` with `image_url` data-URL parts, `logprobs=true, top_logprobs=0`, `return_token_ids=true`; one request per prompt (`n` choices). The chat endpoint's logprob entries carry token *strings*, so ids come from `choices[i].token_ids` and the prompt ids from the response-level `prompt_token_ids` (rendered by the server's chat template) | server `prompt_token_ids` |
 | `sglang` / colocate | `Engine.async_generate(input_ids=<processor ids>, image_data=[[PIL…] or None per request])` run on the engine's loop; sglang's multimodal processor decodes the ids, re-expands the image placeholders and returns the final ids | processor chat template |
 | `sglang` / server | `POST /generate` with `image_data` = per-request lists of `data:image/png;base64,…` URLs (sglang `load_image`) | processor chat template |
+
+In vLLM server mode all the requests of a `generate` call are in flight together: one
+`/v1/completions` request per distinct cap and one chat request per image prompt. The
+completions come back in the order of the prompts, and every request has the body it has when
+it is sent alone. A request that fails drops the others before the call raises its error,
+`cancel()` disconnects all of them, and weight updates and sleep wait for the call. The client
+builds the body of every request before it sends any, so its memory grows with the batch;
+httpx's pool (100 connections by default) bounds how many reach the server at a time.
 
 Text-only models never load a processor (`load_processor` decides from the HF config); a VLM
 prompt against a text-only model is a `ConfigError`. Audio/video parts are not forwarded by the
