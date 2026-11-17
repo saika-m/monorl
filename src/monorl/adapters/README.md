@@ -82,8 +82,10 @@ reports `3 skipped, 448 deselected`; with the frameworks and CUDA they run (not 
    `VERL_COMMIT` (`verl/compiler.py`), `VERSIONS` (`patches.py` of `verl`, `nemo_rl`, `unsloth`),
    `TARGET_TAG`, `TARGET_COMMIT` (`nemo_rl/__init__.py`), `PINNED_VERSION` (`unsloth/__init__.py`),
    the literal in `trl/patches.py`.
-4. Update the fake and its version constant to the new surface, and the extra in `pyproject.toml`
-   if the lower bound moved. Nothing checks `pins.toml` against these constants; keep them in step.
+4. Update the fake and its version constant to the new surface, and the extra in `pyproject.toml`:
+   its range has to stay inside the gate's, upper bound included. `tests/adapters/test_pins.py`
+   fails when the pin, a constant of step 3, a patch's `versions` or the extra disagree, and when
+   a new version constant is not in its table.
 5. Run `.venv/bin/python -m pytest tests/adapters/<name>`, then `monorl patches status <name>` and
    `pytest -m gpu tests/adapters/<name>` where the framework is installed.
 
