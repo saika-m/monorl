@@ -63,7 +63,8 @@ the web build and lint, the MEP/1 conformance tests, hadolint over `docker/`, an
   it removes what it registers. Tests that share one resource outside their process carry
   `pytest.mark.xdist_group("<name>")` and stay together on one worker (`--dist loadgroup` in
   `pyproject.toml`): the local Ray of `tests/distributed/test_ray_runtime.py`, the Docker daemon
-  of `tests/envs/test_sandbox_docker.py`.
+  of `tests/envs/test_sandbox_docker.py`. CI gives every worker one torch thread
+  (`OMP_NUM_THREADS=1`): four workers with a thread per vCPU each are slower than four with one.
 - **Scratch state.** Under pytest `MONORL_HOME` defaults to `/tmp/monorl-tests`, and each xdist
   worker uses a directory of its own below it (`gw0`, `gw1`, ...); tests write everything else
   below `tmp_path`.
