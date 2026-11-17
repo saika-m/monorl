@@ -144,7 +144,16 @@ dropout is on (`model.lora.dropout`).
 With that, a run that is stopped after step `N` and resumed logs, from step `N + 1` on, the
 episodes and the metrics of the run that was not stopped, timings apart. This holds for runs that
 repeat at all (see Repeatability under [What a run does](#what-a-run-does)) and sample from the
-generators of this process: the `hf` engine with `cluster.mode: local`.
+generators of this process: the `hf` engine with `cluster.mode: local`. Run here, with
+`OMP_NUM_THREADS=2`: `grpo_gsm8k_smollm_cpu.yaml` with `trainer.save_every=2`, `data.limit=8` and
+`rollout.max_new_tokens=32`, once with `trainer.max_steps=4` and once with `trainer.max_steps=2`
+followed by `--resume` with `trainer.max_steps=4`. The 8 rows of steps 3 and 4 in
+`trajectories.jsonl` were identical, and so were the 37 metrics of each of the two steps that are
+not timings (`time/*`, `weight_sync/seconds`). Every reward of those runs was 0, so the updates
+were zero and the runs show the sampling stream only. The same pair with
+`--set 'rewards=[{type: length, params: {unit: chars, max_tokens: 100, penalty_per_token: 0.01}}]'`
+and `trainer.learning_rate=1e-4`, where every step has a gradient (`grad_norm` between 2.2 and
+3.5), was identical in the same way.
 
 The stop must not change the run. Stopping with a signal does not. A smaller `trainer.max_steps`
 does not either under `trainer.scheduler: constant` (the default); with `linear` or `cosine` the

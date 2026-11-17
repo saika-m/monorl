@@ -14,7 +14,7 @@ from monorl.orchestrator.batching import build_train_batch
 from monorl.rollout.hf_engine import HFRolloutEngine
 from monorl.trainer.reference import ReferenceTrainer
 from tests.rollout.tiny_vlm import image_chat
-from tests.trainer.conftest import make_config, reinforce_loss
+from tests.trainer.conftest import SGD, assert_same_update, exported, make_config, reinforce_loss
 
 TEXT_CHAT = [{"role": "user", "content": "Say hello."}]
 
@@ -95,12 +95,13 @@ def test_logprobs_and_a_step_with_images_are_those_of_the_logits_at_every_positi
     """The VLM's head is applied at the response positions only, also behind image tokens."""
     results = []
     for narrow in (True, False):
-        trainer = ReferenceTrainer(make_config(tiny_vlm_dir, micro_batch_size=2, max_seq_len=128))
+        trainer = ReferenceTrainer(make_config(tiny_vlm_dir, micro_batch_size=2, max_seq_len=128, **SGD))
         assert trainer._narrow_head
         trainer._narrow_head = narrow
+        initial = exported(trainer)
         before = trainer.compute_logprobs(vlm_batch)
         metrics = trainer.train_step(vlm_batch)
-        weights = torch.cat([w.detach().flatten() for _, w in trainer.export_weights()])
+        weights = exported(trainer)
         results.append((before, metrics, weights, trainer.compute_logprobs(vlm_batch)))
     (before_a, metrics_a, weights_a, after_a), (before_b, metrics_b, weights_b, after_b) = results
     torch.testing.assert_close(before_a, before_b, atol=1e-5, rtol=0)
@@ -108,7 +109,7 @@ def test_logprobs_and_a_step_with_images_are_those_of_the_logits_at_every_positi
     assert not torch.allclose(after_a, before_a, atol=1e-3)
     for key, value in metrics_a.items():
         assert value == pytest.approx(metrics_b[key], rel=1e-4, abs=1e-6), key
-    torch.testing.assert_close(weights_a, weights_b, atol=1e-6, rtol=0)
+    assert_same_update(initial, weights_a, weights_b)
 
 
 def test_lora_train_step_decreases_loss(tiny_vlm_dir: Path, vlm_batch: TrainBatch) -> None:

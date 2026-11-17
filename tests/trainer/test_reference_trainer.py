@@ -10,7 +10,7 @@ from monorl.config.schema import RunConfig
 from monorl.core.interfaces import Trainer
 from monorl.rollout.hf_engine import HFRolloutEngine
 from monorl.trainer.reference import ReferenceTrainer
-from tests.trainer.conftest import make_batch, make_config, reinforce_loss
+from tests.trainer.conftest import SGD, assert_same_update, exported, make_batch, make_config, reinforce_loss
 
 LORA = pytest.mark.parametrize("lora", [False, True], ids=["full", "lora"])
 
@@ -157,18 +157,19 @@ def test_a_step_does_not_depend_on_the_padding_of_the_batch(tiny_model_dir: Path
     )
     results = []
     for which in (batch, wide):
-        trainer = ReferenceTrainer(make_config(tiny_model_dir, max_seq_len=128))
+        trainer = ReferenceTrainer(make_config(tiny_model_dir, max_seq_len=128, **SGD))
+        initial = exported(trainer)
         before = trainer.compute_logprobs(which)
         assert before.shape == which.input_ids.shape and not before[:, batch.input_ids.shape[1] :].any()
         which.old_logprobs = before
         metrics = trainer.train_step(which)
-        weights = torch.cat([w.detach().flatten() for _, w in trainer.export_weights()])
+        weights = exported(trainer)
         results.append((before[:, : batch.input_ids.shape[1]], metrics, weights))
     (lp_a, metrics_a, weights_a), (lp_b, metrics_b, weights_b) = results
     torch.testing.assert_close(lp_a, lp_b, atol=1e-5, rtol=0)
     for key in ("loss/policy", "loss/entropy", "grad_norm"):
         assert metrics_a[key] == pytest.approx(metrics_b[key], rel=1e-4, abs=1e-6), key
-    torch.testing.assert_close(weights_a, weights_b, atol=1e-6, rtol=0)
+    assert_same_update(initial, weights_a, weights_b)
 
 
 def test_truncates_to_max_seq_len(tiny_model_dir: Path, tokenizer) -> None:

@@ -14,7 +14,7 @@ from transformers import LlamaForCausalLM
 from monorl.config.schema import RunConfig
 from monorl.core.batch import TrainBatch
 from monorl.trainer.reference import ReferenceTrainer
-from tests.trainer.conftest import make_batch, make_config
+from tests.trainer.conftest import SGD, assert_same_update, exported, make_batch, make_config
 
 
 def _config(tiny_model_dir: Path, *, lora: bool, algorithm: dict[str, Any], **trainer: Any) -> RunConfig:
@@ -68,13 +68,14 @@ def test_a_step_is_that_of_the_logits_at_every_position(
     for narrow in (True, False):
         torch.manual_seed(0)  # the LoRA adapters are drawn at construction
         trainer = ReferenceTrainer(
-            _config(tiny_model_dir, lora=lora, algorithm=CASES[case], gradient_checkpointing=lora)
+            _config(tiny_model_dir, lora=lora, algorithm=CASES[case], gradient_checkpointing=lora, **SGD)
         )
         assert trainer._narrow_head  # a transformers causal LM applies its head row by row
         trainer._narrow_head = narrow
+        initial = exported(trainer)
         batch = _batch(tokenizer, trainer, case)
         metrics = [trainer.train_step(batch) for _ in range(2)]
-        weights = torch.cat([w.detach().flatten() for _, w in trainer.export_weights()])
+        weights = exported(trainer)
         logprobs = trainer.compute_logprobs(batch)
         reference = trainer.compute_logprobs(batch, reference=True)
         values = trainer.compute_values(batch) if case == "ppo" else None
@@ -88,7 +89,7 @@ def test_a_step_is_that_of_the_logits_at_every_position(
         assert step_a["grad_norm"] > 0
         for key, value in step_a.items():
             assert value == pytest.approx(step_b[key], rel=1e-4, abs=1e-6), key
-    torch.testing.assert_close(weights_a, weights_b, atol=1e-6, rtol=0)
+    assert_same_update(initial, weights_a, weights_b)
     for a, b in ((old_a, old_b), (lp_a, lp_b), (ref_a, ref_b)):
         torch.testing.assert_close(a, b, atol=1e-5, rtol=0)
     torch.testing.assert_close(ref_a, old_a, atol=1e-5, rtol=0)  # the reference is the initial policy
@@ -112,20 +113,21 @@ def test_an_mtp_step_is_that_of_the_logits_at_every_position(tmp_path: Path) -> 
         for prompt, new in zip(PROMPTS, NEW_TOKENS, strict=True)
     ]
     batch = mtp_batch(rows, pad=0)
-    cfg = make_config(mtp_dir).to_dict()
+    cfg = make_config(mtp_dir, **SGD).to_dict()
     cfg["model"]["mtp"] = {"enabled": True, "train": True, "detach_trunk": False, "loss_coef": 1.0}
     results = []
     for narrow in (True, False):
         trainer = ReferenceTrainer(RunConfig.from_dict(cfg))
         assert trainer._narrow_head
         trainer._narrow_head = narrow
+        initial = exported(trainer)
         metrics = trainer.train_step(batch)
-        results.append((metrics, torch.cat([w.detach().flatten() for _, w in trainer.export_weights()])))
+        results.append((metrics, exported(trainer)))
     (metrics_a, weights_a), (metrics_b, weights_b) = results
     assert metrics_a["loss/mtp"] > 0 and metrics_a["grad_norm"] > 0
     for key, value in metrics_a.items():
         assert value == pytest.approx(metrics_b[key], rel=1e-4, abs=1e-6), key
-    torch.testing.assert_close(weights_a, weights_b, atol=1e-6, rtol=0)
+    assert_same_update(initial, weights_a, weights_b)
 
 
 def test_the_output_embedding_sees_the_response_positions_only(tiny_model_dir: Path, tokenizer) -> None:
