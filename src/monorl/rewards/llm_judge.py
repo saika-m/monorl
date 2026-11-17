@@ -24,6 +24,9 @@ Params:
     on_error: what a judgment that failed for good becomes: ``zero`` (default; score 0 with
         ``info["error"]``) or ``raise``.
 
+A call that scored failures as 0 says so in one warning of this module's logger (``reward <name>:
+N of M judgments failed and scored 0 (...)``): a 0 of that kind is not a grade.
+
 Factory kwargs: ``client=httpx.Client(...)`` injects a transport (tests use ``MockTransport``);
 ``wait=fn(stop, seconds)`` replaces the wait between attempts (``threading.Event.wait``) and
 returns whether to give up.
@@ -31,12 +34,14 @@ returns whether to give up.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import random
 import re
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
@@ -65,9 +70,13 @@ a final line of the form <score>N</score> where N is an integer from 0 to {max_s
 
 _SCORE_RE = re.compile(r"<score>\s*(-?\d+(?:\.\d+)?)\s*</score>", re.IGNORECASE)
 
+log = logging.getLogger(__name__)
+
 RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 """Statuses that say "not now": the same request may succeed a moment later."""
 _RETRY_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+_MAX_BODY_CHARS = 300
+"""How much of an error response is kept in ``info["body"]``."""
 
 
 def parse_score(text: str) -> float | None:
@@ -89,6 +98,17 @@ def retry_after_seconds(response: httpx.Response) -> float:
             when = when.replace(tzinfo=UTC)
         seconds = when.timestamp() - time.time()
     return seconds if 0.0 < seconds < math.inf else 0.0
+
+
+def _describe(error: Exception) -> dict[str, Any]:
+    """``info`` of a failed request: ``error`` names the kind, ``body`` holds what the server said."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return {"error": f"{type(error).__name__}: {error}"}
+    response = error.response
+    info = {"error": f"HTTPStatusError: {response.status_code} {response.reason_phrase}"}
+    if response.text:
+        info["body"] = response.text[:_MAX_BODY_CHARS]
+    return info
 
 
 class LLMJudgeReward:
@@ -211,7 +231,7 @@ class LLMJudgeReward:
                         continue
                 if self.on_error == "raise":
                     raise
-                return self._failed(attempts, error=f"{type(e).__name__}: {e}")
+                return self._failed(attempts, **_describe(e))
         # ``content`` is null when the judge spent its tokens on reasoning, refused, or called a tool.
         raw = parse_score(content) if isinstance(content, str) else None
         if raw is None:
@@ -228,16 +248,30 @@ class LLMJudgeReward:
     def __call__(self, trajectories: Sequence[Trajectory]) -> list[RewardResult]:
         check_trajectories(trajectories)
         if len(trajectories) <= 1 or self.max_workers <= 1:
-            return [self.judge(t) for t in trajectories]
-        stop = threading.Event()
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            try:
-                return list(pool.map(partial(self.judge, stop=stop), trajectories))
-            finally:
-                # Left early (an error with on_error: raise, an interrupt): the judgments that wait
-                # for a retry give up at once, so the pool is back after the requests that are on
-                # the wire and not after their backoff.
-                stop.set()
+            results = [self.judge(t) for t in trajectories]
+        else:
+            stop = threading.Event()
+            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                try:
+                    results = list(pool.map(partial(self.judge, stop=stop), trajectories))
+                finally:
+                    # Left early (an error with on_error: raise, an interrupt): the judgments that
+                    # wait for a retry give up at once, so the pool is back after the requests
+                    # that are on the wire and not after their backoff.
+                    stop.set()
+        failed = [r.info for r in results if "error" in r.info]
+        if failed:
+            kinds = Counter(str(info["error"]) for info in failed)
+            said = next((f"; the endpoint said: {info['body']!r}" for info in failed if "body" in info), "")
+            log.warning(
+                "reward %s: %d of %d judgments failed and scored 0 (%s)%s",
+                self.name,
+                len(failed),
+                len(results),
+                ", ".join(f"{n}x {kind}" for kind, n in kinds.most_common()),
+                said,
+            )
+        return results
 
 
 def make_llm_judge(

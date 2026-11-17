@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 
 import httpx
@@ -114,8 +115,8 @@ def test_llm_judge_error_handling(traj):
 
     results = _judge(handler, max_workers=1)([traj("a"), traj("b")])
     assert [r.score for r in results] == [0.0, 0.0]
-    assert "HTTPStatusError" in results[0].info["error"]
-    assert results[1].info["error"] == "no_score"
+    assert results[0].info == {"error": "HTTPStatusError: 404 Not Found", "body": "no such model"}
+    assert results[1].info == {"error": "no_score", "judge_output": "no tag here"}
 
     waits: list[float] = []
     strict = _judge(lambda r: httpx.Response(503), waits, on_error="raise")
@@ -131,15 +132,17 @@ def test_a_reply_without_text_is_a_judgment_without_a_score(traj):
         _judge(lambda request: _reply(None), on_error="raise")([traj("a")])
 
 
-def test_a_rate_limit_is_waited_out_and_the_answer_scored(traj):
+def test_a_rate_limit_is_waited_out_and_the_answer_scored(traj, caplog):
     calls: list[int] = []
     waits: list[float] = []
     first = httpx.Response(429, headers={"Retry-After": "2"}, text="slow down")
-    result = _judge(_failing_then(first, calls), waits)([traj("a")])[0]
+    with caplog.at_level(logging.WARNING):
+        result = _judge(_failing_then(first, calls), waits)([traj("a")])[0]
     assert result.score == 0.7 and result.breakdown == {"llm_judge": 0.7}
     assert result.info == {"raw_score": 7.0, "judge_output": "<score>7</score>", "attempts": 2}
     assert len(calls) == 2
     assert waits == [2.0]  # what the server asked for: more than the first backoff of at most 1s
+    assert not caplog.records  # nothing failed
 
 
 @pytest.mark.parametrize(
@@ -185,7 +188,7 @@ def test_other_failures_are_final_at_once(traj, first, error):
     assert len(calls) == 1
 
 
-def test_a_persistent_outage_ends_after_max_attempts_with_doubling_waits(traj):
+def test_a_persistent_outage_ends_after_max_attempts_with_doubling_waits(traj, caplog):
     calls: list[int] = []
     waits: list[float] = []
 
@@ -194,12 +197,39 @@ def test_a_persistent_outage_ends_after_max_attempts_with_doubling_waits(traj):
         return httpx.Response(503, text="upstream down")
 
     fn = _judge(handler, waits, max_attempts=4, retry_backoff_s=2, max_workers=1)
-    results = fn([traj("a"), traj("b")])
+    with caplog.at_level(logging.WARNING):
+        results = fn([traj("a"), traj("b")])
     assert [r.score for r in results] == [0.0, 0.0]
-    assert "503 Service Unavailable" in results[0].info["error"] and results[0].info["attempts"] == 4
+    assert results[0].info == {
+        "error": "HTTPStatusError: 503 Service Unavailable",
+        "body": "upstream down",
+        "attempts": 4,
+    }
     assert len(calls) == 8 and len(waits) == 6
     for first, second, third in (waits[:3], waits[3:]):
         assert 1.0 <= first <= 2.0 and 2.0 <= second <= 4.0 and 4.0 <= third <= 8.0
+    assert [r.getMessage() for r in caplog.records] == [
+        "reward llm_judge: 2 of 2 judgments failed and scored 0 "
+        "(2x HTTPStatusError: 503 Service Unavailable); the endpoint said: 'upstream down'"
+    ]
+
+
+def test_failed_judgments_of_a_call_are_counted_by_kind_in_one_warning(traj, caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = json.loads(request.content)["messages"][-1]["content"]
+        if "refused" in response:
+            return httpx.Response(403, json={"error": "key has no access to judge-1"})
+        return _reply("<score>4</score>" if "graded" in response else "I cannot grade this.")
+
+    fn = _judge(handler, name="quality", rubric="{response}", max_workers=3)
+    texts = ["graded", "refused", "ungradable", "refused", "graded"]
+    with caplog.at_level(logging.WARNING):
+        results = fn([traj(text) for text in texts])
+    assert [r.score for r in results] == [0.4, 0.0, 0.0, 0.0, 0.4]
+    assert [r.getMessage() for r in caplog.records] == [
+        "reward quality: 3 of 5 judgments failed and scored 0 (2x HTTPStatusError: 403 Forbidden, "
+        """1x no_score); the endpoint said: '{"error":"key has no access to judge-1"}'"""
+    ]
 
 
 def test_the_waits_of_a_judgment_stay_within_retry_max_wait_s(traj):
