@@ -68,7 +68,7 @@ The SFT loop has no rollouts, rewards, environments or weight sync. Each step en
 | `running` | at start, then after every step with a progress message |
 | `succeeded` | all steps ran and `final/` was exported |
 | `cancelled` | a signal stopped the run before `trainer.max_steps` |
-| `failed` | any exception; the message is `<ExceptionType>: <text>`, the traceback is in `run.log` |
+| `failed` | any exception; the message is `<ExceptionType>: <text>`, and `run.log` has the traceback unless the error is a mistake in the config, the data or the installation ([`run.log`](#runlog)) |
 
 `status.json` holds one of these states. `monorl train` exits with 0 for `succeeded`, 130 for
 `cancelled` and 1 otherwise.

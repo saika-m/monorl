@@ -24,7 +24,7 @@ def test_an_unknown_component_fails_the_run_with_its_message_and_no_traceback(ma
     result = run(make_config(trainer={"backend": "no_such_trainer"}))
     assert result.state == "failed"
     message = result.error or ""
-    assert message.startswith("RegistryError: No trainer named 'no_such_trainer'. Available: [")
+    assert message.startswith("RegistryError: No trainer named 'no_such_trainer'. Known: ")
     assert "Traceback" not in message and "Traceback" not in _log(result)
     assert _log(result).splitlines()[-1].endswith(f"[failed] {message}")
     assert read_status(result.run_dir)["message"] == message
