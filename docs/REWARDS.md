@@ -176,21 +176,73 @@ print(r.score, r.info["cases"])  # 0.5 ['passed', 'error']
 
 Asks an OpenAI-compatible chat-completions endpoint for a grade and parses the last
 `<score>N</score>` of the reply, clamped to `[0, max_score]`. The score is `N / max_score`, or `N`
-with `normalize: false`. Not run here against an endpoint; the entry below was validated only.
+with `normalize: false`. A request that fails for a passing reason is sent again; a judgment that
+fails for good scores 0.0 and is reported, see [Operational behaviour](#operational-behaviour).
+Run here against `httpx.MockTransport` and a local stand-in endpoint, not against a judge model;
+the entry below was validated by building the reward from it.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `base_url`, `model` | required | Endpoint root such as `http://host:8000/v1`; judge model name |
-| `rubric` | built-in | Template: `{prompt}`, `{response}`, `{reference}`, `{max_score}` |
+| `rubric` | built-in | `str.format` template, see below |
 | `api_key_env`, `system_prompt` | `OPENAI_API_KEY`, unset | Bearer token variable; system message |
-| `max_score`, `normalize` | `10`, `True` | Scale of `N`; whether to divide by it |
+| `max_score`, `normalize` | `10`, `True` | Scale of `N`, above 0; whether to divide by it |
 | `temperature`, `max_tokens`, `extra_body` | `0.0`, `512`, `{}` | Request fields; extra fields |
-| `timeout_s`, `max_workers`, `on_error` | `60`, `8`, `zero` | Seconds; threads; `zero` or `raise` |
+| `timeout_s`, `max_workers` | `60`, `8` | `httpx` timeout of a request (s); requests at a time |
+| `max_attempts` | `4` | Requests per judgment at most; `1` turns retrying off |
+| `retry_backoff_s` | `1.0` | Longest wait before the first retry, in seconds; doubles per retry |
+| `retry_max_wait_s` | `60` | Seconds a judgment may wait between its attempts in total |
+| `on_error` | `zero` | A judgment that failed for good: `zero` (score 0.0) or `raise` |
+
+The rubric may use `{prompt}`, `{response}`, `{reference}` and `{max_score}` and has to ask for
+the `<score>N</score>` line; a literal brace in it is written `{{` or `}}`. A rubric that does not
+format, a `max_score` of 0 and a `max_attempts` below 1 raise `ValueError` when the reward is
+built.
 
 ```yaml
 rewards:
   - type: llm_judge
     params: {base_url: "http://127.0.0.1:8000/v1", model: judge, api_key_env: JUDGE_KEY}
+```
+
+The factory takes two keyword arguments for tests: `client`, an `httpx.Client` to send through,
+and `wait(stop, seconds)`, called in place of each wait between attempts. Below, an endpoint that
+is busy once and then grades, one that stays down, and one whose reply has no score:
+
+```python
+import httpx
+
+def judge(*replies, **params):  # replies of the endpoint, the last one repeated
+    left = list(replies)
+    answer = lambda request: left.pop(0) if left[1:] else left[0]
+    client = httpx.Client(transport=httpx.MockTransport(answer))
+    params = {"base_url": "http://judge.test/v1", "model": "judge", **params}
+    wait = lambda stop, seconds: print("wait", seconds)
+    return registry.get("reward", "llm_judge")(params, client=client, wait=wait)
+
+def reply(text):
+    return httpx.Response(200, json={"choices": [{"message": {"content": text}}]})
+
+seven = traj("It is 7.", reference="7")
+busy = httpx.Response(429, headers={"Retry-After": "2"})
+r = judge(busy, reply("Right. <score>8</score>"))([seven])[0]
+# wait 2.0
+print(r.score, r.info)
+# 0.8 {'raw_score': 8.0, 'judge_output': 'Right. <score>8</score>', 'attempts': 2}
+
+r = judge(httpx.Response(503), max_attempts=3, retry_backoff_s=0)([seven])[0]
+# wait 0.0
+# wait 0.0
+# on stderr: reward llm_judge: 1 of 1 judgments failed and scored 0 (1x HTTPStatusError:
+#   503 Service Unavailable)
+print(r.score, r.info)
+# 0.0 {'error': 'HTTPStatusError: 503 Service Unavailable', 'attempts': 3}
+
+fn = judge(reply("Right."), reply("Right. <score>8</score>"), max_workers=1)
+r = fn([seven, seven])[0]
+# on stderr: reward llm_judge: 1 of 2 judgments failed and scored 0 (1x no_score)
+print(r.score, r.info)
+# 0.0 {'error': 'no_score', 'judge_output': 'Right.'}
 ```
 
 ### `reward_model`
@@ -242,8 +294,50 @@ boundary: same user, filesystem and network access, no container, no CPU or proc
 
 `llm_judge` sends one `POST {base_url}/chat/completions` per trajectory, up to `max_workers` at a
 time. The only environment variable read is the one named by `api_key_env`, at construction; if
-unset, no `Authorization` header is sent. There are no retries. With `on_error: zero` an HTTP error,
-a malformed body or a reply without a score tag scores 0.0 with `info["error"]`; `raise` propagates.
+unset, no `Authorization` header is sent.
+
+A request is sent again after a connection error, a timeout or one of the statuses 408, 429, 500,
+502, 503 and 504, until the judgment has made `max_attempts` requests. The wait before retry `k`
+(from 1) is drawn between half of and all of `retry_backoff_s * 2 ** (k - 1)` seconds, so that the
+workers of a call do not return together, or is what the response's `Retry-After` header asks for
+(seconds, or a date) when that is longer. A wait that would take the waits of the judgment past
+`retry_max_wait_s` is not begun: the judgment ends with the error it has. A judgment whose
+requests each end within `timeout_s` therefore takes at most
+`max_attempts * timeout_s + retry_max_wait_s` seconds. Every other failure is final at once:
+another status (400, 401, 404, ...), a body that is not a chat completion, a reply without a
+score tag or without text.
+
+A judgment that failed for good scores 0.0 with `on_error: zero`; with `raise` the error
+propagates and ends the run. The 0.0 is the same number as a grade of 0 in `reward/mean` and
+`reward/<name>`, and it is trained on. What tells them apart:
+
+- One warning per call of the reward, which the loop makes once with all trajectories of a step,
+  through Python's `logging` under `monorl.rewards.llm_judge`:
+  `reward <name>: N of M judgments failed and scored 0 (<count>x <error>, ...)`, followed by the
+  body of the first error response. It goes to stderr and carries no time: that is the terminal
+  of `monorl train`, and `run.log` for a job started by `monorl serve`, whose stderr is that file
+  (from `src/monorl/server/jobs.py`; run here with the same redirection, not through the server).
+- In `trajectories.jsonl`, `info.reward_info.<name>` of a row holds `error` (`no_score`, or the
+  exception's name and message, for a status `HTTPStatusError: 503 Service Unavailable`), `body`
+  (the first 300 characters of an error response), `judge_output` for a reply without a score,
+  and `attempts` when the judgment made more than one request, successful or not.
+- `time/reward` grows by the waits.
+
+No metric counts failed judgments. Run here, one step of four episodes on a tiny random model
+against a local endpoint that always answers 503 with `Retry-After: 3`: the run succeeded with
+`reward/mean` 0.0 and `time/reward` 9.07, stderr had
+`reward llm_judge: 4 of 4 judgments failed and scored 0 (4x HTTPStatusError: 503 Service
+Unavailable)` with the response body after it, `run.log` did not (it did with stderr appended to
+it), and the four rows had `attempts: 4`. Against an endpoint that answered every fourth request
+with 429, all four rewards were the judge's 0.6 and nothing was logged.
+
+A judgment that waits keeps its worker thread and nothing else; the other workers go on. When a
+call ends early (an error with `on_error: raise`, a `KeyboardInterrupt`), the waiting judgments
+give up at once. The first Ctrl-C or SIGTERM of a run ends it after the current step, and that
+step finishes its judgments, retries included; a second one stops at once. Run here against the
+endpoint above: a first SIGINT two seconds into the judgments of step 1 was followed by the rest
+of their nine seconds of waits and `cancelled after step 1`; a second one a second later gave
+`cancelled after step 0` within that second.
 
 `reward_model` loads tokenizer and model once, when the loop is built, in the loop's process. Each
 conversation is rendered with the tokenizer's chat template when it has one, else as
