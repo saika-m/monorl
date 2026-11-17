@@ -248,6 +248,12 @@ Spec, sampling, rewards and advantages work exactly as with Python envs: the env
 rewards become the `env` term of the trajectory reward (discounted by `algorithm.gamma`) and are
 added to the score of any `rewards:` entries you configure.
 
+The http servers of the Go and C++ SDKs answer every client that can connect, whatever the
+`Host`, `Origin` and `Content-Type` of its request, which includes a web page open in a browser
+on the same machine. The Python server (`monorl env serve`) refuses such requests
+([ENVIRONMENTS.md](ENVIRONMENTS.md#serving-and-checking-it-over-mep1)). Keep an SDK server whose
+episodes have effects beyond their own state on an address that only your runs reach.
+
 ### Scaling parallel episodes
 
 The orchestrator opens all episodes of a step at once and batches their generation calls,

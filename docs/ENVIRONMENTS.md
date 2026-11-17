@@ -379,6 +379,32 @@ of the `--config` file are loaded, so it serves your types too. Checked here ove
 `monorl env serve guess --config serve.yaml --transport http --port 18474` (a config with the
 three keys above), each followed by `monorl env check --url http://127.0.0.1:<port>`.
 
+The http transport answers environment clients, not browsers. A page open in a browser on the
+same machine can send requests to `127.0.0.1`, so the server refuses the ones a page can make:
+
+| Request | Answer |
+|---|---|
+| `Host` is a name other than `localhost` and the `--allowed-host` names | 403, error type `forbidden` |
+| it has an `Origin` header | 403, error type `forbidden` |
+| `POST` whose `Content-Type` is not `application/json` | 415, error type `unsupported_media_type` |
+
+monorl's clients (`env.type: remote`, `monorl env check`, `monorl bench env`) send none of these,
+and neither does `curl` with `-H 'Content-Type: application/json'`. The refusal is a MEP/1 error
+envelope whose message names what was refused, and the server logs it.
+
+The `Host` check is about names: a page whose domain was pointed at `127.0.0.1` after it loaded
+sends that domain as `Host`, never an address. A `Host` that is an IP address is therefore always
+answered, and a run that addresses the server as `http://10.0.0.5:8080` needs nothing. A server
+that other machines reach under a DNS name needs the name they use in the environment's `url`:
+started with `--host 0.0.0.0 --allowed-host env-1` it answers `http://env-1:8080` (repeat the
+option for more names; in a script, `serve(..., allowed_hosts=["env-1"])`).
+`--allowed-host '*'` accepts every `Host`, for a server behind a proxy that rewrites it; the
+other two checks have no switch. These checks are not authentication: whoever can connect and
+sends a well-formed request is served, so a server on `0.0.0.0` belongs on a network where only
+your runs reach it. Checked here on `127.0.0.1`: the first server above with
+`--allowed-host env-1` added answers `curl -H 'Host: env-1:8080' http://127.0.0.1:18473/health`
+with `{"ok":true}`, and with 403 without the option. `--host 0.0.0.0` was not run.
+
 ### When to use another language
 
 Write the server in Go, C++ or any language that can exchange JSON over stdio or http when the
