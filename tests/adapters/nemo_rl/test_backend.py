@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from monorl.adapters.nemo_rl import register
@@ -283,6 +284,39 @@ def test_a_child_that_logs_while_it_shuts_down_is_not_held_up(
     log = (run_dir / "run.log").read_text()
     assert "shutting down 3999" in log and "shutdown complete" in log
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+def _ended(pid: int) -> bool:
+    """Whether the process ``pid`` has ended; one that was just killed has ten seconds to go."""
+    try:
+        process = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return True
+    return not psutil.wait_procs([process], timeout=10)[1]
+
+
+@pytest.mark.timeout(120)
+def test_a_second_signal_kills_the_child_and_its_process_group(
+    python_launch: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that ignores SIGTERM, and so does its worker: the second signal ends the run at
+    once, without the 30 seconds of the grace period, and leaves neither of them."""
+    monkeypatch.setenv("FAKE_NEMO_RL_SLEEP", "stubborn")
+    run_dir = tmp_path / "run"
+    reporter = _SignallingReporter(run_dir, at="sleeping", signals=[signal.SIGINT, signal.SIGINT])
+    try:
+        result = NemoRLBackend().run(python_launch, run_dir, reporter=reporter)
+        worker = int((run_dir / "worker.pid").read_text())
+        assert result.state == "cancelled" and result.error == "interrupted"
+        status = read_status(run_dir)
+        assert status["state"] == "cancelled" and status["returncode"] == -signal.SIGKILL
+        assert _ended(status["child_pid"]) and _ended(worker)
+        assert "received SIGINT again: stopping now" in (run_dir / "run.log").read_text()
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    finally:  # what a run that did not kill it leaves behind
+        for pid in (int(p.read_text()) for p in run_dir.glob("worker.pid")):
+            if psutil.pid_exists(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 def test_cancel_propagates_to_child(

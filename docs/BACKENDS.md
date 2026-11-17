@@ -380,28 +380,37 @@ gives the backend the event that the first signal sets (`PipelineBackend.run(...
   checkout); what the frameworks do is read from the pinned sources. Neither was run with a
   signal here. Common to both: while monorl prepares the run (compiling the config, exporting the
   data) the event is set and logged like in any run, and the backend does not read it, so the
-  child is started all the same. From the start of the child to its end the backend handles both
-  signals itself. Its handler only notes the request: the child is stopped outside the handler,
-  while the backend goes on with its work, and a second signal changes nothing. The training
+  child is started all the same. From the start of the child to its end the backend handles the
+  two signals for the same event. The first one asks the child to stop and gives it 30 seconds;
+  `run.log` has `received SIGINT: stopping the verl driver` or `stopping NeMo-RL`. A second one
+  kills the child at once, with the line `received SIGINT again: stopping now`. The training
   loops of the two frameworks handle neither signal at the pin (`verl/trainer/`;
   `nemo_rl/algorithms/grpo.py` and `sft.py`, `examples/run_grpo.py` and `run_sft.py`): the step
   in flight is lost, no checkpoint is written for the signal, and `--resume` continues from the
   checkpoint the framework saved last on its own schedule. The run ends `cancelled` with exit
   code 130.
-  * **verl.** Within a second of the signal (the backend looks once a second) the driver,
+  * **verl.** Within a second of the first signal (the backend looks once a second) the driver,
     `python -m monorl.adapters.verl.entry`, gets SIGTERM, and `run.log` the line
     `cancel requested: sent SIGTERM to verl driver`. A driver that is still running 30 seconds
-    later (`VerlBackend.grace_seconds`) is killed with SIGKILL, after the line
-    `verl driver did not exit in time: sending SIGKILL`. The status message is
+    later (`VerlBackend.grace_seconds`, with the line
+    `verl driver did not exit in time: sending SIGKILL`) is killed, and so is the driver at a
+    second signal: SIGKILL to the driver first, then to every process that descends from it. The
+    process tree is read twice for that, before the driver is killed and again before its
+    descendants are, for what they started in between. Not reached: a process that is no longer
+    in the driver's tree (its parent has ended, or it was started detached; whether the daemons
+    Ray starts for the driver are among them was not looked at), and a process the driver starts
+    between the first reading and its own SIGKILL. The driver stays in the process group of
+    `monorl train`, so that Ctrl-C in a terminal reaches it as SIGINT as well, and so does what
+    the server sends to the group of a job it cancels. The status message is
     `verl run cancelled`, and the step is that of `checkpoints/latest_checkpointed_iteration.txt`,
-    or of the last row of `metrics.jsonl` when verl saved no checkpoint. The driver is in the
-    process group of `monorl train`, so Ctrl-C in a terminal reaches it as SIGINT as well. What
-    the Ray processes of the run do when the driver ends was not looked at.
+    or of the last row of `metrics.jsonl` when verl saved no checkpoint.
   * **NeMo-RL.** The child runs in a session of its own, so Ctrl-C in a terminal reaches only
-    monorl. The child's process group gets SIGTERM, and SIGKILL if the child is still running 30
-    seconds later (`CANCEL_GRACE_SECONDS`). What the child prints while it shuts down is copied
-    to `run.log` like the rest of its output. The status message is `cancelled by user`, and the
-    step is that of the last row of `metrics.jsonl`.
+    monorl. At the first signal the child's process group gets SIGTERM, and SIGKILL if the child
+    is still running 30 seconds later (`CANCEL_GRACE_SECONDS`). What the child prints while it
+    shuts down is copied to `run.log` like the rest of its output. At a second signal the group
+    gets SIGKILL at once: the child and what it started, as far as that stayed in its group. The
+    status message is `cancelled by user`, and the step is that of the last row of
+    `metrics.jsonl`.
 
 ## Choosing
 

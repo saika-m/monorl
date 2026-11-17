@@ -270,8 +270,9 @@ class PipelineBackend(Protocol):
     the run once the step in flight is done, as the loops do: the step is logged, the framework's
     checkpoint of it exists for a resume, nothing is exported, and the result is ``cancelled``
     unless that step was the last one. A backend that runs its framework in a child process
-    takes the signals over while the child runs and stops the child; ``docs/BACKENDS.md`` says
-    what each backend does.
+    cannot have the step finished: while the child runs it handles the signals itself, for the
+    same event, asks the child to stop at the first and kills it at a second one;
+    ``docs/BACKENDS.md`` says what each backend does.
     """
 
     name: str

@@ -56,6 +56,7 @@ FAKE_HOME_FILES: dict[str, str] = {
         import os
         import re
         import signal
+        import subprocess
         import sys
         import time
 
@@ -96,6 +97,12 @@ FAKE_HOME_FILES: dict[str, str] = {
                     sys.exit(0)
 
                 signal.signal(signal.SIGTERM, shut_down)
+            if os.environ.get("FAKE_NEMO_RL_SLEEP") == "stubborn":
+                # a framework that SIGTERM does not end, with a worker process (which inherits that)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+                with open(os.path.join(run_dir, "worker.pid"), "w") as f:
+                    f.write(str(worker.pid))
             if os.environ.get("FAKE_NEMO_RL_SLEEP"):
                 print("sleeping", flush=True)
                 while True:

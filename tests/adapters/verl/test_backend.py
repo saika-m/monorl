@@ -11,6 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 import yaml
 
@@ -29,7 +30,7 @@ from monorl.core.registry import registry
 from monorl.core.reporting import RunReporter, iter_metrics, list_checkpoints, read_status
 
 _FAKE_ENTRY = """
-import json, os, signal, sys, time
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 
 run_dir = Path(os.environ["MONORL_RUN_DIR"])
@@ -48,6 +49,11 @@ print("RAY_ADDRESS=", os.environ.get("RAY_ADDRESS"), flush=True)
 if mode == "fail":
     print("boom", file=sys.stderr, flush=True)
     sys.exit(3)
+if mode == "stubborn":
+    # a driver that SIGTERM does not end, with a worker in a session of its own
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True)
+    (run_dir / "worker.pid").write_text(str(worker.pid))
 with open(run_dir / "metrics.jsonl", "a") as f:
     for step in (start + 1, start + 2):
         f.write(json.dumps({"step": step, "time": 0.0, "phase": "train", "reward/mean": 0.25 * step, "actor/lr": 1e-6}) + "\\n")
@@ -60,6 +66,8 @@ tracker.write_text(str(start + 2))
 if mode == "hang":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     time.sleep(60)
+if mode == "stubborn":
+    time.sleep(600)
 print("done", flush=True)
 """
 
@@ -314,6 +322,45 @@ def test_a_signal_during_a_write_of_the_reporter_cancels_instead_of_hanging(
     assert read_status(run_dir)["state"] == "cancelled"
     assert "cancel requested: sent SIGTERM to verl driver" in (run_dir / "run.log").read_text()
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+def _ended(pid: int) -> bool:
+    """Whether the process ``pid`` has ended; one that was just killed has ten seconds to go."""
+    try:
+        process = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return True
+    return not psutil.wait_procs([process], timeout=10)[1]
+
+
+@pytest.mark.timeout(60)
+def test_a_second_signal_kills_the_driver_and_what_it_started(
+    make_config, tmp_path: Path, fake_entry: Path, monkeypatch: pytest.MonkeyPatch, signals_in_a_status_write
+):
+    """A driver that ignores SIGTERM, with a worker in another session: no signal to a process
+    group reaches both. The second signal ends the run at once, without the grace period (ten
+    minutes here, against the timeout of the test), and leaves neither of them."""
+    monkeypatch.setenv("FAKE_ENTRY_MODE", "stubborn")
+    cfg = make_config()
+    run_dir = tmp_path / "run"
+    backend = _backend(cfg)
+    backend.grace_seconds = 600.0
+    signals_in_a_status_write([signal.SIGINT, signal.SIGINT])
+    try:
+        result = backend.run(cfg, run_dir, reporter=RunReporter(run_dir, echo=False))
+        worker = int((run_dir / "worker.pid").read_text())
+        assert result.state == "cancelled" and result.error == "interrupted"
+        status = read_status(run_dir)
+        assert status["state"] == "cancelled"
+        assert _ended(status["child_pid"]) and _ended(worker)
+        assert "received SIGINT again: stopping now" in (run_dir / "run.log").read_text()
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    finally:  # what a run that did not kill them leaves behind
+        leftovers = [int(p.read_text()) for p in run_dir.glob("worker.pid")]
+        leftovers.append((read_status(run_dir) or {}).get("child_pid"))
+        for pid in leftovers:
+            if pid and psutil.pid_exists(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 def test_checkpoint_helpers(tmp_path: Path):

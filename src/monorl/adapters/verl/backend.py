@@ -3,10 +3,12 @@
 Launch is a subprocess ``python -m monorl.adapters.verl.entry <overrides>`` (cwd = run dir) so the
 monorl process never imports verl/ray. Its stdout+stderr stream into ``run.log``; metrics arrive
 through the ``Tracking.log`` patch (``metrics.jsonl``); ``status.json`` is kept current here.
-Cancellation (``cancel()``, SIGTERM/SIGINT in the main thread) forwards SIGTERM to the verl driver,
-which is what ``ray job stop`` does, then SIGKILLs after :attr:`VerlBackend.grace_seconds`. The
-signal handler only sets the event that ``cancel()`` sets; the loop that waits for the driver acts
-on it.
+Cancellation (``cancel()``, or the first SIGTERM/SIGINT in the main thread) forwards SIGTERM to
+the verl driver, which is what ``ray job stop`` does, then SIGKILLs after
+:attr:`VerlBackend.grace_seconds`. The signals are handled by
+:func:`~monorl.core.signals.signal_guard`: the first sets an event that the loop waiting for the
+driver acts on, a second one interrupts that loop and the driver is killed at once. SIGKILL goes
+to the driver and to every process that descends from it (:func:`kill_tree`).
 
 verl writes checkpoints to ``trainer.default_local_dir`` (= ``<run_dir>/checkpoints``) as
 ``global_step_<n>/`` plus ``latest_checkpointed_iteration.txt`` (``verl/trainer/ppo/v1/trainer_base.py``);
@@ -26,6 +28,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+import psutil
 import yaml
 
 from monorl.adapters.verl.compiler import compile_config, to_overrides
@@ -36,6 +39,7 @@ from monorl.adapters.verl.tools import write_tool_config
 from monorl.config.schema import RunConfig
 from monorl.core.errors import BackendUnavailable
 from monorl.core.reporting import CHECKPOINT_DIR, CONFIG_FILE, LOG_FILE, RunReporter, iter_metrics
+from monorl.core.signals import signal_guard
 from monorl.core.types import RunResult
 
 ENTRY_MODULE = "monorl.adapters.verl.entry"
@@ -117,6 +121,43 @@ def final_model_path(run_dir: str | Path) -> str | None:
     return str(last)
 
 
+def _descendants(pids: set[int]) -> list[psutil.Process]:
+    """The processes that descend from one of ``pids``, from one look at the process table."""
+    children: dict[int | None, list[psutil.Process]] = {}
+    for process in psutil.process_iter(["ppid"]):
+        children.setdefault(process.info["ppid"], []).append(process)
+    found: dict[int, psutil.Process] = {}
+    pending = list(pids)
+    while pending:
+        for child in children.get(pending.pop(), ()):
+            if child.pid not in found and child.pid not in pids:
+                found[child.pid] = child
+                pending.append(child.pid)
+    return list(found.values())
+
+
+def kill_tree(proc: subprocess.Popen[bytes]) -> None:
+    """SIGKILL the driver ``proc`` and the processes that descend from it, and reap the driver.
+
+    The driver runs in the process group of monorl, where a signal to the group of whoever
+    started monorl (the server's job control, a terminal) still reaches it; the price is that its
+    group cannot be killed without killing monorl. So its tree is walked: the driver is killed
+    first and starts nothing more, then what it had started. A process whose parent has died is
+    no longer in anybody's tree, so the second look, for what the processes found have started
+    since the first, comes before they are killed. Not reached: a process that left the tree
+    earlier (its parent ended, or it was started detached), and one the driver starts between the
+    first look and its own SIGKILL."""
+    found = _descendants({proc.pid}) if proc.poll() is None else []
+    proc.kill()
+    found += _descendants({process.pid for process in found})
+    for process in found:
+        try:
+            process.kill()
+        except psutil.Error:  # gone already, or not ours to signal
+            pass
+    proc.wait()
+
+
 class VerlBackend:
     name = "verl"
     grace_seconds = 30.0
@@ -165,10 +206,7 @@ class VerlBackend:
     # -- lifecycle ----------------------------------------------------------------------
     def cancel(self) -> None:
         """Request cancellation: ``run`` sends SIGTERM to the verl driver (``ray job stop``
-        semantics) the next time it looks, at most :attr:`poll_seconds` later. This only sets an
-        event, so that the signal handler can call it: the handler runs on the main thread in the
-        middle of whatever that thread is doing, and must not wait for the reporter's lock, which
-        the thread may hold (see :func:`monorl.core.signals.signal_guard`)."""
+        semantics) the next time it looks, at most :attr:`poll_seconds` later."""
         self._cancel.set()
 
     def run(
@@ -180,8 +218,10 @@ class VerlBackend:
         resume: bool = False,
         cancel: threading.Event | None = None,
     ) -> RunResult:
-        """``cancel`` is not read: while the child runs, the signals of this process are handled
-        here (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
+        """``cancel`` is the event that the first SIGINT or SIGTERM sets. While the driver runs
+        the backend handles the two signals with it (on the main thread; with an event of its
+        own when it is given none): the first asks the driver to stop, a second one kills it
+        (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
         run_dir = Path(run_dir).expanduser().resolve()
         if not self._custom_python and not is_available():
             raise BackendUnavailable("pipeline_backend 'verl' needs `pip install monorl[verl]` (verl>=0.9.1)")
@@ -199,22 +239,30 @@ class VerlBackend:
             "launching: " + " ".join(cmd[:3]) + f" (+{len(overrides)} overrides, see {OVERRIDES_FILE})"
         )
 
-        installed = self._install_signal_handlers()
+        stop = cancel if cancel is not None else threading.Event()
+        interrupted = False
         tail: deque[str] = deque(maxlen=20)
-        try:
-            with open(run_dir / LOG_FILE, "ab") as log_file:
-                self._proc = subprocess.Popen(
-                    cmd,
-                    cwd=run_dir,
-                    env=self.build_env(config, run_dir),
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                )
+        with (
+            open(run_dir / LOG_FILE, "ab") as log_file,
+            signal_guard(stop, reporter, "stopping the verl driver"),
+        ):
+            self._proc = subprocess.Popen(
+                cmd,
+                cwd=run_dir,
+                env=self.build_env(config, run_dir),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+            try:
                 reporter.set_status("running", "verl started", step=0, child_pid=self._proc.pid)
-                self._wait(run_dir, reporter)
-            returncode = self._proc.returncode
-        finally:
-            self._restore_signal_handlers(installed)
+                self._wait(run_dir, reporter, stop)
+            except BaseException as e:
+                # The second signal, or a failure of the wait: the driver does not outlive the run.
+                kill_tree(self._proc)
+                if not isinstance(e, KeyboardInterrupt):
+                    raise
+                interrupted = True
+        returncode = self._proc.returncode
         tail.extend(self._tail_log(run_dir))
 
         checkpoints = link_checkpoints(run_dir)
@@ -222,8 +270,8 @@ class VerlBackend:
         last_metrics = self._last_metrics(run_dir)
         if step is None:
             step = int(last_metrics.get("step", 0))
-        if self._cancel.is_set():
-            state, error = "cancelled", None
+        if interrupted or self._cancel.is_set() or stop.is_set():
+            state, error = "cancelled", "interrupted" if interrupted else None
             reporter.set_status("cancelled", "verl run cancelled", step=step)
         elif returncode == 0:
             state, error = "succeeded", None
@@ -246,7 +294,7 @@ class VerlBackend:
         )
 
     # -- internals ----------------------------------------------------------------------
-    def _wait(self, run_dir: Path, reporter: RunReporter) -> None:
+    def _wait(self, run_dir: Path, reporter: RunReporter, stop: threading.Event) -> None:
         assert self._proc is not None
         proc = self._proc
         next_line = 0
@@ -262,34 +310,16 @@ class VerlBackend:
             if last_step > int(status.get("step", 0)):
                 reporter.set_status("running", step=last_step)
             link_checkpoints(run_dir)
-            if self._cancel.is_set():
+            if self._cancel.is_set() or stop.is_set():
                 if deadline is None:
                     proc.send_signal(signal.SIGTERM)
                     reporter.log("cancel requested: sent SIGTERM to verl driver")
                     deadline = time.monotonic() + self.grace_seconds
                 elif time.monotonic() > deadline:
                     reporter.log("verl driver did not exit in time: sending SIGKILL")
-                    proc.kill()
-                    deadline = float("inf")
+                    kill_tree(proc)
             time.sleep(self.poll_seconds)
         proc.wait()
-
-    def _install_signal_handlers(self) -> dict[int, Any]:
-        if threading.current_thread() is not threading.main_thread():
-            return {}
-        previous: dict[int, Any] = {}
-
-        def handler(signum: int, _frame: Any) -> None:
-            self.cancel()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            previous[sig] = signal.signal(sig, handler)
-        return previous
-
-    @staticmethod
-    def _restore_signal_handlers(previous: dict[int, Any]) -> None:
-        for sig, old in previous.items():
-            signal.signal(sig, old)
 
     @staticmethod
     def _tail_log(run_dir: Path, n: int = 20) -> list[str]:

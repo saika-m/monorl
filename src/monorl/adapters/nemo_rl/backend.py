@@ -34,6 +34,7 @@ from monorl.adapters.nemo_rl.patches import ALGORITHM_ENV, RUN_DIR_ENV
 from monorl.config.schema import RunConfig
 from monorl.core.errors import ConfigError
 from monorl.core.reporting import CHECKPOINT_DIR, RunReporter, iter_metrics
+from monorl.core.signals import signal_guard
 from monorl.core.types import RunResult, RunState
 
 ENTRY_MODULE = "monorl.adapters.nemo_rl.entry"
@@ -198,8 +199,11 @@ class NemoRLBackend:
         resume: bool = False,
         cancel: threading.Event | None = None,
     ) -> RunResult:
-        """``cancel`` is not read: while the child runs, the signals of this process are handled
-        here (``docs/BACKENDS.md``, "Signals with a pipeline backend")."""
+        """``cancel`` is the event that the first SIGINT or SIGTERM sets. While the child runs
+        the backend handles the two signals with it (on the main thread; with an event of its
+        own when it is given none): the first makes it :meth:`cancel` the child, a second one
+        kills the child's process group (``docs/BACKENDS.md``, "Signals with a pipeline
+        backend")."""
         run_dir = Path(run_dir).expanduser().resolve()
         home = nemo_rl_home(config)
         self._cancelled.clear()
@@ -245,18 +249,26 @@ class NemoRLBackend:
             self._proc = proc
         reporter.set_status("running", "NeMo-RL training started", child_pid=proc.pid, backend=self.name)
 
-        # The handler only sets an event. It runs on the main thread, which copies the child's
-        # output: stopping the child (SIGTERM, a wait, SIGKILL) is left to a thread, so that the
-        # output is still copied while the child shuts down, and a second signal starts nothing.
-        requested, finished = threading.Event(), threading.Event()
+        # The first signal only sets an event. Its handler runs on the main thread, which copies
+        # the child's output: stopping the child (SIGTERM, a wait, SIGKILL) is left to a thread,
+        # so that the output is still copied while the child shuts down.
+        stop = cancel if cancel is not None else threading.Event()
+        interrupted, finished = False, threading.Event()
         canceller = threading.Thread(
-            target=self._cancel_when, args=(requested, finished), name="monorl-nemo-rl-cancel", daemon=True
+            target=self._cancel_when, args=(stop, finished), name="monorl-nemo-rl-cancel", daemon=True
         )
         canceller.start()
         try:
-            with _signal_handlers(lambda signum, frame: requested.set()):
+            with signal_guard(stop, reporter, "stopping NeMo-RL"):
                 self._stream(proc, reporter)
                 returncode = proc.wait()
+        except BaseException as e:
+            # The second signal, or a failure of the copying: the child does not outlive the run.
+            _signal_group(proc, signal.SIGKILL)
+            returncode = proc.wait()
+            if not isinstance(e, KeyboardInterrupt):
+                raise
+            interrupted = True
         finally:
             finished.set()
             canceller.join()
@@ -265,8 +277,9 @@ class NemoRLBackend:
         step = latest_step(run_dir)
         state: RunState
         error: str | None = None
-        if self.cancelled:
+        if interrupted or self.cancelled:
             state, message = "cancelled", "cancelled by user"
+            error = "interrupted" if interrupted else None
         elif returncode == 0:
             state, message = "succeeded", f"NeMo-RL finished at step {step}"
         else:
@@ -316,25 +329,6 @@ def _signal_group(proc: subprocess.Popen[str], sig: signal.Signals) -> None:
             proc.send_signal(sig)
         except (ProcessLookupError, OSError):
             pass
-
-
-class _signal_handlers:
-    """Install ``handler`` for SIGTERM/SIGINT while active (main thread only) and restore after."""
-
-    def __init__(self, handler: Any) -> None:
-        self.handler = handler
-        self._previous: dict[int, Any] = {}
-
-    def __enter__(self) -> None:
-        if threading.current_thread() is not threading.main_thread():
-            return
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            self._previous[sig] = signal.signal(sig, self.handler)
-
-    def __exit__(self, *exc: Any) -> None:
-        for sig, previous in self._previous.items():
-            signal.signal(sig, previous)
-        self._previous.clear()
 
 
 def _load_tokenizer(config: RunConfig, reporter: RunReporter) -> Any:
