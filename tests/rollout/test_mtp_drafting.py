@@ -87,8 +87,19 @@ def test_bounded_history_preserves_long_sequence_verification(
         expected = _generate(policy, prompt, 24, sample=sample)
     upstream = generators.pop()
 
+    drafts = 0
+
     def capture_factory(*args: Any, **kwargs: Any):
         generator = held_factory(*args, **kwargs)
+        get_candidates = generator.get_candidates
+
+        def counting(input_ids: torch.Tensor, *positional: Any, **keyword: Any):
+            nonlocal drafts
+            candidates, logits = get_candidates(input_ids, *positional, **keyword)
+            drafts += candidates.shape[1] > input_ids.shape[1]
+            return candidates, logits
+
+        generator.get_candidates = counting
         generators.append(generator)
         return generator
 
@@ -118,5 +129,7 @@ def test_bounded_history_preserves_long_sequence_verification(
     assert upstream.full_seq_last_hidden_states.untyped_storage().nbytes() > max_bytes
     stats = layers.take_stats()
     assert stats.emitted == 24 and stats.drafted > stats.accepted
+    # every draft is one token per layer, and a step without a draft counts none
+    assert stats.drafted == layers.num_layers * drafts
     if warm:
         assert stats.accepted > 0
