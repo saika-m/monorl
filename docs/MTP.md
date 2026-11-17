@@ -156,10 +156,9 @@ transformers, vLLM and SGLang all load MTP layers from those keys:
   back.
 
 For vLLM tensor updates, a target and drafter on the same worker device share the policy's staged
-weight stream. A host/peer-origin policy tensor is transferred once and borrowed by both loaders,
-while MTP-only tensors go only to the drafter. Different-device destinations keep separate streams;
-already-resident inputs still need no device copy. This applies to ROCm through PyTorch's device
-API without changing the quantized-head refresh or sampling behavior.
+weight stream. A policy tensor that is not on that device yet is moved there once and borrowed by
+both loaders, while MTP-only tensors go only to the drafter. A drafter on another device gets
+copies of its own; tensors that are on the device already still need no copy.
 
 The staged policy buffers remain live until both loaders consume them, within the current RPC
 payload, and are not cached across updates. A payload carries at most `rollout.extra.chunk_bytes`
