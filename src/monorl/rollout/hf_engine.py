@@ -76,6 +76,8 @@ from monorl.rollout.media import (
 )
 
 log = logging.getLogger(__name__)
+_LOGPROB_TRANSFER_BYTES = 1 << 20
+"""Logical bytes of compact speculative-score staging buffers; one step may exceed the budget."""
 
 
 def resolve_device(requested: str | None) -> torch.device:
@@ -851,29 +853,69 @@ class HFRolloutEngine:
     def _logprobs_from_logits(
         logits: Sequence[torch.Tensor], generated: torch.Tensor, params: SamplingParams
     ) -> tuple[torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
-        """What :meth:`_LogprobRecorder.result` returns, from the raw logits ``generate`` returned:
-        ``logits[t]`` ``[rows, vocab]`` are those the token at position ``t`` was chosen from."""
+        """What :meth:`_LogprobRecorder.result` returns, from the raw logits ``generate`` returned.
+
+        Stage only selected-token/top-k results, not vocabulary-sized logits, and copy them to
+        the host in bounded chunks. Host inputs fill the final arrays directly.
+        """
         rows, steps = generated.shape
         temperature = params.temperature if params.temperature > 0.0 else 1.0
         logprobs = torch.empty((rows, steps), dtype=torch.float32) if params.logprobs else None
-        top: tuple[torch.Tensor, torch.Tensor] | None = None
-        for t, step_logits in enumerate(
-            logits[:steps] if logprobs is not None or params.top_logprobs else ()
-        ):
-            step_logprobs = torch.log_softmax(step_logits.float() / temperature, dim=-1)
-            if logprobs is not None:
-                logprobs[:, t] = step_logprobs.gather(1, generated[:, t : t + 1]).squeeze(1).cpu()
-            if params.top_logprobs > 0:
-                values, indices = step_logprobs.topk(min(params.top_logprobs, step_logprobs.shape[-1]))
-                if top is None:
-                    top = (
-                        torch.empty((rows, steps, indices.shape[-1]), dtype=torch.int32),
-                        torch.empty((rows, steps, indices.shape[-1]), dtype=torch.float32),
-                    )
-                top[0][:, t] = indices.cpu()
-                top[1][:, t] = values.cpu()
-        if params.top_logprobs > 0 and top is None:  # nothing was generated
-            top = (torch.empty((rows, 0, 0), dtype=torch.int32), torch.empty((rows, 0, 0)))
+        k = min(params.top_logprobs, logits[0].shape[-1]) if params.top_logprobs > 0 and steps else 0
+        top = (
+            (
+                torch.empty((rows, steps, k), dtype=torch.int32),
+                torch.empty((rows, steps, k), dtype=torch.float32),
+            )
+            if params.top_logprobs > 0
+            else None
+        )
+        if not steps or (logprobs is None and top is None):
+            return logprobs, top
+
+        on_host = generated.device.type == "cpu"
+        bytes_per_step = rows * ((4 if logprobs is not None else 0) + 8 * k)
+        chunk_steps = min(steps, max(1, _LOGPROB_TRANSFER_BYTES // max(1, bytes_per_step)))
+        staged_logprobs = (
+            torch.empty((rows, chunk_steps), dtype=torch.float32, device=generated.device)
+            if not on_host and logprobs is not None
+            else None
+        )
+        staged_top = (
+            (
+                torch.empty((rows, chunk_steps, k), dtype=torch.int32, device=generated.device),
+                torch.empty((rows, chunk_steps, k), dtype=torch.float32, device=generated.device),
+            )
+            if not on_host and top is not None
+            else None
+        )
+        for start in range(0, steps, chunk_steps):
+            stop = min(start + chunk_steps, steps)
+            width = stop - start
+            host_logprobs = None if logprobs is None else logprobs[:, start:stop]
+            host_top = None if top is None else (top[0][:, start:stop], top[1][:, start:stop])
+            if on_host:
+                part_logprobs, part_top = host_logprobs, host_top
+            else:
+                part_logprobs = None if staged_logprobs is None else staged_logprobs[:, :width]
+                part_top = (
+                    None if staged_top is None else (staged_top[0][:, :width], staged_top[1][:, :width])
+                )
+            for offset, step_logits in enumerate(logits[start:stop]):
+                step_logprobs = torch.log_softmax(step_logits.float() / temperature, dim=-1)
+                if part_logprobs is not None:
+                    tokens = generated[:, start + offset : start + offset + 1]
+                    part_logprobs[:, offset] = step_logprobs.gather(1, tokens).squeeze(1)
+                if part_top is not None:
+                    values, indices = step_logprobs.topk(k)
+                    part_top[0][:, offset] = indices
+                    part_top[1][:, offset] = values
+            if not on_host:
+                if host_logprobs is not None:
+                    host_logprobs.copy_(part_logprobs)
+                if host_top is not None:
+                    host_top[0].copy_(part_top[0])
+                    host_top[1].copy_(part_top[1])
         return logprobs, top
 
     def _completions(

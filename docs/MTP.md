@@ -71,6 +71,13 @@ Per engine:
   which is as far back as transformers reads when it corrects the drafter's cache after a
   rejected draft; transformers itself keeps them for the whole sequence and copies them at every
   draft. The bound is on that buffer, not on the key-value caches of policy and drafter.
+  After generation, sampled-token and top-k scores are staged on the generation device and
+  copied to the host by chunk, not by token. The explicit staging buffers use at most 1 MiB of
+  logical score data, unless a single timestep needs more. Only selected scores and int32 token
+  IDs are staged; vocabulary logits are not stacked into another tensor. Host inputs fill the
+  final arrays directly. This reduces score-transfer synchronization points in the ROCm path
+  without changing sampling or acceptance. The budget is not a bound on model logits, PyTorch
+  workspaces, KV caches, or total device memory; ordinary streaming generation is unchanged.
 - **vLLM.** `speculative_config = {"method": "mtp", "num_speculative_tokens": N or 1}`; keys in
   `rollout.extra.engine_kwargs.speculative_config` are laid over it. A `rejection_sample_method`
   other than `standard` is rejected (the lossy ones sample from another distribution than the
