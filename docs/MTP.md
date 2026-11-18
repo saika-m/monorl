@@ -73,8 +73,10 @@ Per engine:
   draft. The bound is on that buffer, not on the key-value caches of policy and drafter.
   A prompt of fewer than `D` tokens has no `D` positions to read back at its first draft, and
   transformers fails there with a tensor size error when fewer than `D - 1` tokens of that
-  draft are accepted. The engine then lets the layers read the whole sequence again, as they
-  read a prompt, and goes on drafting.
+  draft are accepted
+  ([huggingface/transformers#50906](https://github.com/huggingface/transformers/issues/50906)).
+  The engine then lets the layers read the whole sequence again, as they read a prompt, and goes
+  on drafting.
 - **vLLM.** `speculative_config = {"method": "mtp", "num_speculative_tokens": N or 1}`; keys in
   `rollout.extra.engine_kwargs.speculative_config` are laid over it. A `rejection_sample_method`
   other than `standard` is rejected (the lossy ones sample from another distribution than the

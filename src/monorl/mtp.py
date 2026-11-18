@@ -646,7 +646,8 @@ def _held_candidate_generator(layers: MtpLayers, generation_config: Any, logits_
                 # different lengths and the layers fail on them. Every earlier hidden state is
                 # still held here, so the layers read the whole sequence again, as they read a
                 # prompt: the cache and the draft of a correction that starts at the first
-                # position.
+                # position. Reported as huggingface/transformers#50906 (5.22.2, 5.23.0 and main
+                # of 2026-11-18 fail); this branch can go when the pinned release has the fix.
                 verified = layers.last_hidden_states(model_outputs)[:, : n_last_matches + 1]
                 verified = verified.to(self.device)
                 history = torch.cat([self.full_seq_last_hidden_states, verified], dim=1)
